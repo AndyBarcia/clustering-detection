@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch.func import functional_call
 import copy
 import contextlib
+from typing import Optional
 
 from .config import ModelConfig
 from .outputs import RawOutputs
@@ -257,6 +258,21 @@ class CustomMask2Former(nn.Module):
         self.compact_margin = cfg.compact_margin
         self.w_proto_ttt = cfg.w_proto_ttt
 
+    @contextlib.contextmanager
+    def _temporary_ttt_steps(self, ttt_steps_override: Optional[int] = None):
+        if ttt_steps_override is None:
+            yield
+            return
+
+        previous_steps = [layer.ttt_steps for layer in self.transformer_decoder.layers]
+        try:
+            for layer in self.transformer_decoder.layers:
+                layer.ttt_steps = ttt_steps_override
+            yield
+        finally:
+            for layer, previous in zip(self.transformer_decoder.layers, previous_steps):
+                layer.ttt_steps = previous
+
     def _build_memory(self, images):
         features = self.backbone(images)
         B, C, H_f, W_f = features.shape
@@ -264,19 +280,20 @@ class CustomMask2Former(nn.Module):
         memory = memory + self.spatial_pos_embed[:, :memory.shape[1], :]
         return features, memory
 
-    def _decode_queries(self, memory, query_embed=None):
+    def _decode_queries(self, memory, query_embed=None, ttt_steps_override: Optional[int] = None):
         B = memory.shape[0]
         if query_embed is None:
             query_embed = self.queries.weight.unsqueeze(0).repeat(B, 1, 1)
 
-        q_dec_all, intermediate_ttt_q = self.transformer_decoder(
-            tgt=query_embed,
-            memory=memory,
-            sim_head=self.sim_head,
-        )
+        with self._temporary_ttt_steps(ttt_steps_override):
+            q_dec_all, intermediate_ttt_q = self.transformer_decoder(
+                tgt=query_embed,
+                memory=memory,
+                sim_head=self.sim_head,
+            )
         return q_dec_all, intermediate_ttt_q
 
-    def encode_gts(self, memory, features, masks, labels, pad_mask):
+    def encode_gts(self, memory, features, masks, labels, pad_mask, ttt_steps_override: Optional[int] = None):
         B_val, M_max = masks.shape[:2]
         _, C, Hf, Wf = features.shape
 
@@ -292,12 +309,13 @@ class CustomMask2Former(nn.Module):
         attn_mask = attn_mask.masked_fill(all_masked, False)
         attn_mask_rep = attn_mask.repeat_interleave(4, dim=0)
 
-        q_gt_all, _ = self.transformer_decoder(
-            tgt=query_init,
-            memory=memory,
-            memory_mask=attn_mask_rep,
-            sim_head=self.sim_head,
-        )
+        with self._temporary_ttt_steps(ttt_steps_override):
+            q_gt_all, _ = self.transformer_decoder(
+                tgt=query_init,
+                memory=memory,
+                memory_mask=attn_mask_rep,
+                sim_head=self.sim_head,
+            )
         q_gt = q_gt_all[-1]
 
         sig = self.sig_head(q_gt)
@@ -311,11 +329,11 @@ class CustomMask2Former(nn.Module):
         margin_preds = torch.sigmoid(self.margin_head(q).squeeze(-1))
         return mask_embs, cls_preds, sig_embs, sim_scores, margin_preds
 
-    def forward(self, images: torch.Tensor) -> RawOutputs:
+    def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
 
         features, memory = self._build_memory(images)
-        q_dec_all, intermediate_ttt_q = self._decode_queries(memory)
+        q_dec_all, intermediate_ttt_q = self._decode_queries(memory, ttt_steps_override=ttt_steps_override)
 
         mask_embs, cls_preds, sig_embs, sim_scores, margin_preds = self._run_heads(q_dec_all)
 

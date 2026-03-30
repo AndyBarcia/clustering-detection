@@ -18,6 +18,7 @@ from src.panoptic import load_system_checkpoint
 
 
 DEFAULT_SEARCH_SPACE = {
+    "ttt_steps": {"type": "int", "low": 0, "high": 20},
     "seed.quality_threshold": {"type": "float", "low": 0.03, "high": 0.2},
     "seed.min_foreground_prob": {"type": "float", "low": 0.0, "high": 0.25},
     "cluster.method": {"type": "categorical", "choices": ["dbscan", "hdbscan", "cc", "louvain", "leiden"]},

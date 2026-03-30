@@ -314,25 +314,35 @@ def evaluate_system_many_configs(
     try:
         for images, targets in data_loader:
             batch = torch.stack(images).to(device)
-            raw = system.model(batch)
+            configs_by_ttt_steps = defaultdict(list)
+            for key, cfg in inference_cfgs.items():
+                configs_by_ttt_steps[cfg.ttt_steps].append((key, predictors[key]))
 
-            for key, predictor in predictors.items():
+            for ttt_steps, group in configs_by_ttt_steps.items():
+                raw = system.model(batch, ttt_steps_override=ttt_steps)
                 if use_gt_prototypes:
-                    predictions = predictor.predict_from_raw_with_gt_prototypes(system.model, raw, targets)
+                    predictions_by_key = {
+                        key: predictor.predict_from_raw_with_gt_prototypes(system.model, raw, targets)
+                        for key, predictor in group
+                    }
                 else:
-                    predictions = predictor.predict_from_raw(system.model, raw)
+                    predictions_by_key = {
+                        key: predictor.predict_from_raw(system.model, raw)
+                        for key, predictor in group
+                    }
 
-                if not isinstance(predictions, list):
-                    predictions = [predictions]
+                for key, predictions in predictions_by_key.items():
+                    if not isinstance(predictions, list):
+                        predictions = [predictions]
 
-                for prediction, target in zip(predictions, targets):
-                    image_evaluations[key].append(
-                        evaluate_image(
-                            prediction,
-                            target,
-                            ap_iou_threshold=ap_iou_threshold,
+                    for prediction, target in zip(predictions, targets):
+                        image_evaluations[key].append(
+                            evaluate_image(
+                                prediction,
+                                target,
+                                ap_iou_threshold=ap_iou_threshold,
+                            )
                         )
-                    )
 
             object_counts.extend(int(target["labels"].shape[0]) for target in targets)
     finally:

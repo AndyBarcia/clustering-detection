@@ -27,19 +27,23 @@ class PanopticSystem(nn.Module):
         self.cfg.inference = inference_cfg
         self.predictor = ModularPrototypePredictor(inference_cfg)
 
+    def _resolve_ttt_steps(self, inference_cfg: Optional[PrototypeInferenceConfig]) -> Optional[int]:
+        cfg = self.cfg.inference if inference_cfg is None else inference_cfg
+        return cfg.ttt_steps
+
     def training_step(self, images, targets):
         raw = self.model(images)
         return self.criterion(self.model, raw, targets)
 
     @torch.no_grad()
     def predict(self, images, inference_cfg: Optional[PrototypeInferenceConfig] = None):
-        raw = self.model(images)
+        raw = self.model(images, ttt_steps_override=self._resolve_ttt_steps(inference_cfg))
         predictor = self.predictor if inference_cfg is None else ModularPrototypePredictor(inference_cfg)
         return predictor.predict_from_raw(self.model, raw)
 
     @torch.no_grad()
     def predict_with_gt_prototypes(self, images, targets, inference_cfg: Optional[PrototypeInferenceConfig] = None):
-        raw = self.model(images)
+        raw = self.model(images, ttt_steps_override=self._resolve_ttt_steps(inference_cfg))
         predictor = self.predictor if inference_cfg is None else ModularPrototypePredictor(inference_cfg)
         return predictor.predict_from_raw_with_gt_prototypes(self.model, raw, targets)
 

@@ -474,6 +474,7 @@ class ModularPrototypePredictor:
             gt_masks,
             gt_labels,
             gt_pad_mask,
+            ttt_steps_override=self.cfg.ttt_steps,
         )[0]
 
         q_sig = flat["q_sig"]

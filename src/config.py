@@ -135,6 +135,7 @@ class OverlapResolutionConfig:
 
 @dataclass
 class PrototypeInferenceConfig:
+    ttt_steps: Optional[int] = None
     seed: SeedFilterConfig = field(default_factory=SeedFilterConfig)
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
     assign: SoftAssignmentConfig = field(default_factory=SoftAssignmentConfig)
