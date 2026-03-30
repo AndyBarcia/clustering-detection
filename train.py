@@ -1,13 +1,18 @@
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Optional
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 
 import torch
 from torch.utils.data import DataLoader
 
 from src.config import PanopticSystemConfig
 from src.dataset import SyntheticPanopticDataset, collate_fn
+from src.evaluation import evaluate_system, format_metrics_table
 from src.panoptic import PanopticSystem, load_system_checkpoint, save_system_checkpoint
 from src.visualization import (
     DEFAULT_CLASS_NAMES,
@@ -41,10 +46,20 @@ def parse_args():
     parser.add_argument("--device", default=None, help="Training device, e.g. cpu or cuda.")
     parser.add_argument("--vis-samples", type=int, default=4, help="Number of synthetic samples rendered after each epoch.")
     parser.add_argument("--vis-seed", type=int, default=0, help="Random seed for the fixed visualization batch.")
+    parser.add_argument("--eval-dataset-length", type=int, default=32, help="Number of synthetic samples used for epoch evaluation.")
+    parser.add_argument("--eval-batch-size", type=int, default=None, help="Batch size used for epoch evaluation. Defaults to training batch size.")
+    parser.add_argument("--eval-seed", type=int, default=123, help="Base random seed used for synthetic evaluation.")
+    parser.add_argument("--eval-ap-threshold", type=float, default=0.5, help="IoU threshold used for AP during evaluation.")
+    parser.add_argument("--use-gt-prototypes-for-eval", action="store_true", help="Evaluate the GT-prototype decoding path instead of clustered predictions.")
     parser.add_argument(
         "--skip-epoch-vis",
         action="store_true",
         help="Disable prediction PNG export during training.",
+    )
+    parser.add_argument(
+        "--skip-epoch-eval",
+        action="store_true",
+        help="Disable the synthetic evaluation pass after each epoch.",
     )
     parser.add_argument(
         "--output-dir",
@@ -215,6 +230,32 @@ def main():
 
         history.append(epoch_metrics)
         print(f"Epoch {epoch_idx + 1}/{args.epochs}: {format_epoch_metrics(epoch_metrics)}", flush=True)
+
+        if not args.skip_epoch_eval:
+            eval_batch_size = args.eval_batch_size or args.batch_size
+            overall_eval, per_count_eval = evaluate_system(
+                system,
+                dataset_length=args.eval_dataset_length,
+                height=args.height,
+                width=args.width,
+                max_objects=args.max_objects,
+                batch_size=eval_batch_size,
+                device=device,
+                seed=args.eval_seed + epoch_idx,
+                ap_iou_threshold=args.eval_ap_threshold,
+                use_gt_prototypes=args.use_gt_prototypes_for_eval,
+            )
+            epoch_metrics["evaluation"] = {
+                "overall": overall_eval,
+                "by_object_count": per_count_eval,
+                "ap_threshold": args.eval_ap_threshold,
+                "dataset_length": args.eval_dataset_length,
+                "seed": args.eval_seed + epoch_idx,
+                "use_gt_prototypes": args.use_gt_prototypes_for_eval,
+            }
+            print("Evaluation", flush=True)
+            print(format_metrics_table(overall_eval, per_count_eval, ap_threshold=args.eval_ap_threshold), flush=True)
+
         save_training_state(output_dir, system, optimizer, history, epoch_idx + 1)
         if not args.skip_epoch_vis:
             vis_path = save_epoch_visualization(output_dir, system, vis_images, vis_targets, epoch_idx + 1)
