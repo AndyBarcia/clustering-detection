@@ -17,7 +17,7 @@ class DecoderLayerConfig:
     dim_feedforward: int = 256
     dropout: float = 0.1
     activation: str = "gelu"
-    ttt_steps: int = 2
+    ttt_steps: int = 10
     ttt_lr: float = 0.1
     ttt_momentum: float = 0.8
 
