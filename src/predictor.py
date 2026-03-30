@@ -44,7 +44,8 @@ def _cosine_affinity_np(x: np.ndarray) -> np.ndarray:
 
 
 def _cosine_distance_np(x: np.ndarray) -> np.ndarray:
-    return 1.0 - np.clip(x @ x.T, -1.0, 1.0)
+    dist = 1.0 - np.clip(x @ x.T, -1.0, 1.0)
+    return np.ascontiguousarray(dist, dtype=np.float64)
 
 
 def _connected_components_labels(affinity: np.ndarray, threshold: float) -> np.ndarray:
