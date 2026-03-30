@@ -11,6 +11,7 @@ from scipy.optimize import linear_sum_assignment
 from torch.utils.data import DataLoader
 
 from .dataset import SyntheticPanopticDataset, collate_fn
+from .predictor import ModularPrototypePredictor
 
 
 @dataclass
@@ -262,6 +263,90 @@ def evaluate_system(
     overall = summarize_evaluations(image_evaluations)
     by_count = summarize_by_object_count(image_evaluations, object_counts)
     return overall, by_count
+
+
+@torch.no_grad()
+def evaluate_system_many_configs(
+    system,
+    inference_cfgs: Dict[str, object],
+    *,
+    dataset_length: int,
+    height: int,
+    width: int,
+    max_objects: int,
+    batch_size: int,
+    device,
+    seed: int = 0,
+    ap_iou_threshold: float = 0.5,
+    use_gt_prototypes: bool = False,
+):
+    random_state = random.getstate()
+    py_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    dataset = SyntheticPanopticDataset(
+        length=dataset_length,
+        height=height,
+        width=width,
+        max_objects=max_objects,
+    )
+    data_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+    )
+
+    was_training = system.training
+    system.eval()
+
+    predictors = {
+        key: ModularPrototypePredictor(cfg)
+        for key, cfg in inference_cfgs.items()
+    }
+    image_evaluations = {key: [] for key in inference_cfgs}
+    object_counts = []
+
+    try:
+        for images, targets in data_loader:
+            batch = torch.stack(images).to(device)
+            raw = system.model(batch)
+
+            for key, predictor in predictors.items():
+                if use_gt_prototypes:
+                    predictions = predictor.predict_from_raw_with_gt_prototypes(system.model, raw, targets)
+                else:
+                    predictions = predictor.predict_from_raw(system.model, raw)
+
+                if not isinstance(predictions, list):
+                    predictions = [predictions]
+
+                for prediction, target in zip(predictions, targets):
+                    image_evaluations[key].append(
+                        evaluate_image(
+                            prediction,
+                            target,
+                            ap_iou_threshold=ap_iou_threshold,
+                        )
+                    )
+
+            object_counts.extend(int(target["labels"].shape[0]) for target in targets)
+    finally:
+        system.train(was_training)
+        random.setstate(random_state)
+        np.random.set_state(py_state)
+        torch.random.set_rng_state(torch_state)
+
+    results = {}
+    for key, evaluations in image_evaluations.items():
+        overall = summarize_evaluations(evaluations)
+        by_count = summarize_by_object_count(evaluations, object_counts)
+        results[key] = (overall, by_count)
+    return results
 
 
 def format_metrics_table(

@@ -1,9 +1,10 @@
 import argparse
 import json
 import os
+import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
@@ -12,7 +13,7 @@ import optuna
 import torch
 
 from src.config import PrototypeInferenceConfig, dataclass_from_dict
-from src.evaluation import evaluate_system
+from src.evaluation import evaluate_system_many_configs
 from src.panoptic import load_system_checkpoint
 
 
@@ -121,6 +122,15 @@ def parse_args():
         type=int,
         default=10,
         help="Number of startup trials for the TPE sampler.",
+    )
+    parser.add_argument(
+        "--parallel-trials",
+        type=int,
+        default=1,
+        help=(
+            "Number of Optuna trials to evaluate together per round. "
+            "Trials in the same round share each batch's model forward pass."
+        ),
     )
     parser.add_argument(
         "--use-gt-prototypes",
@@ -267,6 +277,40 @@ def maybe_enqueue_trial(study: optuna.Study, params: Dict[str, Any]):
     study.enqueue_trial(params)
 
 
+def find_completed_duplicate(study: optuna.Study, params: Dict[str, Any]):
+    target = canonicalize_params(params)
+    for trial in study.trials:
+        if trial.state != optuna.trial.TrialState.COMPLETE:
+            continue
+        previous_params = trial.user_attrs.get("resolved_params", trial.params)
+        if canonicalize_params(previous_params) == target:
+            return trial
+    return None
+
+
+def evaluate_trial_batch(system, batch_records: List[Dict[str, Any]], *, args):
+    if not batch_records:
+        return {}
+
+    inference_cfgs = {
+        str(record["trial"].number): record["cfg"]
+        for record in batch_records
+    }
+    return evaluate_system_many_configs(
+        system,
+        inference_cfgs,
+        dataset_length=args.dataset_length,
+        height=args.height,
+        width=args.width,
+        max_objects=args.max_objects,
+        batch_size=args.batch_size,
+        device=args.device,
+        seed=args.seed,
+        ap_iou_threshold=args.ap_threshold,
+        use_gt_prototypes=args.use_gt_prototypes,
+    )
+
+
 def export_study_summary(
     study: optuna.Study,
     output_path: Path,
@@ -367,76 +411,119 @@ def main():
     print(f"Storage: {storage}")
     print(f"Search metric: {args.metric}")
     print(f"Existing trials: {len(study.trials)}")
+    print(f"Parallel trials per round: {args.parallel_trials}")
     print(f"Output JSON: {output_path.resolve()}")
+    start_time = time.time()
+    scheduled_trials = 0
 
-    def objective(trial: optuna.Trial) -> float:
-        params = sample_params(trial, search_space)
-        canonical_params = canonicalize_params(params)
+    while scheduled_trials < args.n_trials:
+        if args.timeout is not None and (time.time() - start_time) >= args.timeout:
+            break
 
-        for previous_trial in study.trials:
-            if previous_trial.number == trial.number:
+        round_records: List[Dict[str, Any]] = []
+        pending_by_params: Dict[str, Dict[str, Any]] = {}
+
+        while len(round_records) < args.parallel_trials and scheduled_trials < args.n_trials:
+            if args.timeout is not None and (time.time() - start_time) >= args.timeout:
+                break
+
+            trial = study.ask()
+            scheduled_trials += 1
+            params = sample_params(trial, search_space)
+            canonical_params = canonicalize_params(params)
+
+            duplicate_trial = find_completed_duplicate(study, params)
+            if duplicate_trial is not None:
+                metrics = duplicate_trial.user_attrs.get("metrics")
+                if metrics is not None:
+                    objective_value = read_metric(metrics, args.metric)
+                    trial.set_user_attr("metrics", metrics)
+                    trial.set_user_attr("resolved_params", params)
+                    trial.set_user_attr("duplicate_of", duplicate_trial.number)
+                    study.tell(trial, objective_value)
+                    print(
+                        f"Trial {trial.number} reused trial {duplicate_trial.number} | "
+                        f"{args.metric}={objective_value:.4f} | "
+                        f"params={json.dumps(params, sort_keys=True)}",
+                        flush=True,
+                    )
+                    continue
+
+            if canonical_params in pending_by_params:
+                pending_by_params[canonical_params]["aliases"].append(trial)
                 continue
-            if previous_trial.state != optuna.trial.TrialState.COMPLETE:
-                continue
 
-            previous_params = previous_trial.user_attrs.get("resolved_params", previous_trial.params)
-            if canonicalize_params(previous_params) != canonical_params:
-                continue
+            record = {
+                "trial": trial,
+                "params": params,
+                "cfg": build_inference_config(base_inference_cfg, params),
+                "aliases": [],
+            }
+            pending_by_params[canonical_params] = record
+            round_records.append(record)
 
-            metrics = previous_trial.user_attrs.get("metrics")
-            if metrics is None:
-                continue
+        if not round_records:
+            continue
 
+        try:
+            batch_results = evaluate_trial_batch(system, round_records, args=args)
+        except Exception as exc:
+            for record in round_records:
+                study.tell(record["trial"], state=optuna.trial.TrialState.FAIL)
+                for alias_trial in record["aliases"]:
+                    study.tell(alias_trial, state=optuna.trial.TrialState.FAIL)
+            export_study_summary(
+                study,
+                output_path,
+                args=args,
+                storage=storage,
+                checkpoint_path=checkpoint_path,
+                search_space=search_space,
+            )
+            if not args.continue_on_error:
+                raise
+            print(f"Batch failed: {exc}", flush=True)
+            continue
+
+        for record in round_records:
+            trial = record["trial"]
+            params = record["params"]
+            overall, by_count = batch_results[str(trial.number)]
+            metrics = {
+                "overall": overall,
+                "by_object_count": by_count,
+            }
             objective_value = read_metric(metrics, args.metric)
+
             trial.set_user_attr("metrics", metrics)
             trial.set_user_attr("resolved_params", params)
-            trial.set_user_attr("duplicate_of", previous_trial.number)
+            study.tell(trial, objective_value)
             print(
-                f"Trial {trial.number} reused trial {previous_trial.number} | "
-                f"{args.metric}={objective_value:.4f} | "
+                f"Trial {trial.number} finished | {args.metric}={objective_value:.4f} | "
                 f"params={json.dumps(params, sort_keys=True)}",
                 flush=True,
             )
-            return objective_value
 
-        trial_cfg = build_inference_config(base_inference_cfg, params)
-        system.set_inference_config(trial_cfg)
+            for alias_trial in record["aliases"]:
+                alias_trial.set_user_attr("metrics", metrics)
+                alias_trial.set_user_attr("resolved_params", params)
+                alias_trial.set_user_attr("duplicate_of", trial.number)
+                study.tell(alias_trial, objective_value)
+                print(
+                    f"Trial {alias_trial.number} reused trial {trial.number} in-batch | "
+                    f"{args.metric}={objective_value:.4f} | "
+                    f"params={json.dumps(params, sort_keys=True)}",
+                    flush=True,
+                )
 
-        overall, by_count = evaluate_system(
-            system,
-            dataset_length=args.dataset_length,
-            height=args.height,
-            width=args.width,
-            max_objects=args.max_objects,
-            batch_size=args.batch_size,
-            device=args.device,
-            seed=args.seed,
-            ap_iou_threshold=args.ap_threshold,
-            use_gt_prototypes=args.use_gt_prototypes,
+        export_study_summary(
+            study,
+            output_path,
+            args=args,
+            storage=storage,
+            checkpoint_path=checkpoint_path,
+            search_space=search_space,
         )
-
-        metrics = {
-            "overall": overall,
-            "by_object_count": by_count,
-        }
-        objective_value = read_metric(metrics, args.metric)
-
-        trial.set_user_attr("metrics", metrics)
-        trial.set_user_attr("resolved_params", params)
-        print(
-            f"Trial {trial.number} finished | {args.metric}={objective_value:.4f} | "
-            f"params={json.dumps(params, sort_keys=True)}",
-            flush=True,
-        )
-        return objective_value
-
-    catch = (Exception,) if args.continue_on_error else ()
-    study.optimize(
-        objective,
-        n_trials=args.n_trials,
-        timeout=args.timeout,
-        catch=catch,
-    )
 
     export_study_summary(
         study,

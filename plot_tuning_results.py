@@ -45,6 +45,14 @@ def load_trials(path: Path) -> Tuple[Dict, List[Dict]]:
     return payload, trials
 
 
+def group_trials_by_method(trials: List[Dict]) -> Dict[str, List[Dict]]:
+    grouped: Dict[str, List[Dict]] = {}
+    for trial in trials:
+        method = trial.get("params", {}).get("cluster.method", "unknown")
+        grouped.setdefault(method, []).append(trial)
+    return grouped
+
+
 def collect_numeric_param_names(trials: List[Dict]) -> List[str]:
     names = set()
     for trial in trials:
@@ -154,6 +162,8 @@ def save_param_scatter_grid(
 ):
     top_params = [name for name, _ in compute_param_scores(trials, numeric_names)]
     top_params = top_params[: max(1, min(len(top_params), top_k))]
+    if not top_params:
+        return
 
     cols = 2
     rows = math.ceil(len(top_params) / cols)
@@ -169,32 +179,20 @@ def save_param_scatter_grid(
 
         xs = []
         ys = []
-        colors = []
         for trial in trials:
             value = trial.get("params", {}).get(name)
             if not isinstance(value, (int, float)) or isinstance(value, bool):
                 continue
             xs.append(float(value))
             ys.append(float(trial["value"]))
-            colors.append(trial.get("params", {}).get("cluster.method", "unknown"))
-
-        color_map = {method: idx for idx, method in enumerate(sorted(set(colors)))}
-        cvals = [color_map[c] for c in colors]
-        sc = ax.scatter(xs, ys, c=cvals, cmap="tab10", alpha=0.75, s=28)
+        ax.scatter(xs, ys, alpha=0.75, s=28, color="#5B8FF9")
         ax.set_title(name)
         ax.set_xlabel(name)
         ax.set_ylabel(metric_name)
         ax.grid(True, alpha=0.2)
 
-    handles = []
-    labels = []
-    for method in sorted({trial.get("params", {}).get("cluster.method", "unknown") for trial in trials}):
-        color = plt.get_cmap("tab10")(sorted({trial.get("params", {}).get("cluster.method", "unknown") for trial in trials}).index(method))
-        handles.append(plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=color, markersize=8))
-        labels.append(method)
-    fig.legend(handles, labels, loc="upper center", ncol=min(5, len(labels)))
     fig.suptitle("Most Correlated Numeric Parameters")
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
 
@@ -278,6 +276,39 @@ def save_top_trials_table(trials: List[Dict], metric_name: str, output_path: Pat
     plt.close(fig)
 
 
+def save_method_specific_plots(
+    grouped_trials: Dict[str, List[Dict]],
+    metric_name: str,
+    top_k: int,
+    output_dir: Path,
+):
+    methods = [name for name in METHOD_ORDER if name in grouped_trials] + sorted(
+        name for name in grouped_trials if name not in METHOD_ORDER
+    )
+
+    for method in methods:
+        trials = grouped_trials[method]
+        method_dir = output_dir / f"method_{method}"
+        method_dir.mkdir(parents=True, exist_ok=True)
+        numeric_names = collect_numeric_param_names(trials)
+
+        save_optimization_history(trials, metric_name, method_dir / "optimization_history.png")
+        save_top_trials_table(trials, metric_name, method_dir / "top_trials_table.png")
+        save_param_scatter_grid(
+            trials,
+            metric_name,
+            numeric_names,
+            top_k,
+            method_dir / "parameter_scatter_grid.png",
+        )
+        save_correlation_heatmap(
+            trials,
+            metric_name,
+            numeric_names,
+            method_dir / "parameter_correlation_heatmap.png",
+        )
+
+
 def main():
     args = parse_args()
     tuning_path = Path(args.tuning_json)
@@ -287,6 +318,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     numeric_names = collect_numeric_param_names(trials)
+    grouped_trials = group_trials_by_method(trials)
 
     save_optimization_history(trials, metric_name, output_dir / "optimization_history.png")
     save_method_summary(trials, metric_name, output_dir / "method_summary.png")
@@ -299,6 +331,7 @@ def main():
     )
     save_correlation_heatmap(trials, metric_name, numeric_names[:], output_dir / "parameter_correlation_heatmap.png")
     save_top_trials_table(trials, metric_name, output_dir / "top_trials_table.png")
+    save_method_specific_plots(grouped_trials, metric_name, args.top_k, output_dir)
 
     print(f"Saved plots to {output_dir.resolve()}")
 
