@@ -64,18 +64,18 @@ class LossConfig:
 
 @dataclass
 class SeedFilterConfig:
-    quality_threshold: float = 0.15
+    quality_threshold: float = 0.17
     topk: Optional[int] = None
     min_num_seeds: int = 1
     exclude_background: bool = True
-    min_foreground_prob: float = 0.0
+    min_foreground_prob: float = 0.22
     use_foreground_in_score: bool = False
     foreground_score_power: float = 1.0
 
 
 @dataclass
 class ClusterConfig:
-    method: str = "dbscan"   # ["dbscan", "hdbscan", "cc", "louvain", "leiden"]
+    method: str = "cc"   # ["dbscan", "hdbscan", "cc", "louvain", "leiden"]
     cluster_per_class: bool = True
     promote_noise_to_singletons: bool = True
 
@@ -90,7 +90,7 @@ class ClusterConfig:
     hdbscan_cluster_selection_epsilon: float = 0.0
 
     # Graph methods
-    graph_affinity_threshold: float = 0.75
+    graph_affinity_threshold: float = 0.76
     graph_min_edge_weight: float = 0.01
 
     # Louvain / Leiden
@@ -109,7 +109,7 @@ class SoftAssignmentConfig:
 
     use_layer_weights: bool = True
     use_query_quality: bool = True
-    query_quality_power: float = 1.0
+    query_quality_power: float = 0.6
 
     use_foreground_prob: bool = False
     foreground_prob_power: float = 1.0
@@ -121,11 +121,11 @@ class SoftAssignmentConfig:
 @dataclass
 class OverlapResolutionConfig:
     remove_background: bool = True
-    min_prototype_score: float = 0.05
+    min_prototype_score: float = 0.04
     min_area: int = 20
 
-    mask_threshold: float = 0.5
-    pixel_score_threshold: float = 0.25
+    mask_threshold: float = 0.42
+    pixel_score_threshold: float = 0.28
 
     use_class_confidence: bool = True
     use_foreground_confidence: bool = True

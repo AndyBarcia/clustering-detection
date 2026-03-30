@@ -40,11 +40,14 @@ DEFAULT_SEARCH_SPACE = {
 BEST_KNOWN_PARAMS = {
     "assign.class_compat_power": 0.0,
     "assign.refinement_steps": 1,
-    "cluster.graph_affinity_threshold": 0.75,
+    "assign.query_quality_power": 0.6,
+    "cluster.graph_affinity_threshold": 0.76,
     "cluster.method": "cc",
-    "overlap.min_prototype_score": 0.03,
-    "overlap.pixel_score_threshold": 0.2,
-    "seed.quality_threshold": 0.15,
+    "overlap.mask_threshold": 0.42,
+    "overlap.min_prototype_score": 0.04,
+    "overlap.pixel_score_threshold": 0.28,
+    "seed.min_foreground_prob": 0.22,
+    "seed.quality_threshold": 0.17,
 }
 
 METRIC_ALIASES = {
