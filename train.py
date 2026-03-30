@@ -9,6 +9,12 @@ from torch.utils.data import DataLoader
 from src.config import PanopticSystemConfig
 from src.dataset import SyntheticPanopticDataset, collate_fn
 from src.panoptic import PanopticSystem, load_system_checkpoint, save_system_checkpoint
+from src.visualization import (
+    DEFAULT_CLASS_NAMES,
+    run_predictions,
+    sample_synthetic_examples,
+    save_prediction_grid,
+)
 
 
 CHECKPOINT_NAME = "checkpoint.pt"
@@ -25,7 +31,20 @@ def parse_args():
     parser.add_argument("--max-objects", type=int, default=10, help="Maximum objects per image.")
     parser.add_argument("--lr", type=float, default=1e-4, help="Adam learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Adam weight decay.")
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=100,
+        help="Report running mean losses every N training iterations. Set to 0 to disable intra-epoch logging.",
+    )
     parser.add_argument("--device", default=None, help="Training device, e.g. cpu or cuda.")
+    parser.add_argument("--vis-samples", type=int, default=4, help="Number of synthetic samples rendered after each epoch.")
+    parser.add_argument("--vis-seed", type=int, default=0, help="Random seed for the fixed visualization batch.")
+    parser.add_argument(
+        "--skip-epoch-vis",
+        action="store_true",
+        help="Disable prediction PNG export during training.",
+    )
     parser.add_argument(
         "--output-dir",
         default="outputs",
@@ -67,6 +86,10 @@ def format_epoch_metrics(epoch_metrics):
     return " | ".join(f"{key}={epoch_metrics[key]:.4f}" for key in ordered_keys if key in epoch_metrics)
 
 
+def format_iteration_metrics(metrics):
+    return format_epoch_metrics(metrics)
+
+
 def load_training_state(output_dir: Path, device: torch.device, lr: float, weight_decay: float):
     checkpoint_path = output_dir / CHECKPOINT_NAME
     if checkpoint_path.exists():
@@ -103,6 +126,37 @@ def save_training_state(output_dir: Path, system: PanopticSystem, optimizer, his
     metrics_path.write_text(json.dumps(history, indent=2))
 
 
+def build_visualization_batch(args):
+    if args.vis_samples <= 0:
+        return [], []
+
+    return sample_synthetic_examples(
+        num_samples=args.vis_samples,
+        dataset_length=args.dataset_length,
+        height=args.height,
+        width=args.width,
+        max_objects=args.max_objects,
+        seed=args.vis_seed,
+    )
+
+
+def save_epoch_visualization(output_dir: Path, system: PanopticSystem, images, targets, epoch: int):
+    if len(images) == 0:
+        return None
+
+    predictions = run_predictions(system, images)
+    path = output_dir / f"predictions_epoch_{epoch:03d}.png"
+    save_prediction_grid(
+        path,
+        images,
+        targets,
+        predictions,
+        class_names=DEFAULT_CLASS_NAMES,
+        figure_title=f"Epoch {epoch} predictions",
+    )
+    return path
+
+
 def main():
     args = parse_args()
     device = resolve_device(args.device)
@@ -116,10 +170,12 @@ def main():
         weight_decay=args.weight_decay,
     )
     data_loader = build_dataloader(args)
+    vis_images, vis_targets = build_visualization_batch(args)
 
     for epoch_idx in range(start_epoch, args.epochs):
         system.train()
         epoch_sums = {}
+        interval_sums = {}
         num_batches = 0
 
         for images, targets in data_loader:
@@ -132,7 +188,20 @@ def main():
 
             num_batches += 1
             for name, value in components.items():
-                epoch_sums[name] = epoch_sums.get(name, 0.0) + float(value.detach().item())
+                scalar = float(value.detach().item())
+                epoch_sums[name] = epoch_sums.get(name, 0.0) + scalar
+                interval_sums[name] = interval_sums.get(name, 0.0) + scalar
+
+            if args.log_every > 0 and num_batches % args.log_every == 0:
+                interval_metrics = {
+                    name: value / args.log_every for name, value in interval_sums.items()
+                }
+                print(
+                    f"Epoch {epoch_idx + 1}/{args.epochs} | Iteration {num_batches}: "
+                    f"{format_iteration_metrics(interval_metrics)}",
+                    flush=True,
+                )
+                interval_sums = {}
 
         epoch_metrics = {
             "epoch": epoch_idx + 1,
@@ -144,6 +213,10 @@ def main():
         history.append(epoch_metrics)
         print(f"Epoch {epoch_idx + 1}/{args.epochs}: {format_epoch_metrics(epoch_metrics)}", flush=True)
         save_training_state(output_dir, system, optimizer, history, epoch_idx + 1)
+        if not args.skip_epoch_vis:
+            vis_path = save_epoch_visualization(output_dir, system, vis_images, vis_targets, epoch_idx + 1)
+            if vis_path is not None:
+                print(f"Saved prediction snapshot to {vis_path.resolve()}", flush=True)
 
     print(f"Saved checkpoint to {(output_dir / CHECKPOINT_NAME).resolve()}", flush=True)
     print(f"Saved epoch metrics to {(output_dir / METRICS_NAME).resolve()}", flush=True)
