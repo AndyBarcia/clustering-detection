@@ -87,7 +87,7 @@ class ModularPrototypePredictor:
 
     @torch.no_grad()
     def predict(self, model: CustomMask2Former, images: torch.Tensor):
-        raw = model.forward_raw(images)
+        raw = model(images)
         return self.predict_from_raw(model, raw)
 
     @torch.no_grad()

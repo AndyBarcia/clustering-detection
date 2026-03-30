@@ -67,7 +67,20 @@ class PanopticCriterion(nn.Module):
                 labels_list.append(l)
 
         if not valid_b:
-            return features.sum() * 0.0
+            zero = features.sum() * 0.0
+            return zero, {
+                "loss_total": zero,
+                "loss_proto_sig": zero,
+                "loss_proto_ttt": zero,
+                "loss_cls": zero,
+                "loss_mask_bce": zero,
+                "loss_mask_iou": zero,
+                "loss_mask_total": zero,
+                "loss_sim": zero,
+                "loss_margin": zero,
+                "loss_intra": zero,
+                "loss_inter": zero,
+            }
 
         B_val = len(valid_b)
         M_max = max(len(l) for l in labels_list)
@@ -189,4 +202,18 @@ class PanopticCriterion(nn.Module):
             self.cfg.w_inter * loss_inter
         )
 
-        return final_loss
+        components = {
+            "loss_total": final_loss,
+            "loss_proto_sig": loss_proto_sig,
+            "loss_proto_ttt": loss_proto_ttt,
+            "loss_cls": loss_cls,
+            "loss_mask_bce": loss_mask_bce,
+            "loss_mask_iou": loss_mask_iou,
+            "loss_mask_total": total_loss_mask,
+            "loss_sim": loss_sim,
+            "loss_margin": loss_margin,
+            "loss_intra": loss_intra,
+            "loss_inter": loss_inter,
+        }
+
+        return final_loss, components

@@ -28,13 +28,12 @@ class PanopticSystem(nn.Module):
         self.predictor = ModularPrototypePredictor(inference_cfg)
 
     def training_step(self, images, targets):
-        raw = self.model.forward_raw(images)
-        loss = self.criterion(self.model, raw, targets)
-        return loss
+        raw = self.model(images)
+        return self.criterion(self.model, raw, targets)
 
     @torch.no_grad()
     def predict(self, images, inference_cfg: Optional[PrototypeInferenceConfig] = None):
-        raw = self.model.forward_raw(images)
+        raw = self.model(images)
         predictor = self.predictor if inference_cfg is None else ModularPrototypePredictor(inference_cfg)
         return predictor.predict_from_raw(self.model, raw)
 

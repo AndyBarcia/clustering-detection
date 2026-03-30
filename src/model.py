@@ -311,7 +311,7 @@ class CustomMask2Former(nn.Module):
         margin_preds = torch.sigmoid(self.margin_head(q).squeeze(-1))
         return mask_embs, cls_preds, sig_embs, sim_scores, margin_preds
 
-    def forward_raw(self, images: torch.Tensor) -> RawOutputs:
+    def forward(self, images: torch.Tensor) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
 
         features, memory = self._build_memory(images)
@@ -332,6 +332,3 @@ class CustomMask2Former(nn.Module):
             layer_importance=F.softmax(self.layer_importance, dim=0),
             img_shape=(H_img, W_img),
         )
-
-    def forward(self, images, targets=None):
-        return self.forward_raw(images)

@@ -25,7 +25,7 @@ class DecoderLayerConfig:
 @dataclass
 class DecoderConfig:
     num_layers: int = 3
-    num_queries: int = 50
+    num_queries: int = 20
 
 
 @dataclass
