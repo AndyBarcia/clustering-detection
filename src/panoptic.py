@@ -37,6 +37,12 @@ class PanopticSystem(nn.Module):
         predictor = self.predictor if inference_cfg is None else ModularPrototypePredictor(inference_cfg)
         return predictor.predict_from_raw(self.model, raw)
 
+    @torch.no_grad()
+    def predict_with_gt_prototypes(self, images, targets, inference_cfg: Optional[PrototypeInferenceConfig] = None):
+        raw = self.model(images)
+        predictor = self.predictor if inference_cfg is None else ModularPrototypePredictor(inference_cfg)
+        return predictor.predict_from_raw_with_gt_prototypes(self.model, raw, targets)
+
 
 def save_system_checkpoint(system: PanopticSystem, path: str, optimizer=None, extra: Optional[dict] = None):
     ckpt = {

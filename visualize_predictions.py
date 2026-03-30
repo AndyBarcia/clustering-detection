@@ -4,6 +4,7 @@ from src.panoptic import load_system_checkpoint
 from src.visualization import (
     DEFAULT_CLASS_NAMES,
     run_predictions,
+    run_predictions_with_gt_prototypes,
     sample_synthetic_examples,
     save_prediction_grid,
     show_prediction_grid,
@@ -39,6 +40,7 @@ def main():
         seed=args.seed,
     )
     predictions = run_predictions(system, images)
+    gt_proto_predictions = run_predictions_with_gt_prototypes(system, images, targets)
 
     figure_title = f"Checkpoint preview: {args.checkpoint}"
     if args.save_path:
@@ -47,6 +49,7 @@ def main():
             images,
             targets,
             predictions,
+            gt_proto_predictions=gt_proto_predictions,
             class_names=DEFAULT_CLASS_NAMES,
             figure_title=figure_title,
         )
@@ -56,6 +59,7 @@ def main():
             images,
             targets,
             predictions,
+            gt_proto_predictions=gt_proto_predictions,
             class_names=DEFAULT_CLASS_NAMES,
             figure_title=figure_title,
             window_title="Synthetic Prediction Viewer",

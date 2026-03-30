@@ -96,6 +96,12 @@ class ModularPrototypePredictor:
         preds = [self._predict_single(model, raw, b) for b in range(B)]
         return preds[0] if B == 1 else preds
 
+    @torch.no_grad()
+    def predict_from_raw_with_gt_prototypes(self, model: CustomMask2Former, raw: RawOutputs, targets):
+        B = raw.features.shape[0]
+        preds = [self._predict_single_with_gt_prototypes(model, raw, targets, b) for b in range(B)]
+        return preds[0] if B == 1 else preds
+
     def _flatten_outputs(self, raw: RawOutputs, b: int) -> Dict[str, torch.Tensor]:
         device = raw.features.device
         features = raw.features[b]
@@ -432,6 +438,90 @@ class ModularPrototypePredictor:
         })
         return proto_state
 
+    def _build_gt_proto_state(
+        self,
+        model: CustomMask2Former,
+        raw: RawOutputs,
+        flat: Dict[str, torch.Tensor],
+        targets,
+        b: int,
+    ):
+        device = flat["q_sig"].device
+        labels = targets[b]["labels"].to(device)
+        masks = targets[b]["masks"].to(device).float()
+
+        if labels.numel() == 0:
+            return {
+                "num_prototypes": 0,
+                "proto_sig": torch.empty((0, flat["q_sig"].shape[-1]), device=device),
+                "proto_cls": torch.empty((0, flat["q_cls"].shape[-1]), device=device),
+                "proto_mask_emb": torch.empty((0, flat["q_mask_emb"].shape[-1]), device=device),
+                "cluster_members": [],
+                "seed_idx": torch.empty((0,), dtype=torch.long, device=device),
+                "seed_cluster_labels": torch.empty((0,), dtype=torch.long, device=device),
+                "assignment_weights": torch.empty((flat["q_sig"].shape[0], 0), device=device),
+                "assignment_strength": torch.empty((0,), device=device),
+            }
+
+        gt_masks = masks.unsqueeze(0)
+        gt_labels = labels.unsqueeze(0)
+        gt_pad_mask = torch.ones((1, labels.shape[0]), dtype=torch.bool, device=device)
+
+        gt_sig = model.encode_gts(
+            raw.memory[b:b + 1],
+            raw.features[b:b + 1],
+            gt_masks,
+            gt_labels,
+            gt_pad_mask,
+        )[0]
+
+        q_sig = flat["q_sig"]
+        q_cls = flat["q_cls"]
+        q_cls_prob = flat["q_cls_prob"]
+        q_mask_emb = flat["q_mask_emb"]
+
+        alpha = _alpha_value(model.alpha_focal) if self.cfg.assign.use_alpha_focal else 1.0
+        sim = torch.matmul(q_sig, gt_sig.T).clamp_min(self.cfg.assign.similarity_floor)
+        raw_w = sim.pow(alpha)
+
+        if self.cfg.assign.use_layer_weights:
+            raw_w = raw_w * flat["layer_weights_flat"].unsqueeze(1)
+
+        if self.cfg.assign.use_query_quality:
+            raw_w = raw_w * flat["q_quality"].pow(self.cfg.assign.query_quality_power).unsqueeze(1)
+
+        if self.cfg.assign.use_foreground_prob:
+            raw_w = raw_w * flat["fg_conf"].pow(self.cfg.assign.foreground_prob_power).unsqueeze(1)
+
+        if self.cfg.assign.class_compat_power > 0:
+            gt_cls_logits = torch.full(
+                (labels.shape[0], q_cls.shape[-1]),
+                fill_value=-20.0,
+                device=device,
+                dtype=q_cls.dtype,
+            )
+            gt_cls_logits[torch.arange(labels.shape[0], device=device), labels] = 20.0
+            gt_cls_prob = F.softmax(gt_cls_logits, dim=-1)
+            class_compat = torch.matmul(q_cls_prob, gt_cls_prob.T).clamp_min(1e-6)
+            raw_w = raw_w * class_compat.pow(self.cfg.assign.class_compat_power)
+
+        norm_w = raw_w / (raw_w.sum(dim=0, keepdim=True) + 1e-6)
+
+        proto_mask_emb = torch.matmul(norm_w.T, q_mask_emb)
+        proto_cls = torch.matmul(norm_w.T, q_cls)
+
+        return {
+            "num_prototypes": labels.shape[0],
+            "proto_sig": gt_sig,
+            "proto_cls": proto_cls,
+            "proto_mask_emb": proto_mask_emb,
+            "cluster_members": [],
+            "seed_idx": torch.arange(labels.shape[0], device=device),
+            "seed_cluster_labels": torch.arange(labels.shape[0], device=device),
+            "assignment_weights": norm_w,
+            "assignment_strength": raw_w.sum(dim=0),
+        }
+
     def _decode_and_resolve(self, flat: Dict[str, torch.Tensor], proto_state: Dict[str, Any]):
         cfg = self.cfg.overlap
         features = flat["features"]
@@ -560,6 +650,13 @@ class ModularPrototypePredictor:
         cluster_labels = self._cluster_seeds(flat, seed_idx, seed_scores)
         proto_state = self._initialize_prototypes(flat, seed_idx, cluster_labels)
         proto_state = self._soft_refine_prototypes(model, flat, proto_state)
+        pred = self._decode_and_resolve(flat, proto_state)
+        pred["flat"] = flat
+        return pred
+
+    def _predict_single_with_gt_prototypes(self, model: CustomMask2Former, raw: RawOutputs, targets, b: int):
+        flat = self._flatten_outputs(raw, b)
+        proto_state = self._build_gt_proto_state(model, raw, flat, targets, b)
         pred = self._decode_and_resolve(flat, proto_state)
         pred["flat"] = flat
         return pred

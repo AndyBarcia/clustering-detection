@@ -12,6 +12,7 @@ from src.panoptic import PanopticSystem, load_system_checkpoint, save_system_che
 from src.visualization import (
     DEFAULT_CLASS_NAMES,
     run_predictions,
+    run_predictions_with_gt_prototypes,
     sample_synthetic_examples,
     save_prediction_grid,
 )
@@ -145,12 +146,14 @@ def save_epoch_visualization(output_dir: Path, system: PanopticSystem, images, t
         return None
 
     predictions = run_predictions(system, images)
+    gt_proto_predictions = run_predictions_with_gt_prototypes(system, images, targets)
     path = output_dir / f"predictions_epoch_{epoch:03d}.png"
     save_prediction_grid(
         path,
         images,
         targets,
         predictions,
+        gt_proto_predictions=gt_proto_predictions,
         class_names=DEFAULT_CLASS_NAMES,
         figure_title=f"Epoch {epoch} predictions",
     )

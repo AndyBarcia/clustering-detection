@@ -169,21 +169,50 @@ def run_predictions(
     return [predictions]
 
 
+@torch.no_grad()
+def run_predictions_with_gt_prototypes(
+    system: PanopticSystem,
+    images: Sequence[torch.Tensor],
+    targets: Sequence[dict],
+    *,
+    device: Optional[torch.device] = None,
+):
+    if len(images) == 0:
+        return []
+
+    model_device = device
+    if model_device is None:
+        model_device = next(system.parameters()).device
+
+    batch = torch.stack(list(images)).to(model_device)
+    was_training = system.training
+    system.eval()
+    try:
+        predictions = system.predict_with_gt_prototypes(batch, targets)
+    finally:
+        system.train(was_training)
+
+    if isinstance(predictions, list):
+        return predictions
+    return [predictions]
+
+
 def render_prediction_grid(
     images: Sequence[torch.Tensor],
     targets: Sequence[dict],
-    predictions: Sequence[dict],
+    prediction_columns: Sequence[Tuple[str, Sequence[dict]]],
     *,
     class_names: Optional[Sequence[str]] = None,
     figure_title: Optional[str] = None,
 ):
     num_samples = len(images)
-    fig, axes = plt.subplots(num_samples, 3, figsize=(15, 5 * max(num_samples, 1)), squeeze=False)
+    num_cols = 2 + len(prediction_columns)
+    fig, axes = plt.subplots(num_samples, num_cols, figsize=(5 * num_cols, 5 * max(num_samples, 1)), squeeze=False)
 
     if figure_title:
         fig.suptitle(figure_title, fontsize=14)
 
-    for row_idx, (image, target, prediction) in enumerate(zip(images, targets, predictions)):
+    for row_idx, (image, target) in enumerate(zip(images, targets)):
         image_np = _to_numpy_image(image)
         axes[row_idx, 0].imshow(image_np)
         axes[row_idx, 0].set_title("Input")
@@ -200,18 +229,20 @@ def render_prediction_grid(
             title="Ground Truth",
         )
 
-        pred_masks = [mask.detach().cpu().numpy() for mask in prediction["resolved_masks"]]
-        pred_labels = [int(label) for label in prediction["resolved_labels"]]
-        pred_scores = [float(score) for score in prediction["resolved_scores"]]
-        _draw_instances(
-            axes[row_idx, 2],
-            image_np,
-            pred_masks,
-            pred_labels,
-            scores=pred_scores,
-            class_names=class_names,
-            title="Prediction",
-        )
+        for col_idx, (column_title, predictions) in enumerate(prediction_columns, start=2):
+            prediction = predictions[row_idx]
+            pred_masks = [mask.detach().cpu().numpy() for mask in prediction["resolved_masks"]]
+            pred_labels = [int(label) for label in prediction["resolved_labels"]]
+            pred_scores = [float(score) for score in prediction["resolved_scores"]]
+            _draw_instances(
+                axes[row_idx, col_idx],
+                image_np,
+                pred_masks,
+                pred_labels,
+                scores=pred_scores,
+                class_names=class_names,
+                title=column_title,
+            )
 
     if figure_title:
         plt.tight_layout(rect=(0, 0, 1, 0.97))
@@ -226,15 +257,19 @@ def save_prediction_grid(
     targets: Sequence[dict],
     predictions: Sequence[dict],
     *,
+    gt_proto_predictions: Optional[Sequence[dict]] = None,
     class_names: Optional[Sequence[str]] = None,
     figure_title: Optional[str] = None,
 ):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    prediction_columns = [("Clustered Prediction", predictions)]
+    if gt_proto_predictions is not None:
+        prediction_columns.append(("GT Prototype Prediction", gt_proto_predictions))
     fig = render_prediction_grid(
         images,
         targets,
-        predictions,
+        prediction_columns,
         class_names=class_names,
         figure_title=figure_title,
     )
@@ -248,14 +283,18 @@ def show_prediction_grid(
     targets: Sequence[dict],
     predictions: Sequence[dict],
     *,
+    gt_proto_predictions: Optional[Sequence[dict]] = None,
     class_names: Optional[Sequence[str]] = None,
     figure_title: Optional[str] = None,
     window_title: Optional[str] = None,
 ):
+    prediction_columns = [("Clustered Prediction", predictions)]
+    if gt_proto_predictions is not None:
+        prediction_columns.append(("GT Prototype Prediction", gt_proto_predictions))
     fig = render_prediction_grid(
         images,
         targets,
-        predictions,
+        prediction_columns,
         class_names=class_names,
         figure_title=figure_title,
     )
