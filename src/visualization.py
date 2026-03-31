@@ -13,7 +13,7 @@ import matplotlib.patches as patches
 import numpy as np
 import torch
 
-from .dataset import SyntheticPanopticDataset
+from .dataset import SyntheticPanopticBatchGenerator
 from .panoptic import PanopticSystem
 
 
@@ -28,28 +28,35 @@ def sample_synthetic_examples(
     width: int,
     max_objects: int,
     seed: int = 0,
+    device: Optional[torch.device] = None,
 ) -> Tuple[List[torch.Tensor], List[dict]]:
     py_state = random.getstate()
     np_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
 
     try:
         random.seed(seed)
         np.random.seed(seed)
+        torch.manual_seed(seed)
 
-        dataset = SyntheticPanopticDataset(
-            length=max(dataset_length, num_samples),
+        generator = SyntheticPanopticBatchGenerator(
             height=height,
             width=width,
             max_objects=max_objects,
+            device=device or "cpu",
         )
-        indices = random.sample(range(len(dataset)), k=min(num_samples, len(dataset)))
-        samples = [dataset[idx] for idx in indices]
+        batch_size = min(num_samples, max(dataset_length, num_samples))
+        batch_images, batch_targets = generator.generate_batch(
+            batch_size=batch_size,
+            start_idx=0,
+        )
     finally:
         random.setstate(py_state)
         np.random.set_state(np_state)
+        torch.random.set_rng_state(torch_state)
 
-    images = [image for image, _ in samples]
-    targets = [target for _, target in samples]
+    images = [image for image in batch_images]
+    targets = batch_targets
     return images, targets
 
 

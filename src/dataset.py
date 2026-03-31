@@ -1,216 +1,331 @@
+import math
 import torch
-import torch.utils.data
-import numpy as np
-import cv2
-import matplotlib.pyplot as plt
-import random
+from torch.utils.data import IterableDataset
 import matplotlib.pyplot as plt
 
 
-class SyntheticPanopticDataset(torch.utils.data.Dataset):
-    def __init__(self, length=100, height=256, width=256, max_objects=10):
-        self.length = length
+class BatchedSyntheticIterableDataset(IterableDataset):
+    def __init__(
+        self,
+        generator,
+        total_samples,
+        batch_size,
+        drop_last=False,
+    ):
+        super().__init__()
+        self.generator = generator
+        self.total_samples = int(total_samples)
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+
+    def __len__(self):
+        if self.drop_last:
+            return self.total_samples // self.batch_size
+        return math.ceil(self.total_samples / self.batch_size)
+
+    def __iter__(self):
+        produced = 0
+        next_image_id = 0
+
+        while produced < self.total_samples:
+            remaining = self.total_samples - produced
+
+            if remaining < self.batch_size and self.drop_last:
+                break
+
+            current_bs = min(self.batch_size, remaining)
+
+            images, targets = self.generator.generate_batch(
+                batch_size=current_bs,
+                start_idx=next_image_id,
+            )
+
+            yield images, targets
+
+            produced += current_bs
+            next_image_id += current_bs
+
+
+class SyntheticPanopticBatchGenerator:
+    def __init__(
+        self,
+        height=256,
+        width=256,
+        max_objects=10,
+        device="cuda",
+    ):
         self.height = height
         self.width = width
         self.max_objects = max_objects
-        
-        # Classes: 0=Background, 1=Square, 2=Triangle
-        self.classes = ['Background', 'Square', 'Triangle']
+        self.device = torch.device(
+            device if (device == "cpu" or torch.cuda.is_available()) else "cpu"
+        )
 
-    def __len__(self):
-        return self.length
+        self.classes = ["Background", "Square", "Triangle"]
 
-    def __getitem__(self, idx):
-        # 1. Init empty canvas
-        # Image: H, W, 3 (RGB)
-        img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        # Instance Map: H, W (stores instance IDs)
-        instance_map = np.zeros((self.height, self.width), dtype=np.int32)
-        
-        obj_ids = []
-        obj_classes = []
-        
-        num_objs = random.randint(1, self.max_objects)
-        
-        # 2. Draw objects (Painter's algorithm: later objects overwrite earlier ones)
-        for i in range(num_objs):
-            instance_id = i + 1
-            class_id = random.randint(1, 2) # 1=Square, 2=Triangle
-            
-            # Random color for the image
-            color = np.random.randint(0, 255, (3,)).tolist()
-                        
-            cx = random.randint(20, self.width - 20)
-            cy = random.randint(20, self.height - 20)
-            size = random.randint(10, 40)
-            
-            if class_id == 1: # Square
-                x1, y1 = cx - size, cy - size
-                x2, y2 = cx + size, cy + size
-                cv2.rectangle(img, (x1, y1), (x2, y2), color, -1)
-                cv2.rectangle(instance_map, (x1, y1), (x2, y2), instance_id, -1)
-                
-            elif class_id == 2: # Triangle
-                pt1 = (cx, cy - size)
-                pt2 = (cx - size, cy + size)
-                pt3 = (cx + size, cy + size)
-                points = np.array([pt1, pt2, pt3])
-                cv2.fillPoly(img, [points], color)
-                cv2.fillPoly(instance_map, [points], instance_id)
+        self.margin = 20
+        self.min_size = 10
+        self.max_size = 40
 
-            # Store what we attempted to draw, but we verify existence later
-            obj_ids.append(instance_id)
-            obj_classes.append(class_id)
+        if self.width <= 2 * self.margin or self.height <= 2 * self.margin:
+            raise ValueError("height/width are too small for margin=20.")
 
-        # 3. Process masks based on what is actually visible
-        # In panoptic segmentation, masks must not overlap. 
-        # Since we used painter's algo on 'instance_map', we just extract unique IDs.
-        present_ids = np.unique(instance_map)
-        present_ids = present_ids[present_ids > 0] # Exclude background (0)
+        # Cached coordinate grids on device
+        self.yy = torch.arange(self.height, device=self.device, dtype=torch.int32).view(
+            1, 1, self.height, 1
+        )
+        self.xx = torch.arange(self.width, device=self.device, dtype=torch.int32).view(
+            1, 1, 1, self.width
+        )
 
-        masks = []
-        labels = []
-        boxes = []
+    def _boxes_from_masks(self, masks: torch.Tensor) -> torch.Tensor:
+        """
+        masks: [N, H, W] bool
+        returns: [N, 4] float32 in xyxy
+        """
+        if masks.numel() == 0:
+            return torch.zeros((0, 4), dtype=torch.float32, device=self.device)
 
-        for inst_id in present_ids:
-            # Create binary mask for this instance
-            mask = (instance_map == inst_id).astype(np.uint8)
-            
-            # Find which class this instance originally was
-            # (We look up the index in our creation lists)
-            original_idx = obj_ids.index(inst_id)
-            lbl = obj_classes[original_idx]
-            
-            # Bounding box
-            pos = np.where(mask)
-            xmin = np.min(pos[1])
-            xmax = np.max(pos[1])
-            ymin = np.min(pos[0])
-            ymax = np.max(pos[0])
-            
-            # Filter small artifacts
-            if (xmax - xmin) < 1 or (ymax - ymin) < 1:
-                continue
+        rows = masks.any(dim=2)  # [N, H]
+        cols = masks.any(dim=1)  # [N, W]
 
-            masks.append(mask)
-            labels.append(lbl)
-            boxes.append([xmin, ymin, xmax, ymax])
+        y_min = rows.float().argmax(dim=1)
+        y_max = self.height - 1 - rows.flip(1).float().argmax(dim=1)
+        x_min = cols.float().argmax(dim=1)
+        x_max = self.width - 1 - cols.flip(1).float().argmax(dim=1)
 
-        # Convert to PyTorch Tensors
-        if len(masks) > 0:
-            boxes = torch.as_tensor(boxes, dtype=torch.float32)
-            labels = torch.as_tensor(labels, dtype=torch.int64)
-            masks = torch.as_tensor(np.array(masks), dtype=torch.uint8)
-        else:
-            # Handle rare empty image case
-            boxes = torch.zeros((0, 4), dtype=torch.float32)
-            labels = torch.zeros((0,), dtype=torch.int64)
-            masks = torch.zeros((0, self.height, self.width), dtype=torch.uint8)
+        return torch.stack([x_min, y_min, x_max, y_max], dim=1).to(torch.float32)
 
-        image_id = torch.tensor([idx])
-        area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
-        iscrowd = torch.zeros((len(labels),), dtype=torch.int64)
+    @torch.no_grad()
+    def generate_batch(self, batch_size, start_idx=0):
+        """
+        Returns:
+          images: [B, 3, H, W] float32
+          targets: list[dict]
+        """
+        B = batch_size
+        M = self.max_objects
+        H = self.height
+        W = self.width
+        device = self.device
 
-        target = {}
-        target["boxes"] = boxes
-        target["labels"] = labels
-        target["masks"] = masks
-        target["image_id"] = image_id
-        target["area"] = area
-        target["iscrowd"] = iscrowd
+        # Number of objects per image
+        num_objs = torch.randint(
+            low=1,
+            high=M + 1,
+            size=(B,),
+            device=device,
+            dtype=torch.int32,
+        )  # [B]
 
-        # Normalize image to 0-1 and channels first (C, H, W)
-        img = img / 255.0
-        img = np.transpose(img, (2, 0, 1))
-        img = torch.as_tensor(img, dtype=torch.float32)
+        # Active object slots per image
+        obj_idx0 = torch.arange(M, device=device, dtype=torch.int32).view(1, M)  # [1, M]
+        active = obj_idx0 < num_objs.view(B, 1)  # [B, M] bool
 
-        return img, target
+        # Instance ids are 1..M within each image
+        instance_ids = torch.arange(1, M + 1, device=device, dtype=torch.int32).view(
+            1, M, 1, 1
+        )  # [1, M, 1, 1]
+
+        # Random attributes for all object slots
+        class_ids = torch.randint(
+            low=1,
+            high=3,
+            size=(B, M),
+            device=device,
+            dtype=torch.int64,
+        )  # 1=square, 2=triangle
+
+        colors = torch.randint(
+            low=0,
+            high=256,
+            size=(B, M, 3),
+            device=device,
+            dtype=torch.uint8,
+        )  # [B, M, 3]
+
+        cx = torch.randint(
+            low=self.margin,
+            high=W - self.margin,
+            size=(B, M),
+            device=device,
+            dtype=torch.int32,
+        )
+        cy = torch.randint(
+            low=self.margin,
+            high=H - self.margin,
+            size=(B, M),
+            device=device,
+            dtype=torch.int32,
+        )
+        size = torch.randint(
+            low=self.min_size,
+            high=self.max_size + 1,
+            size=(B, M),
+            device=device,
+            dtype=torch.int32,
+        )
+
+        # Expand attrs to [B, M, 1, 1]
+        cx_e = cx.unsqueeze(-1).unsqueeze(-1)
+        cy_e = cy.unsqueeze(-1).unsqueeze(-1)
+        size_e = size.unsqueeze(-1).unsqueeze(-1)
+
+        # Broadcasted rasterization
+        dx = (self.xx - cx_e).abs()
+        dy = (self.yy - cy_e).abs()
+
+        square_masks = (dx <= size_e) & (dy <= size_e)
+
+        # Triangle:
+        # top    = (cx, cy - size)
+        # left   = (cx - size, cy + size)
+        # right  = (cx + size, cy + size)
+        #
+        # y_rel = y - (cy - size), valid in [0, 2*size]
+        # horizontal half-width = y_rel / 2
+        y_rel = self.yy - (cy_e - size_e)
+        triangle_masks = (
+            (y_rel >= 0)
+            & (y_rel <= 2 * size_e)
+            & ((2 * (self.xx - cx_e).abs()) <= y_rel)
+        )
+
+        obj_masks = torch.where(
+            class_ids.unsqueeze(-1).unsqueeze(-1) == 1,
+            square_masks,
+            triangle_masks,
+        )  # [B, M, H, W]
+
+        # Remove inactive slots
+        obj_masks = obj_masks & active.unsqueeze(-1).unsqueeze(-1)
+
+        # Painter's algorithm:
+        # later object slots overwrite earlier ones, so max instance_id wins
+        instance_map = torch.where(
+            obj_masks,
+            instance_ids.expand(B, -1, H, W),
+            torch.zeros((1,), dtype=torch.int32, device=device),
+        ).amax(dim=1)  # [B, H, W]
+
+        # Visible masks for each slot
+        visible_masks = instance_map.unsqueeze(1) == instance_ids  # [B, M, H, W]
+        keep = active & visible_masks.flatten(2).any(dim=2)  # [B, M]
+
+        # Boxes for all candidate visible masks in one vectorized pass
+        visible_masks_flat = visible_masks.view(B * M, H, W)
+        boxes_flat = self._boxes_from_masks(visible_masks_flat).view(B, M, 4)
+
+        # Filter tiny artifacts
+        valid_box = (
+            ((boxes_flat[..., 2] - boxes_flat[..., 0]) >= 1)
+            & ((boxes_flat[..., 3] - boxes_flat[..., 1]) >= 1)
+        )
+        keep = keep & valid_box
+
+        # Build RGB image by per-image palette lookup
+        palette = torch.zeros((B, M + 1, 3), dtype=torch.uint8, device=device)
+        palette[:, 1:] = colors
+
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1)
+        images = palette[batch_idx, instance_map.long()]  # [B, H, W, 3]
+        images = images.permute(0, 3, 1, 2).to(torch.float32).div_(255.0)  # [B, 3, H, W]
+
+        # Package ragged targets per image
+        targets = []
+        for b in range(B):
+            kb = keep[b]
+            masks_b = visible_masks[b][kb].to(torch.uint8)
+            labels_b = class_ids[b][kb].to(torch.int64)
+            boxes_b = boxes_flat[b][kb].to(torch.float32)
+
+            area_b = (boxes_b[:, 3] - boxes_b[:, 1]) * (boxes_b[:, 2] - boxes_b[:, 0])
+            iscrowd_b = torch.zeros((labels_b.numel(),), dtype=torch.int64, device=device)
+            image_id_b = torch.tensor([start_idx + b], dtype=torch.int64, device=device)
+
+            targets.append(
+                {
+                    "boxes": boxes_b,
+                    "labels": labels_b,
+                    "masks": masks_b,
+                    "image_id": image_id_b,
+                    "area": area_b,
+                    "iscrowd": iscrowd_b,
+                }
+            )
+
+        return images, targets
+
 
 def visualize_sample(image, target):
-    """
-    Displays the image and overlays the ground truth masks.
-    """
-    img_np = image.numpy().transpose(1, 2, 0) # Back to H,W,C
-    masks = target['masks'].numpy()
-    labels = target['labels'].numpy()
-    
-    plt.figure(figsize=(12, 5))
-    
-    # Plot 1: The Raw Image
-    plt.subplot(1, 2, 1)
-    plt.imshow(img_np)
-    plt.title("Synthetic Input Image")
-    plt.axis('off')
-    
-    # Plot 2: Semantic/Instance Map
-    plt.subplot(1, 2, 2)
-    # Create a composite mask for visualization
-    composite_mask = np.zeros((img_np.shape[0], img_np.shape[1]))
-    
-    for i, mask in enumerate(masks):
-        # Assign a unique value per instance to visualize separation
-        composite_mask[mask == 1] = labels[i] * 10 + i 
-        
-        # Draw bounding box on the map
-        box = target['boxes'][i].numpy()
-        rect = plt.Rectangle((box[0], box[1]), box[2]-box[0], box[3]-box[1], 
-                             fill=False, edgecolor='white', linewidth=1)
-        plt.gca().add_patch(rect)
-        plt.text(box[0], box[1], f"Cls: {labels[i]}", color='white', fontsize=8, backgroundcolor='black')
+    image = image.detach().cpu()
+    target = {
+        k: (v.detach().cpu() if torch.is_tensor(v) else v)
+        for k, v in target.items()
+    }
 
-    plt.imshow(composite_mask, cmap='nipy_spectral', interpolation='nearest')
-    plt.title("Ground Truth Instances & Labels")
-    plt.axis('off')
-    
-    plt.tight_layout()
-    plt.show()
+    img_np = image.permute(1, 2, 0).numpy()
+    masks = target["masks"].numpy()
+    labels = target["labels"].numpy()
+    boxes = target["boxes"].numpy()
 
-def visualize_sample(image, target):
-    """
-    Creates a popup window showing the image and ground truth.
-    """
-    # Convert from (C, H, W) to (H, W, C)
-    img_np = image.permute(1, 2, 0).cpu().numpy()
-    masks = target['masks'].cpu().numpy()
-    labels = target['labels'].cpu().numpy()
-    boxes = target['boxes'].cpu().numpy()
-    
     fig, ax = plt.subplots(1, 2, figsize=(12, 6))
-    fig.canvas.manager.set_window_title('Dataset Sample Viewer')
 
-    # Left Plot: Raw Image
     ax[0].imshow(img_np)
     ax[0].set_title("Input Image")
-    ax[0].axis('off')
-    
-    # Right Plot: Instance Segmentation
-    composite_mask = np.zeros((img_np.shape[0], img_np.shape[1]))
-    for i, mask in enumerate(masks):
-        # Create a unique value for each instance for visual contrast
-        composite_mask[mask == 1] = i + 1 
-        
-        # Overlay Bounding Box
-        box = boxes[i]
-        rect = plt.Rectangle((box[0], box[1]), box[2]-box[0], box[3]-box[1], 
-                             fill=False, edgecolor='white', linewidth=1.5)
-        ax[1].add_patch(rect)
-        ax[1].text(box[0], box[1]-5, f"Cls: {labels[i]}", color='yellow', fontsize=10, weight='bold')
+    ax[0].axis("off")
 
-    ax[1].imshow(composite_mask, cmap='nipy_spectral')
+    composite_mask = torch.zeros((img_np.shape[0], img_np.shape[1]), dtype=torch.float32).numpy()
+
+    for i, mask in enumerate(masks):
+        composite_mask[mask == 1] = i + 1
+        box = boxes[i]
+        rect = plt.Rectangle(
+            (box[0], box[1]),
+            box[2] - box[0],
+            box[3] - box[1],
+            fill=False,
+            edgecolor="white",
+            linewidth=1.5,
+        )
+        ax[1].add_patch(rect)
+        ax[1].text(
+            box[0],
+            max(box[1] - 5, 0),
+            f"Cls: {labels[i]}",
+            color="yellow",
+            fontsize=10,
+            weight="bold",
+        )
+
+    ax[1].imshow(composite_mask, cmap="nipy_spectral")
     ax[1].set_title("Instances & Labels")
-    ax[1].axis('off')
-    
+    ax[1].axis("off")
+
     plt.tight_layout()
-    print("Close the popup window to continue...")
     plt.show()
 
-def collate_fn(batch):
-    return tuple(zip(*batch))
 
 if __name__ == "__main__":
-    dataset = SyntheticPanopticDataset(length=10)    
-    data_loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_fn)
-    
-    for images, targets in data_loader:
-        visualize_sample(images[0], targets[0])
-        break
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    generator = SyntheticPanopticBatchGenerator(
+        height=256,
+        width=256,
+        max_objects=10,
+        device=device,
+    )
+
+    batch_size = 16
+
+    # Dense batch tensor + ragged target list
+    images, targets = generator.generate_batch(batch_size=batch_size, start_idx=0)
+
+    print(images.shape)  # [B, 3, H, W]
+    print(len(targets))  # B
+
+    # Visualize first sample
+    visualize_sample(images[0], targets[0])

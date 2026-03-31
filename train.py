@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.config import PanopticSystemConfig
-from src.dataset import SyntheticPanopticDataset, collate_fn
+from src.dataset import SyntheticPanopticBatchGenerator, BatchedSyntheticIterableDataset
 from src.evaluation import evaluate_system, format_metrics_table
 from src.panoptic import PanopticSystem, load_system_checkpoint, save_system_checkpoint
 from src.visualization import (
@@ -75,14 +75,32 @@ def resolve_device(requested_device: Optional[str]) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def build_dataloader(args):
-    dataset = SyntheticPanopticDataset(
-        length=args.dataset_length,
+def build_dataloader(args, device):
+    generator = SyntheticPanopticBatchGenerator(
         height=args.height,
         width=args.width,
         max_objects=args.max_objects,
+        device=device,
     )
-    return DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    dataset = BatchedSyntheticIterableDataset(
+        generator=generator,
+        total_samples=args.dataset_length,
+        batch_size=args.batch_size,
+        drop_last=getattr(args, "drop_last", False),
+    )
+
+    def identity_collate(sample):
+        # With batch_size=None, collate_fn receives a single yielded item.
+        return sample
+
+    loader = DataLoader(
+        dataset,
+        batch_size=None,      # dataset already yields full batches
+        num_workers=0,        # important for CUDA-generated batches
+        pin_memory=False,     # data is already on GPU
+        collate_fn=identity_collate,
+    )
+    return loader
 
 
 def format_epoch_metrics(epoch_metrics):
@@ -152,6 +170,7 @@ def build_visualization_batch(args):
         width=args.width,
         max_objects=args.max_objects,
         seed=args.vis_seed,
+        device="cpu",
     )
 
 
@@ -186,7 +205,7 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    data_loader = build_dataloader(args)
+    data_loader = build_dataloader(args, device)
     vis_images, vis_targets = build_visualization_batch(args)
 
     for epoch_idx in range(start_epoch, args.epochs):
@@ -194,10 +213,7 @@ def main():
         epoch_sums = {}
         interval_sums = {}
         num_batches = 0
-
         for images, targets in data_loader:
-            images = torch.stack(images).to(device)
-
             optimizer.zero_grad(set_to_none=True)
             loss, components = system.training_step(images, targets)
             loss.backward()

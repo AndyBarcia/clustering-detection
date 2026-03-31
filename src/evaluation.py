@@ -8,9 +8,8 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
-from torch.utils.data import DataLoader
 
-from .dataset import SyntheticPanopticDataset, collate_fn
+from .dataset import SyntheticPanopticBatchGenerator, BatchedSyntheticIterableDataset
 from .predictor import ModularPrototypePredictor
 
 
@@ -215,17 +214,16 @@ def evaluate_system(
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    dataset = SyntheticPanopticDataset(
-        length=dataset_length,
+    generator = SyntheticPanopticBatchGenerator(
         height=height,
         width=width,
         max_objects=max_objects,
+        device=device,
     )
-    data_loader = DataLoader(
-        dataset,
+    dataset = BatchedSyntheticIterableDataset(
+        generator=generator,
+        total_samples=dataset_length,
         batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
     )
 
     was_training = system.training
@@ -235,8 +233,8 @@ def evaluate_system(
     object_counts = []
 
     try:
-        for images, targets in data_loader:
-            batch = torch.stack(images).to(device)
+        for batch, targets in dataset:
+            batch = batch.to(device)
             if use_gt_prototypes:
                 predictions = system.predict_with_gt_prototypes(batch, targets)
             else:
@@ -288,17 +286,16 @@ def evaluate_system_many_configs(
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    dataset = SyntheticPanopticDataset(
-        length=dataset_length,
+    generator = SyntheticPanopticBatchGenerator(
         height=height,
         width=width,
         max_objects=max_objects,
+        device=device,
     )
-    data_loader = DataLoader(
-        dataset,
+    dataset = BatchedSyntheticIterableDataset(
+        generator=generator,
+        total_samples=dataset_length,
         batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
     )
 
     was_training = system.training
@@ -312,8 +309,8 @@ def evaluate_system_many_configs(
     object_counts = []
 
     try:
-        for images, targets in data_loader:
-            batch = torch.stack(images).to(device)
+        for batch, targets in dataset:
+            batch = batch.to(device)
             configs_by_ttt_steps = defaultdict(list)
             for key, cfg in inference_cfgs.items():
                 configs_by_ttt_steps[cfg.ttt_steps].append((key, predictors[key]))
