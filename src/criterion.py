@@ -78,7 +78,6 @@ class PanopticCriterion(nn.Module):
                 "loss_mask_total": zero,
                 "loss_sim": zero,
                 "loss_margin": zero,
-                "loss_intra": zero,
                 "loss_inter": zero,
             }
 
@@ -189,8 +188,6 @@ class PanopticCriterion(nn.Module):
         loss_proto_ttt = F.relu(model.compact_margin - true_sim_max).pow(model.alpha_focal).mean()
         total_loss_mask = self.cfg.w_mask_bce * loss_mask_bce + self.cfg.w_mask_iou * loss_mask_iou
 
-        loss_intra = features.sum() * 0.0
-
         final_loss = (
             loss_proto_sig +
             self.cfg.w_proto_ttt * loss_proto_ttt +
@@ -198,7 +195,6 @@ class PanopticCriterion(nn.Module):
             total_loss_mask +
             self.cfg.w_sim * loss_sim +
             self.cfg.w_margin * loss_margin +
-            self.cfg.w_intra * loss_intra +
             self.cfg.w_inter * loss_inter
         )
 
@@ -212,7 +208,6 @@ class PanopticCriterion(nn.Module):
             "loss_mask_total": total_loss_mask,
             "loss_sim": loss_sim,
             "loss_margin": loss_margin,
-            "loss_intra": loss_intra,
             "loss_inter": loss_inter,
         }
 

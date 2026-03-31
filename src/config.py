@@ -4,7 +4,7 @@ from typing import Optional, List, Tuple, Union, get_origin, get_args
 
 @dataclass
 class BackboneConfig:
-    hidden_dim: int = 128
+    hidden_dim: int = 256
     in_channels: int = 3
     conv1_channels: int = 32
     conv2_channels: int = 64
@@ -12,9 +12,9 @@ class BackboneConfig:
 
 @dataclass
 class DecoderLayerConfig:
-    d_model: int = 128
+    d_model: int = 256
     nhead: int = 4
-    dim_feedforward: int = 256
+    dim_feedforward: int = 1024
     dropout: float = 0.1
     activation: str = "gelu"
     ttt_steps: int = 10
@@ -31,7 +31,7 @@ class DecoderConfig:
 @dataclass
 class HeadConfig:
     num_classes: int = 3
-    hidden_dim: int = 128
+    hidden_dim: int = 1024
     sig_dim: int = 64
 
 
@@ -55,7 +55,6 @@ class LossConfig:
     w_mask_iou: float = 5.0
     w_sim: float = 2.0
     w_margin: float = 2.0
-    w_intra: float = 2.0
     w_inter: float = 10.0
     w_proto_ttt: float = 1.0
     inter_margin: float = 0.0
