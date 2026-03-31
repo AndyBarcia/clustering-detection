@@ -3,9 +3,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from sklearn.cluster import DBSCAN
-
 # Optional clustering backends
+try:
+    from sklearn.cluster import DBSCAN
+except ImportError:
+    DBSCAN = None
+
 try:
     import hdbscan as _hdbscan
 except ImportError:
@@ -205,6 +208,8 @@ class ModularPrototypePredictor:
             return np.array([0], dtype=np.int64)
 
         if method == "dbscan":
+            if DBSCAN is None:
+                raise ImportError("scikit-learn is not installed. pip install scikit-learn")
             clusterer = DBSCAN(
                 eps=cfg.dbscan_eps,
                 min_samples=cfg.dbscan_min_samples,
