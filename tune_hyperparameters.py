@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -9,7 +10,62 @@ from typing import Any, Dict, List
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 
-import optuna
+
+def _get_cli_int_flag(flag: str):
+    argv = sys.argv[1:]
+    prefix = f"{flag}="
+    for idx, arg in enumerate(argv):
+        if arg == flag and idx + 1 < len(argv):
+            try:
+                return int(argv[idx + 1])
+            except ValueError:
+                return None
+        if arg.startswith(prefix):
+            try:
+                return int(arg[len(prefix):])
+            except ValueError:
+                return None
+    return None
+
+
+def _apply_thread_env_limit(limit: int):
+    value = str(limit)
+    for var in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[var] = value
+
+
+_cli_cpu_threads = _get_cli_int_flag("--cpu-threads")
+if _cli_cpu_threads is not None and _cli_cpu_threads > 0:
+    _apply_thread_env_limit(_cli_cpu_threads)
+
+try:
+    import optuna
+except ImportError:
+    print("optuna not found. Installing it now...")
+    import subprocess
+    import sys
+    import site
+    import importlib
+
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", 
+        "--user", "--no-cache-dir", "optuna"
+    ])
+    
+    # Refresh sys.path so Python immediately sees the newly created ~/.local/lib/...
+    importlib.invalidate_caches()
+    if site.USER_SITE not in sys.path:
+        sys.path.append(site.USER_SITE)
+    
+    import optuna
+
 import torch
 
 from src.config import PrototypeInferenceConfig, dataclass_from_dict
@@ -26,7 +82,8 @@ DEFAULT_SEARCH_SPACE = {
     "seed.min_foreground_prob": {"type": "float", "low": 0.0, "high": 0.25},
     "seed.use_foreground_in_score": {"type": "categorical", "choices": [False, True]},
     "seed.foreground_score_power": {"type": "float", "low": 0.5, "high": 2.0},
-    "cluster.method": {"type": "categorical", "choices": ["dbscan", "hdbscan", "cc", "louvain", "leiden"]},
+    #"cluster.method": {"type": "categorical", "choices": ["dbscan", "hdbscan", "cc", "louvain", "leiden"]},
+    #"cluster.method": {"type": "categorical", "choices": ["cc"]},
     "cluster.cluster_per_class": {"type": "categorical", "choices": [True, False]},
     "cluster.promote_noise_to_singletons": {"type": "categorical", "choices": [True, False]},
     "cluster.dbscan_eps": {"type": "float", "low": 0.05, "high": 0.3},
@@ -130,6 +187,21 @@ def parse_args():
         help="Optuna study name used for resume/load.",
     )
     parser.add_argument("--device", default="cpu", help="Evaluation device, e.g. cpu or cuda.")
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=None,
+        help=(
+            "Cap CPU worker threads used by PyTorch and common BLAS/OpenMP backends "
+            "such as MKL/OpenBLAS. Useful on shared GPU clusters."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-interop-threads",
+        type=int,
+        default=None,
+        help="Optional PyTorch inter-op thread cap. Only applies when supported by the runtime.",
+    )
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size used for inference.")
     parser.add_argument("--dataset-length", type=int, default=100, help="Number of synthetic samples to evaluate.")
     parser.add_argument("--height", type=int, default=256, help="Synthetic image height.")
@@ -191,6 +263,19 @@ def parse_args():
         help="Mark failed trials and continue instead of aborting the study run.",
     )
     return parser.parse_args()
+
+
+def configure_cpu_threading(args):
+    if args.cpu_threads is not None:
+        if args.cpu_threads <= 0:
+            raise ValueError("--cpu-threads must be > 0 when provided.")
+        _apply_thread_env_limit(args.cpu_threads)
+        torch.set_num_threads(args.cpu_threads)
+
+    if args.cpu_interop_threads is not None:
+        if args.cpu_interop_threads <= 0:
+            raise ValueError("--cpu-interop-threads must be > 0 when provided.")
+        torch.set_num_interop_threads(args.cpu_interop_threads)
 
 
 def load_search_space(path: str | None) -> Dict[str, Dict[str, Any]]:
@@ -411,6 +496,7 @@ def export_study_summary(
 
 def main():
     args = parse_args()
+    configure_cpu_threading(args)
     output_path = Path(args.output_json)
     checkpoint_path = Path(args.checkpoint).resolve()
     search_space = load_search_space(args.search_space_json)
@@ -460,6 +546,10 @@ def main():
     print(f"Search metric: {args.metric}")
     print(f"Existing trials: {len(study.trials)}")
     print(f"Parallel trials per round: {args.parallel_trials}")
+    if args.cpu_threads is not None:
+        print(f"CPU thread cap: {args.cpu_threads}")
+    if args.cpu_interop_threads is not None:
+        print(f"CPU inter-op thread cap: {args.cpu_interop_threads}")
     print(f"Output JSON: {output_path.resolve()}")
     start_time = time.time()
     scheduled_trials = 0
