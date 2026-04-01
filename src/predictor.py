@@ -547,6 +547,7 @@ class ModularPrototypePredictor:
                 "seed_cluster_labels": proto_state["seed_cluster_labels"],
                 "cluster_members": proto_state["cluster_members"],
                 "assignment_weights": torch.empty((flat["q_sig"].shape[0], 0), device=flat["q_sig"].device),
+                "all_proto_sig": proto_state["proto_sig"],
                 "proto_sig": torch.empty((0, flat["q_sig"].shape[-1]), device=flat["q_sig"].device),
                 "proto_cls": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
                 "proto_cls_prob": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
@@ -595,6 +596,7 @@ class ModularPrototypePredictor:
                 "seed_cluster_labels": proto_state["seed_cluster_labels"],
                 "cluster_members": proto_state["cluster_members"],
                 "assignment_weights": proto_state["assignment_weights"],
+                "all_proto_sig": proto_state["proto_sig"],
                 "proto_sig": torch.empty((0, flat["q_sig"].shape[-1]), device=flat["q_sig"].device),
                 "proto_cls": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
                 "proto_cls_prob": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
@@ -640,6 +642,7 @@ class ModularPrototypePredictor:
             "cluster_members": proto_state["cluster_members"],
             "assignment_weights": proto_state["assignment_weights"],
 
+            "all_proto_sig": proto_state["proto_sig"],
             "proto_sig": proto_sig_kept,
             "proto_cls": proto_cls_kept,
             "proto_cls_prob": cls_prob_kept,

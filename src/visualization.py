@@ -13,6 +13,11 @@ import matplotlib.patches as patches
 import numpy as np
 import torch
 
+try:
+    import umap
+except ImportError:
+    umap = None
+
 from .dataset import SyntheticPanopticBatchGenerator
 from .panoptic import PanopticSystem
 
@@ -74,6 +79,184 @@ def _mask_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     ymin = int(ys.min())
     ymax = int(ys.max())
     return xmin, ymin, xmax, ymax
+
+
+def _project_signatures_2d(signatures: np.ndarray) -> np.ndarray:
+    if signatures.shape[0] == 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    if signatures.shape[0] == 1:
+        return np.zeros((1, 2), dtype=np.float32)
+
+    signatures = signatures.astype(np.float32, copy=False)
+
+    if umap is not None:
+        n_neighbors = max(2, min(15, signatures.shape[0] - 1))
+        reducer = umap.UMAP(
+            n_components=2,
+            n_neighbors=n_neighbors,
+            min_dist=0.15,
+            metric="cosine",
+            random_state=0,
+        )
+        return reducer.fit_transform(signatures).astype(np.float32, copy=False)
+
+    centered = signatures - signatures.mean(axis=0, keepdims=True)
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    basis = vh[:2].T
+    if basis.shape[1] < 2:
+        basis = np.pad(basis, ((0, 0), (0, 2 - basis.shape[1])))
+    return (centered @ basis[:, :2]).astype(np.float32, copy=False)
+
+
+def _instance_color(image_np: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    mask_bool = np.asarray(mask).astype(bool)
+    if not mask_bool.any():
+        return np.array([0.85, 0.85, 0.85], dtype=np.float32)
+
+    pixels = image_np[mask_bool]
+    if pixels.size == 0:
+        return np.array([0.85, 0.85, 0.85], dtype=np.float32)
+
+    color = pixels.mean(axis=0)
+    color = 0.2 + 0.8 * color
+    return np.clip(color, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _gt_marker(label: int) -> str:
+    markers = ["o", "s", "^", "D", "P", "X", "v", "*", "<", ">"]
+    return markers[int(label) % len(markers)]
+
+
+def _draw_signature_umap(
+    ax,
+    image_np: np.ndarray,
+    target: dict,
+    prediction: dict,
+    *,
+    class_names: Optional[Sequence[str]] = None,
+    title: str,
+):
+    flat = prediction.get("flat")
+    q_sig = None if flat is None else flat.get("q_sig")
+    q_sim = None if flat is None else flat.get("q_sim")
+    gt_sig = prediction.get("all_proto_sig", prediction.get("proto_sig"))
+
+    if q_sig is None or gt_sig is None:
+        ax.set_title(title)
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No signatures", ha="center", va="center", fontsize=11, transform=ax.transAxes)
+        return
+
+    q_sig_np = q_sig.detach().cpu().numpy()
+    gt_sig_np = gt_sig.detach().cpu().numpy()
+
+    all_sig = np.concatenate([q_sig_np, gt_sig_np], axis=0) if gt_sig_np.shape[0] > 0 else q_sig_np
+    embedding = _project_signatures_2d(all_sig)
+    q_pts = embedding[: q_sig_np.shape[0]]
+    gt_pts = embedding[q_sig_np.shape[0] :]
+
+    gt_masks = [mask.detach().cpu().numpy() for mask in target["masks"]]
+    gt_labels = [int(label) for label in target["labels"].detach().cpu().tolist()]
+    gt_colors = [_instance_color(image_np, mask) for mask in gt_masks]
+    gt_marker_size = 150.0
+    min_query_marker_size = 18.0
+
+    ax.set_title(title)
+    ax.grid(True, alpha=0.15, linewidth=0.5)
+
+    if q_sig_np.shape[0] > 1:
+        q_sig_norm = q_sig_np / np.clip(np.linalg.norm(q_sig_np, axis=1, keepdims=True), 1e-6, None)
+        cosine_dist = 1.0 - np.clip(q_sig_norm @ q_sig_norm.T, -1.0, 1.0)
+        np.fill_diagonal(cosine_dist, np.inf)
+        neighbor_order = np.argsort(cosine_dist, axis=1)
+        arrow_specs = [
+            (0, "red", 0.22, 0.45),
+            (1, "orange", 0.14, 0.35),
+        ]
+        for neighbor_rank, color, alpha, linewidth in arrow_specs:
+            if neighbor_rank >= neighbor_order.shape[1]:
+                continue
+            neighbor_idx = neighbor_order[:, neighbor_rank]
+            for idx, nbr_idx in enumerate(neighbor_idx):
+                dx = q_pts[nbr_idx, 0] - q_pts[idx, 0]
+                dy = q_pts[nbr_idx, 1] - q_pts[idx, 1]
+                ax.arrow(
+                    q_pts[idx, 0],
+                    q_pts[idx, 1],
+                    dx,
+                    dy,
+                    color=color,
+                    alpha=alpha,
+                    linewidth=linewidth,
+                    length_includes_head=True,
+                    head_width=0.0,
+                    head_length=0.0,
+                    zorder=1,
+                )
+
+    if q_sim is not None:
+        q_sim_np = q_sim.detach().cpu().numpy()
+        query_sizes = min_query_marker_size + (gt_marker_size - min_query_marker_size) * np.clip(q_sim_np, 0.0, 1.0)
+    else:
+        query_sizes = np.full((q_pts.shape[0],), min_query_marker_size, dtype=np.float32)
+
+    if gt_sig_np.shape[0] > 0 and prediction.get("assignment_weights") is not None:
+        assignment = prediction["assignment_weights"].detach().cpu().numpy()
+        if assignment.shape[1] > 0:
+            query_owner = assignment.argmax(axis=1)
+            query_strength = assignment.max(axis=1)
+            query_colors = np.asarray([gt_colors[idx] for idx in query_owner], dtype=np.float32)
+            query_alpha = 0.55 + 0.35 * np.clip(query_strength, 0.0, 1.0)
+            for idx in range(q_pts.shape[0]):
+                ax.scatter(
+                    q_pts[idx, 0],
+                    q_pts[idx, 1],
+                    s=float(query_sizes[idx]),
+                    c=[query_colors[idx]],
+                    alpha=float(query_alpha[idx]),
+                    marker=".",
+                    linewidths=0,
+                    zorder=2,
+                )
+        else:
+            ax.scatter(q_pts[:, 0], q_pts[:, 1], s=query_sizes, c="0.7", alpha=0.72, marker=".", linewidths=0, zorder=2)
+    else:
+        ax.scatter(q_pts[:, 0], q_pts[:, 1], s=query_sizes, c="0.7", alpha=0.72, marker=".", linewidths=0, zorder=2)
+
+    for idx, pt in enumerate(gt_pts):
+        label = gt_labels[idx] if idx < len(gt_labels) else idx
+        marker = _gt_marker(label)
+        color = gt_colors[idx] if idx < len(gt_colors) else np.array([0.2, 0.2, 0.2], dtype=np.float32)
+        class_name = str(label)
+        if class_names is not None and 0 <= label < len(class_names):
+            class_name = class_names[label]
+
+        ax.scatter(
+            pt[0],
+            pt[1],
+            s=gt_marker_size,
+            c=[color],
+            marker=marker,
+            edgecolors="black",
+            linewidths=1.2,
+            zorder=3,
+        )
+        ax.text(
+            pt[0],
+            pt[1],
+            f" {class_name}",
+            fontsize=8,
+            color="black",
+            va="center",
+            ha="left",
+            zorder=4,
+        )
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_alpha(0.3)
 
 
 def _draw_instances(
@@ -213,7 +396,8 @@ def render_prediction_grid(
     figure_title: Optional[str] = None,
 ):
     num_samples = len(images)
-    num_cols = 2 + len(prediction_columns)
+    add_signature_column = any("GT Prototype" in title for title, _ in prediction_columns)
+    num_cols = 2 + len(prediction_columns) + int(add_signature_column)
     fig, axes = plt.subplots(num_samples, num_cols, figsize=(5 * num_cols, 5 * max(num_samples, 1)), squeeze=False)
 
     if figure_title:
@@ -236,13 +420,14 @@ def render_prediction_grid(
             title="Ground Truth",
         )
 
-        for col_idx, (column_title, predictions) in enumerate(prediction_columns, start=2):
+        next_col_idx = 2
+        for column_title, predictions in prediction_columns:
             prediction = predictions[row_idx]
             pred_masks = [mask.detach().cpu().numpy() for mask in prediction["resolved_masks"]]
             pred_labels = [int(label) for label in prediction["resolved_labels"]]
             pred_scores = [float(score) for score in prediction["resolved_scores"]]
             _draw_instances(
-                axes[row_idx, col_idx],
+                axes[row_idx, next_col_idx],
                 image_np,
                 pred_masks,
                 pred_labels,
@@ -250,6 +435,18 @@ def render_prediction_grid(
                 class_names=class_names,
                 title=column_title,
             )
+            next_col_idx += 1
+
+            if add_signature_column and "GT Prototype" in column_title:
+                _draw_signature_umap(
+                    axes[row_idx, next_col_idx],
+                    image_np,
+                    target,
+                    prediction,
+                    class_names=class_names,
+                    title="GT Signature UMAP",
+                )
+                next_col_idx += 1
 
     if figure_title:
         plt.tight_layout(rect=(0, 0, 1, 0.97))
