@@ -116,6 +116,7 @@ class ModularPrototypePredictor:
         q_cls = raw.cls_preds[:, b]
         q_sig = raw.sig_embs[:, b]
         q_sim = raw.sim_scores[:, b]
+        q_sim_pairwise = raw.sim_scores_pairwise[:, b]
         q_margin = raw.margin_preds[:, b]
 
         L, N_q, S = q_sig.shape
@@ -125,6 +126,7 @@ class ModularPrototypePredictor:
         q_cls = q_cls.reshape(L * N_q, num_classes)
         q_sig = q_sig.reshape(L * N_q, S)
         q_sim = q_sim.reshape(L * N_q)
+        q_sim_pairwise = q_sim_pairwise.reshape(L * N_q, N_q)
         q_margin = q_margin.reshape(L * N_q)
 
         layer_ids = torch.arange(L, device=device).repeat_interleave(N_q)
@@ -148,6 +150,7 @@ class ModularPrototypePredictor:
             "q_cls_prob": q_cls_prob,
             "q_sig": q_sig,
             "q_sim": q_sim,
+            "q_sim_pairwise": q_sim_pairwise,
             "q_margin": q_margin,
             "q_quality": q_quality,
             "fg_conf": fg_conf,

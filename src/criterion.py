@@ -52,6 +52,7 @@ class PanopticCriterion(nn.Module):
         cls_preds = raw.cls_preds
         sig_embs = raw.sig_embs
         sim_scores = raw.sim_scores
+        sim_scores_pairwise = raw.sim_scores_pairwise
         margin_preds = raw.margin_preds
         intermediate_ttt_q = raw.intermediate_ttt_q
         H_img, W_img = raw.img_shape
@@ -101,6 +102,7 @@ class PanopticCriterion(nn.Module):
         q_mask_emb = mask_embs[:, valid_b]
         q_cls = cls_preds[:, valid_b]
         q_sim_score = sim_scores[:, valid_b]
+        q_sim_score_pairwise = sim_scores_pairwise[:, valid_b]
         q_margin = margin_preds[:, valid_b]
 
         L, _, N_q, S = q_sig.shape
@@ -169,19 +171,41 @@ class PanopticCriterion(nn.Module):
         loss_mask_iou = soft_iou_loss(mask_logits_flat, gt_masks_flat)
 
         true_sim_max, _ = sim_masked.max(dim=2)
-        loss_sim = F.mse_loss(q_sim_score_flat, true_sim_max.detach())
+
+        true_sim_pw_list = []
+        for l_idx in range(L):
+            sig_l = q_sig[l_idx]
+            sig_i = sig_l.unsqueeze(2)
+            sig_j = sig_l.unsqueeze(1)
+            pair_sig = F.normalize((sig_i + sig_j) / 2.0, p=2, dim=-1)
+            pair_sim = torch.einsum("bqks,bms->bqkm", pair_sig, gt_sigs_norm)
+            pair_sim = pair_sim.masked_fill(~gt_pad_mask.view(B_val, 1, 1, M_max), -1.0)
+            true_sim_pw_list.append(pair_sim.max(dim=-1).values)
+
+        true_sim_pairwise = torch.stack(true_sim_pw_list, dim=0)
+        loss_sim = F.mse_loss(q_sim_score_pairwise, true_sim_pairwise.detach())
 
         with torch.no_grad():
             sig_embs_ttt = F.normalize(model.sig_head(intermediate_ttt_q), p=2, dim=-1)
             sig_embs_ttt_val = sig_embs_ttt[:, valid_b]
 
-        sim_scores_ttt = torch.sigmoid(model.sim_head(intermediate_ttt_q).squeeze(-1))
+        steps_L, _, N_q, _ = intermediate_ttt_q.shape
+        q_ttt_flat = intermediate_ttt_q.reshape(steps_L * B, N_q, -1)
+        sim_scores_ttt = torch.sigmoid(model.sim_head(q_ttt_flat)).view(steps_L, B, N_q, N_q)
         sim_scores_ttt_val = sim_scores_ttt[:, valid_b]
 
         with torch.no_grad():
-            sim_ttt = torch.einsum('tbns,bms->tbnm', sig_embs_ttt_val, gt_sigs_norm)
-            sim_ttt_masked = sim_ttt.masked_fill(~gt_pad_mask.view(1, B_val, 1, M_max), -1.0)
-            true_sim_ttt = sim_ttt_masked.max(dim=-1).values
+            true_sim_ttt_pw_list = []
+            for t_idx in range(steps_L):
+                sig_t = sig_embs_ttt_val[t_idx]
+                sig_i = sig_t.unsqueeze(2)
+                sig_j = sig_t.unsqueeze(1)
+                pair_sig = F.normalize((sig_i + sig_j) / 2.0, p=2, dim=-1)
+                pair_sim = torch.einsum("bqks,bms->bqkm", pair_sig, gt_sigs_norm)
+                pair_sim = pair_sim.masked_fill(~gt_pad_mask.view(B_val, 1, 1, M_max), -1.0)
+                true_sim_ttt_pw_list.append(pair_sim.max(dim=-1).values)
+
+            true_sim_ttt = torch.stack(true_sim_ttt_pw_list, dim=0)
 
         loss_sim = loss_sim + F.mse_loss(sim_scores_ttt_val, true_sim_ttt.detach())
 

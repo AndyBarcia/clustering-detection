@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch.func import functional_call
 import copy
 import contextlib
+import math
 from typing import Optional
 
 from .config import ModelConfig
@@ -178,6 +179,35 @@ class TTTTransformerDecoder(nn.Module):
         return all_outputs, intermediate_ttt_q
 
 
+class PairwisePredictor(nn.Module):
+    def __init__(self, d_model: int, n_heads: int = 16):
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+        self.q = nn.Linear(d_model, d_model)
+        self.k = nn.Linear(d_model, d_model)
+        self.out = nn.Linear(n_heads, 1)
+        self.n_heads = n_heads
+
+    def forward(self, qx: torch.Tensor, qy: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, Q, C = qx.shape
+        q = self.q(qx)
+
+        if qy is None:
+            qy = qx
+        K_len = qy.shape[1]
+        k = self.k(qy)
+
+        head_dim = C // self.n_heads
+        q = q.view(B, Q, self.n_heads, head_dim)
+        k = k.view(B, K_len, self.n_heads, head_dim)
+
+        dot_product = torch.einsum("bqhd,bkhd->bqkh", q, k) / math.sqrt(head_dim)
+        dot_product = torch.tanh(dot_product)
+        out = self.out(dot_product)
+        return out.squeeze(-1)
+
+
 class CustomMask2Former(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -229,11 +259,7 @@ class CustomMask2Former(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, sig_dim),
         )
-        self.sim_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
+        self.sim_head = PairwisePredictor(d_model=hidden_dim, n_heads=16)
         self.margin_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -325,9 +351,12 @@ class CustomMask2Former(nn.Module):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
         sig_embs = F.normalize(self.sig_head(q), p=2, dim=-1)
-        sim_scores = torch.sigmoid(self.sim_head(q).squeeze(-1))
+        L, B, N_q, C = q.shape
+        q_flat = q.reshape(L * B, N_q, C)
+        sim_scores_pairwise = torch.sigmoid(self.sim_head(q_flat)).view(L, B, N_q, N_q)
+        sim_scores = sim_scores_pairwise.diagonal(dim1=2, dim2=3)
         margin_preds = torch.sigmoid(self.margin_head(q).squeeze(-1))
-        return mask_embs, cls_preds, sig_embs, sim_scores, margin_preds
+        return mask_embs, cls_preds, sig_embs, sim_scores, sim_scores_pairwise, margin_preds
 
     def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
@@ -335,7 +364,7 @@ class CustomMask2Former(nn.Module):
         features, memory = self._build_memory(images)
         q_dec_all, intermediate_ttt_q = self._decode_queries(memory, ttt_steps_override=ttt_steps_override)
 
-        mask_embs, cls_preds, sig_embs, sim_scores, margin_preds = self._run_heads(q_dec_all)
+        mask_embs, cls_preds, sig_embs, sim_scores, sim_scores_pairwise, margin_preds = self._run_heads(q_dec_all)
 
         return RawOutputs(
             features=features,
@@ -346,6 +375,7 @@ class CustomMask2Former(nn.Module):
             cls_preds=cls_preds,
             sig_embs=sig_embs,
             sim_scores=sim_scores,
+            sim_scores_pairwise=sim_scores_pairwise,
             margin_preds=margin_preds,
             layer_importance=F.softmax(self.layer_importance, dim=0),
             img_shape=(H_img, W_img),
