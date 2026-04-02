@@ -42,6 +42,13 @@ def _alpha_value(alpha_obj) -> float:
     return float(alpha_obj)
 
 
+def _assignment_affinity(similarity: torch.Tensor, influence: torch.Tensor, similarity_floor: float = 0.0):
+    affinity = (similarity + influence.unsqueeze(1)).clamp(0.0, 1.0)
+    if similarity_floor > 0.0:
+        affinity = affinity.clamp_min(similarity_floor)
+    return affinity
+
+
 def _cosine_affinity_np(x: np.ndarray) -> np.ndarray:
     return np.clip(x @ x.T, 0.0, 1.0)
 
@@ -116,6 +123,7 @@ class ModularPrototypePredictor:
         q_cls = raw.cls_preds[:, b]
         q_sig = raw.sig_embs[:, b]
         q_sim = raw.sim_scores[:, b]
+        q_influence = raw.influence_preds[:, b]
         q_margin = raw.margin_preds[:, b]
 
         L, N_q, S = q_sig.shape
@@ -125,6 +133,7 @@ class ModularPrototypePredictor:
         q_cls = q_cls.reshape(L * N_q, num_classes)
         q_sig = q_sig.reshape(L * N_q, S)
         q_sim = q_sim.reshape(L * N_q)
+        q_influence = q_influence.reshape(L * N_q)
         q_margin = q_margin.reshape(L * N_q)
 
         layer_ids = torch.arange(L, device=device).repeat_interleave(N_q)
@@ -148,6 +157,7 @@ class ModularPrototypePredictor:
             "q_cls_prob": q_cls_prob,
             "q_sig": q_sig,
             "q_sim": q_sim,
+            "q_influence": q_influence,
             "q_margin": q_margin,
             "q_quality": q_quality,
             "fg_conf": fg_conf,
@@ -397,8 +407,9 @@ class ModularPrototypePredictor:
 
         n_steps = max(1, cfg.refinement_steps)
         for _ in range(n_steps):
-            sim = torch.matmul(q_sig, proto_sig.T).clamp_min(cfg.similarity_floor)
-            raw_w = sim.pow(alpha)
+            sim = torch.matmul(q_sig, proto_sig.T)
+            affinity = _assignment_affinity(sim, flat["q_influence"][q_idx], cfg.similarity_floor)
+            raw_w = affinity.pow(alpha)
 
             if cfg.use_layer_weights:
                 raw_w = raw_w * flat["layer_weights_flat"][q_idx].unsqueeze(1)
@@ -488,8 +499,9 @@ class ModularPrototypePredictor:
         q_mask_emb = flat["q_mask_emb"]
 
         alpha = _alpha_value(model.alpha_focal) if self.cfg.assign.use_alpha_focal else 1.0
-        sim = torch.matmul(q_sig, gt_sig.T).clamp_min(self.cfg.assign.similarity_floor)
-        raw_w = sim.pow(alpha)
+        sim = torch.matmul(q_sig, gt_sig.T)
+        affinity = _assignment_affinity(sim, flat["q_influence"], self.cfg.assign.similarity_floor)
+        raw_w = affinity.pow(alpha)
 
         if self.cfg.assign.use_layer_weights:
             raw_w = raw_w * flat["layer_weights_flat"].unsqueeze(1)

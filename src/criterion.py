@@ -8,6 +8,18 @@ from .model import CustomMask2Former
 from .outputs import RawOutputs
 
 
+def assignment_weights_with_influence(
+    similarity: torch.Tensor,
+    influence: torch.Tensor,
+    alpha,
+    valid_mask: torch.Tensor | None = None,
+):
+    affinity = (similarity + influence.unsqueeze(-1)).clamp(0.0, 1.0)
+    if valid_mask is not None:
+        affinity = affinity.masked_fill(~valid_mask.unsqueeze(1), 0.0)
+    return affinity.pow(alpha)
+
+
 def sigmoid_focal_loss(inputs, targets, alpha=0.25, gamma=2.0):
     """Optional: Focal loss is often better than BCE for extreme foreground/background imbalance"""
     prob = torch.sigmoid(inputs)
@@ -52,6 +64,7 @@ class PanopticCriterion(nn.Module):
         cls_preds = raw.cls_preds
         sig_embs = raw.sig_embs
         sim_scores = raw.sim_scores
+        influence_preds = raw.influence_preds
         margin_preds = raw.margin_preds
         intermediate_ttt_q = raw.intermediate_ttt_q
         H_img, W_img = raw.img_shape
@@ -101,6 +114,7 @@ class PanopticCriterion(nn.Module):
         q_mask_emb = mask_embs[:, valid_b]
         q_cls = cls_preds[:, valid_b]
         q_sim_score = sim_scores[:, valid_b]
+        q_influence = influence_preds[:, valid_b]
         q_margin = margin_preds[:, valid_b]
 
         L, _, N_q, S = q_sig.shape
@@ -109,13 +123,19 @@ class PanopticCriterion(nn.Module):
         q_mask_emb_flat = q_mask_emb.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_sim_score_flat = q_sim_score.transpose(0, 1).reshape(B_val, L * N_q)
+        q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
         q_margin_flat = q_margin.transpose(0, 1).reshape(B_val, L * N_q)
 
         gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
 
         sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
         sim_masked = sim.masked_fill(~gt_pad_mask.unsqueeze(1), -1.0)
-        weights_raw = sim_masked.clamp_min(0.0).pow(model.alpha_focal)
+        weights_raw = assignment_weights_with_influence(
+            similarity=sim,
+            influence=q_influence_flat,
+            alpha=model.alpha_focal,
+            valid_mask=gt_pad_mask,
+        )
 
         layer_weights = raw.layer_importance
         weights_shaped = weights_raw.view(B_val, L, N_q, M_max)

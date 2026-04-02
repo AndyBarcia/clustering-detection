@@ -13,6 +13,7 @@ class RawOutputs:
     cls_preds: torch.Tensor         # [L, B, Nq, K]
     sig_embs: torch.Tensor          # [L, B, Nq, S]
     sim_scores: torch.Tensor        # [L, B, Nq]
+    influence_preds: torch.Tensor   # [L, B, Nq]
     margin_preds: torch.Tensor      # [L, B, Nq]
     layer_importance: torch.Tensor  # [L]
     img_shape: Tuple[int, int]
