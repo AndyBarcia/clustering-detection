@@ -173,32 +173,29 @@ class ModularPrototypePredictor:
         if cfg.use_foreground_in_score:
             score = score * flat["fg_conf"].pow(cfg.foreground_score_power)
 
-        keep = torch.ones_like(score, dtype=torch.bool)
+        eligible = torch.ones_like(score, dtype=torch.bool)
 
         if cfg.exclude_background:
-            keep &= (flat["pred_cls"] != 0)
+            eligible &= (flat["pred_cls"] != 0)
 
         if cfg.min_foreground_prob > 0:
-            keep &= (flat["fg_conf"] >= cfg.min_foreground_prob)
+            eligible &= (flat["fg_conf"] >= cfg.min_foreground_prob)
 
+        if cfg.max_influence is not None:
+            eligible &= (flat["q_influence"] <= cfg.max_influence)
+
+        keep = eligible.clone()
         keep &= (score >= cfg.quality_threshold)
 
         seed_idx = torch.where(keep)[0]
 
         if seed_idx.numel() < cfg.min_num_seeds:
-            fallback = torch.ones_like(score, dtype=torch.bool)
-            if cfg.exclude_background:
-                fallback &= (flat["pred_cls"] != 0)
-            if cfg.min_foreground_prob > 0:
-                fallback &= (flat["fg_conf"] >= cfg.min_foreground_prob)
+            fallback_idx = torch.where(eligible)[0]
 
-            fallback_idx = torch.where(fallback)[0]
-            if fallback_idx.numel() == 0:
-                fallback_idx = torch.arange(score.numel(), device=score.device)
-
-            k = min(cfg.min_num_seeds, fallback_idx.numel())
-            top_local = torch.topk(score[fallback_idx], k=k).indices
-            seed_idx = fallback_idx[top_local]
+            if fallback_idx.numel() > 0:
+                k = min(cfg.min_num_seeds, fallback_idx.numel())
+                top_local = torch.topk(score[fallback_idx], k=k).indices
+                seed_idx = fallback_idx[top_local]
 
         if cfg.topk is not None and seed_idx.numel() > cfg.topk:
             top_local = torch.topk(score[seed_idx], k=cfg.topk).indices

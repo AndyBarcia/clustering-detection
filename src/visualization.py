@@ -139,7 +139,7 @@ def _draw_signature_umap(
 ):
     flat = prediction.get("flat")
     q_sig = None if flat is None else flat.get("q_sig")
-    q_sim = None if flat is None else flat.get("q_sim")
+    q_influence = None if flat is None else flat.get("q_influence")
     gt_sig = prediction.get("all_proto_sig", prediction.get("proto_sig"))
 
     if q_sig is None or gt_sig is None:
@@ -161,6 +161,7 @@ def _draw_signature_umap(
     gt_colors = [_instance_color(image_np, mask) for mask in gt_masks]
     gt_marker_size = 150.0
     min_query_marker_size = 18.0
+    max_query_marker_size = 300.0
 
     ax.set_title(title)
     ax.grid(True, alpha=0.15, linewidth=0.5)
@@ -195,9 +196,15 @@ def _draw_signature_umap(
                     zorder=1,
                 )
 
-    if q_sim is not None:
-        q_sim_np = q_sim.detach().cpu().numpy()
-        query_sizes = min_query_marker_size + (gt_marker_size - min_query_marker_size) * np.clip(q_sim_np, 0.0, 1.0)
+    if q_influence is not None:
+        q_influence_np = q_influence.detach().cpu().numpy()
+        influence_min = float(np.min(q_influence_np))
+        influence_max = float(np.max(q_influence_np))
+        if influence_max > influence_min:
+            influence_norm = (q_influence_np - influence_min) / (influence_max - influence_min)
+        else:
+            influence_norm = np.ones_like(q_influence_np, dtype=np.float32)
+        query_sizes = min_query_marker_size + (max_query_marker_size - min_query_marker_size) * np.clip(influence_norm, 0.0, 1.0)
     else:
         query_sizes = np.full((q_pts.shape[0],), min_query_marker_size, dtype=np.float32)
 

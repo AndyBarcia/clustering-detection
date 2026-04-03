@@ -68,6 +68,7 @@ class SeedFilterConfig:
     min_num_seeds: int = 1
     exclude_background: bool = True
     min_foreground_prob: float = 0.22
+    max_influence: Optional[float] = None
     use_foreground_in_score: bool = False
     foreground_score_power: float = 1.0
 
