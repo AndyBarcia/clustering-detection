@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import os
 import random
+from dataclasses import asdict
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
@@ -12,17 +15,21 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 import torch
+from matplotlib.widgets import Button, CheckButtons, RadioButtons, Slider
 
 try:
     import umap
 except ImportError:
     umap = None
 
+from .config import PrototypeInferenceConfig
 from .dataset import SyntheticPanopticBatchGenerator
+from .predictor import ModularPrototypePredictor
 from .panoptic import PanopticSystem
 
 
 DEFAULT_CLASS_NAMES = ["Background", "Square", "Triangle"]
+_SIGNATURE_PROJECTION_CACHE: dict[tuple, np.ndarray] = {}
 
 
 def sample_synthetic_examples(
@@ -89,6 +96,13 @@ def _project_signatures_2d(signatures: np.ndarray) -> np.ndarray:
         return np.zeros((1, 2), dtype=np.float32)
 
     signatures = signatures.astype(np.float32, copy=False)
+    signatures_key = (
+        signatures.shape,
+        hashlib.blake2b(np.ascontiguousarray(signatures).view(np.uint8), digest_size=16).hexdigest(),
+    )
+    cached = _SIGNATURE_PROJECTION_CACHE.get(signatures_key)
+    if cached is not None:
+        return cached.copy()
 
     if umap is not None:
         n_neighbors = max(2, min(15, signatures.shape[0] - 1))
@@ -99,14 +113,17 @@ def _project_signatures_2d(signatures: np.ndarray) -> np.ndarray:
             metric="cosine",
             random_state=0,
         )
-        return reducer.fit_transform(signatures).astype(np.float32, copy=False)
+        embedding = reducer.fit_transform(signatures).astype(np.float32, copy=False)
+    else:
+        centered = signatures - signatures.mean(axis=0, keepdims=True)
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        basis = vh[:2].T
+        if basis.shape[1] < 2:
+            basis = np.pad(basis, ((0, 0), (0, 2 - basis.shape[1])))
+        embedding = (centered @ basis[:, :2]).astype(np.float32, copy=False)
 
-    centered = signatures - signatures.mean(axis=0, keepdims=True)
-    _, _, vh = np.linalg.svd(centered, full_matrices=False)
-    basis = vh[:2].T
-    if basis.shape[1] < 2:
-        basis = np.pad(basis, ((0, 0), (0, 2 - basis.shape[1])))
-    return (centered @ basis[:, :2]).astype(np.float32, copy=False)
+    _SIGNATURE_PROJECTION_CACHE[signatures_key] = embedding.copy()
+    return embedding
 
 
 def _instance_color(image_np: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -333,14 +350,15 @@ def _draw_instances(
 
 
 @torch.no_grad()
-def run_predictions(
+def run_raw_outputs(
     system: PanopticSystem,
     images: Sequence[torch.Tensor],
     *,
+    inference_cfg: Optional[PrototypeInferenceConfig] = None,
     device: Optional[torch.device] = None,
 ):
     if len(images) == 0:
-        return []
+        return None
 
     model_device = device
     if model_device is None:
@@ -350,7 +368,34 @@ def run_predictions(
     was_training = system.training
     system.eval()
     try:
-        predictions = system.predict(batch)
+        ttt_steps = system._resolve_ttt_steps(inference_cfg)
+        raw = system.model(batch, ttt_steps_override=ttt_steps)
+    finally:
+        system.train(was_training)
+
+    return raw
+
+
+@torch.no_grad()
+def run_predictions(
+    system: PanopticSystem,
+    images: Sequence[torch.Tensor],
+    *,
+    raw=None,
+    inference_cfg: Optional[PrototypeInferenceConfig] = None,
+    device: Optional[torch.device] = None,
+):
+    if len(images) == 0:
+        return []
+
+    predictor = system.predictor if inference_cfg is None else ModularPrototypePredictor(inference_cfg)
+    if raw is None:
+        raw = run_raw_outputs(system, images, inference_cfg=inference_cfg, device=device)
+
+    was_training = system.training
+    system.eval()
+    try:
+        predictions = predictor.predict_from_raw(system.model, raw)
     finally:
         system.train(was_training)
 
@@ -365,20 +410,21 @@ def run_predictions_with_gt_prototypes(
     images: Sequence[torch.Tensor],
     targets: Sequence[dict],
     *,
+    raw=None,
+    inference_cfg: Optional[PrototypeInferenceConfig] = None,
     device: Optional[torch.device] = None,
 ):
     if len(images) == 0:
         return []
 
-    model_device = device
-    if model_device is None:
-        model_device = next(system.parameters()).device
+    predictor = system.predictor if inference_cfg is None else ModularPrototypePredictor(inference_cfg)
+    if raw is None:
+        raw = run_raw_outputs(system, images, inference_cfg=inference_cfg, device=device)
 
-    batch = torch.stack(list(images)).to(model_device)
     was_training = system.training
     system.eval()
     try:
-        predictions = system.predict_with_gt_prototypes(batch, targets)
+        predictions = predictor.predict_from_raw_with_gt_prototypes(system.model, raw, targets)
     finally:
         system.train(was_training)
 
@@ -387,21 +433,65 @@ def run_predictions_with_gt_prototypes(
     return [predictions]
 
 
-def render_prediction_grid(
+def run_gt_signature_reference(
+    system: PanopticSystem,
+    images: Sequence[torch.Tensor],
+    targets: Sequence[dict],
+    *,
+    raw=None,
+    inference_cfg: Optional[PrototypeInferenceConfig] = None,
+    device: Optional[torch.device] = None,
+):
+    if len(images) == 0:
+        return []
+
+    predictor = system.predictor if inference_cfg is None else ModularPrototypePredictor(inference_cfg)
+    if raw is None:
+        raw = run_raw_outputs(system, images, inference_cfg=inference_cfg, device=device)
+
+    refs = []
+    for idx, target in enumerate(targets):
+        flat = predictor._flatten_outputs(raw, idx)
+        # GT encoding may run the decoder's TTT adaptation loop, which needs gradients
+        # even during interactive evaluation.
+        with torch.enable_grad():
+            proto_state = predictor._build_gt_proto_state(system.model, raw, flat, targets, idx)
+        refs.append(
+            {
+                "flat": flat,
+                "all_proto_sig": proto_state["proto_sig"],
+                "assignment_weights": proto_state["assignment_weights"],
+                "resolved_masks": [],
+                "resolved_labels": [],
+                "resolved_scores": [],
+            }
+        )
+    return refs
+
+
+def _build_prediction_columns(
+    predictions: Sequence[dict],
+    gt_proto_predictions: Optional[Sequence[dict]] = None,
+):
+    prediction_columns = [("Clustered Prediction", predictions)]
+    if gt_proto_predictions is not None:
+        prediction_columns.append(("GT Prototype Prediction", gt_proto_predictions))
+    return prediction_columns
+
+
+def _draw_prediction_grid_axes(
+    axes,
     images: Sequence[torch.Tensor],
     targets: Sequence[dict],
     prediction_columns: Sequence[Tuple[str, Sequence[dict]]],
     *,
     class_names: Optional[Sequence[str]] = None,
-    figure_title: Optional[str] = None,
 ):
-    num_samples = len(images)
+    axes = np.atleast_2d(axes)
     add_signature_column = any("GT Prototype" in title for title, _ in prediction_columns)
-    num_cols = 2 + len(prediction_columns) + int(add_signature_column)
-    fig, axes = plt.subplots(num_samples, num_cols, figsize=(5 * num_cols, 5 * max(num_samples, 1)), squeeze=False)
 
-    if figure_title:
-        fig.suptitle(figure_title, fontsize=14)
+    for ax in axes.flat:
+        ax.clear()
 
     for row_idx, (image, target) in enumerate(zip(images, targets)):
         image_np = _to_numpy_image(image)
@@ -448,6 +538,81 @@ def render_prediction_grid(
                 )
                 next_col_idx += 1
 
+
+def _draw_interactive_sample_axes(
+    axes,
+    image: torch.Tensor,
+    target: dict,
+    prediction: dict,
+    *,
+    signature_reference: Optional[dict] = None,
+    class_names: Optional[Sequence[str]] = None,
+):
+    image_np = _to_numpy_image(image)
+    axes = list(np.ravel(axes))
+    for ax in axes:
+        ax.clear()
+
+    gt_masks = [mask.detach().cpu().numpy() for mask in target["masks"]]
+    gt_labels = [int(label) for label in target["labels"].detach().cpu().tolist()]
+    _draw_instances(
+        axes[0],
+        image_np,
+        gt_masks,
+        gt_labels,
+        class_names=class_names,
+        title="Ground Truth",
+    )
+
+    pred_masks = [mask.detach().cpu().numpy() for mask in prediction["resolved_masks"]]
+    pred_labels = [int(label) for label in prediction["resolved_labels"]]
+    pred_scores = [float(score) for score in prediction["resolved_scores"]]
+    _draw_instances(
+        axes[1],
+        image_np,
+        pred_masks,
+        pred_labels,
+        scores=pred_scores,
+        class_names=class_names,
+        title="Clustered Prediction",
+    )
+
+    if len(axes) > 2:
+        reference = prediction if signature_reference is None else signature_reference
+        _draw_signature_umap(
+            axes[2],
+            image_np,
+            target,
+            reference,
+            class_names=class_names,
+            title="GT Signature UMAP",
+        )
+
+
+def render_prediction_grid(
+    images: Sequence[torch.Tensor],
+    targets: Sequence[dict],
+    prediction_columns: Sequence[Tuple[str, Sequence[dict]]],
+    *,
+    class_names: Optional[Sequence[str]] = None,
+    figure_title: Optional[str] = None,
+):
+    num_samples = len(images)
+    add_signature_column = any("GT Prototype" in title for title, _ in prediction_columns)
+    num_cols = 2 + len(prediction_columns) + int(add_signature_column)
+    fig, axes = plt.subplots(num_samples, num_cols, figsize=(5 * num_cols, 5 * max(num_samples, 1)), squeeze=False)
+
+    if figure_title:
+        fig.suptitle(figure_title, fontsize=14)
+
+    _draw_prediction_grid_axes(
+        axes,
+        images,
+        targets,
+        prediction_columns,
+        class_names=class_names,
+    )
+
     if figure_title:
         plt.tight_layout(rect=(0, 0, 1, 0.97))
     else:
@@ -467,9 +632,7 @@ def save_prediction_grid(
 ):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    prediction_columns = [("Clustered Prediction", predictions)]
-    if gt_proto_predictions is not None:
-        prediction_columns.append(("GT Prototype Prediction", gt_proto_predictions))
+    prediction_columns = _build_prediction_columns(predictions, gt_proto_predictions)
     fig = render_prediction_grid(
         images,
         targets,
@@ -492,9 +655,7 @@ def show_prediction_grid(
     figure_title: Optional[str] = None,
     window_title: Optional[str] = None,
 ):
-    prediction_columns = [("Clustered Prediction", predictions)]
-    if gt_proto_predictions is not None:
-        prediction_columns.append(("GT Prototype Prediction", gt_proto_predictions))
+    prediction_columns = _build_prediction_columns(predictions, gt_proto_predictions)
     fig = render_prediction_grid(
         images,
         targets,
@@ -506,3 +667,454 @@ def show_prediction_grid(
         fig.canvas.manager.set_window_title(window_title)
     plt.show()
     plt.close(fig)
+
+
+def render_prediction_grid_to_image(
+    images: Sequence[torch.Tensor],
+    targets: Sequence[dict],
+    prediction_columns: Sequence[Tuple[str, Sequence[dict]]],
+    *,
+    class_names: Optional[Sequence[str]] = None,
+    figure_title: Optional[str] = None,
+    dpi: float = 110.0,
+) -> np.ndarray:
+    fig = render_prediction_grid(
+        images,
+        targets,
+        prediction_columns,
+        class_names=class_names,
+        figure_title=figure_title,
+    )
+    fig.set_dpi(dpi)
+    fig.canvas.draw()
+    image = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)[..., :3].copy()
+    plt.close(fig)
+    return image
+
+
+def _available_cluster_methods() -> List[str]:
+    from . import predictor as predictor_module
+
+    methods = ["cc"]
+    if predictor_module.DBSCAN is not None:
+        methods.append("dbscan")
+    if predictor_module._hdbscan is not None:
+        methods.append("hdbscan")
+    if predictor_module.nx is not None and hasattr(predictor_module.nx.algorithms.community, "louvain_communities"):
+        methods.append("louvain")
+    if predictor_module.ig is not None and predictor_module.leidenalg is not None:
+        methods.append("leiden")
+    return methods
+
+
+class InteractivePredictionGrid:
+    def __init__(
+        self,
+        system: PanopticSystem,
+        images: Sequence[torch.Tensor],
+        targets: Sequence[dict],
+        *,
+        class_names: Optional[Sequence[str]] = None,
+        figure_title: Optional[str] = None,
+        window_title: Optional[str] = None,
+        include_gt_proto_predictions: bool = True,
+        device: Optional[torch.device] = None,
+        sample_callback: Optional[Callable[[], Tuple[List[torch.Tensor], List[dict]]]] = None,
+    ):
+        self.system = system
+        self.images = list(images)
+        self.targets = list(targets)
+        self.class_names = class_names
+        self.figure_title = figure_title
+        self.include_gt_proto_predictions = include_gt_proto_predictions
+        self.device = device
+        self.sample_callback = sample_callback
+
+        self.base_cfg = copy.deepcopy(system.cfg.inference)
+        self.available_cluster_methods = _available_cluster_methods()
+        if self.base_cfg.cluster.method not in self.available_cluster_methods:
+            self.available_cluster_methods.append(self.base_cfg.cluster.method)
+
+        num_cols = 2 + int(include_gt_proto_predictions)
+        self.current_index = 0
+
+        self.fig = plt.figure(figsize=(16, 6.8))
+        grid_spec = self.fig.add_gridspec(
+            1,
+            num_cols,
+            left=0.04,
+            right=0.62,
+            top=0.86,
+            bottom=0.08,
+            wspace=0.08,
+        )
+        self.display_axes = np.empty((1, num_cols), dtype=object)
+        for col_idx in range(num_cols):
+            self.display_axes[0, col_idx] = self.fig.add_subplot(grid_spec[0, col_idx])
+        self._dirty = False
+        self._raw_cache: dict[tuple[int, Optional[int]], object] = {}
+        self._gt_signature_cache: dict[tuple, dict] = {}
+
+        if figure_title:
+            self.fig.suptitle(figure_title, fontsize=14)
+        if window_title and self.fig.canvas.manager is not None:
+            self.fig.canvas.manager.set_window_title(window_title)
+
+        self._suspend_callbacks = False
+        self._build_controls()
+        self.refresh_predictions()
+
+    def _build_controls(self):
+        x0 = 0.66
+        width = 0.30
+        button_w = 0.072
+        gap = 0.007
+
+        self.prev_button = Button(self.fig.add_axes([0.04, 0.90, 0.05, 0.04]), "Prev")
+        self.prev_button.on_clicked(self._on_prev_sample)
+        self.next_button = Button(self.fig.add_axes([0.095, 0.90, 0.05, 0.04]), "Next")
+        self.next_button.on_clicked(self._on_next_sample)
+        self.sample_text = self.fig.text(0.155, 0.912, "", fontsize=10, ha="left", va="center")
+
+        self.apply_button = Button(self.fig.add_axes([x0, 0.92, button_w, 0.04]), "Apply")
+        self.apply_button.on_clicked(self._on_apply_clicked)
+
+        self.reset_button = Button(self.fig.add_axes([x0 + button_w + gap, 0.92, button_w, 0.04]), "Reset")
+        self.reset_button.on_clicked(self._on_reset_clicked)
+
+        self.resample_button = None
+        if self.sample_callback is not None:
+            self.resample_button = Button(self.fig.add_axes([x0 + 2 * (button_w + gap), 0.92, button_w, 0.04]), "Resample")
+            self.resample_button.on_clicked(self._on_resample_clicked)
+
+        title_ax = self.fig.add_axes([x0, 0.88, width, 0.03])
+        title_ax.axis("off")
+        title_ax.text(0.0, 0.5, "Inference Controls", fontsize=11, fontweight="bold", va="center")
+
+        radio_ax = self.fig.add_axes([x0, 0.72, width, 0.14])
+        self.cluster_method_radio = RadioButtons(
+            radio_ax,
+            self.available_cluster_methods,
+            active=self.available_cluster_methods.index(self.base_cfg.cluster.method),
+        )
+        self.cluster_method_radio.on_clicked(self._on_widget_change)
+
+        checks_ax = self.fig.add_axes([x0, 0.49, width, 0.2])
+        self.toggle_labels = [
+            "Cluster per class",
+            "Use all queries",
+            "Use query quality",
+            "FG confidence",
+            "Assign strength",
+        ]
+        self.toggle_checks = CheckButtons(
+            checks_ax,
+            self.toggle_labels,
+            [
+                self.base_cfg.cluster.cluster_per_class,
+                self.base_cfg.assign.use_all_queries,
+                self.base_cfg.assign.use_query_quality,
+                self.base_cfg.overlap.use_foreground_confidence,
+                self.base_cfg.overlap.use_assignment_strength,
+            ],
+        )
+        self.toggle_checks.on_clicked(self._on_widget_change)
+
+        slider_h = 0.025
+        slider_gap = 0.042
+        slider_y = 0.45
+
+        max_topk = self.system.cfg.model.decoder.num_layers * self.system.cfg.model.decoder.num_queries
+        max_ttt = max(12, int(self.system.cfg.model.decoder_layer.ttt_steps) + 6)
+        max_refinement = max(4, int(self.base_cfg.assign.refinement_steps) + 3)
+
+        self.ttt_steps_slider = self._create_slider(
+            x0, slider_y, width, slider_h, "TTT steps (0=ckpt)", 0, max_ttt, self._optional_int_to_slider(self.base_cfg.ttt_steps), 1
+        )
+        slider_y -= slider_gap
+        self.quality_threshold_slider = self._create_slider(
+            x0, slider_y, width, slider_h, "Seed quality", 0.0, 1.0, self.base_cfg.seed.quality_threshold, 0.01
+        )
+        slider_y -= slider_gap
+        self.min_fg_slider = self._create_slider(
+            x0, slider_y, width, slider_h, "Min FG prob", 0.0, 1.0, self.base_cfg.seed.min_foreground_prob, 0.01
+        )
+        slider_y -= slider_gap
+        self.topk_slider = self._create_slider(
+            x0, slider_y, width, slider_h, "Seed top-k (0=all)", 0, max_topk, self._optional_int_to_slider(self.base_cfg.seed.topk), 1
+        )
+        slider_y -= slider_gap
+        self.refinement_slider = self._create_slider(
+            x0, slider_y, width, slider_h, "Refine steps", 1, max_refinement, self.base_cfg.assign.refinement_steps, 1
+        )
+        slider_y -= slider_gap
+        self.graph_affinity_slider = self._create_slider(
+            x0, slider_y, width, slider_h, "Graph affinity", 0.0, 1.0, self.base_cfg.cluster.graph_affinity_threshold, 0.01
+        )
+        slider_y -= slider_gap
+        self.dbscan_eps_slider = self._create_slider(
+            x0, slider_y, width, slider_h, "DBSCAN eps", 0.01, 1.0, self.base_cfg.cluster.dbscan_eps, 0.01
+        )
+        slider_y -= slider_gap
+        self.min_proto_slider = self._create_slider(
+            x0, slider_y, width, slider_h, "Min proto score", 0.0, 1.0, self.base_cfg.overlap.min_prototype_score, 0.01
+        )
+        slider_y -= slider_gap
+        self.mask_threshold_slider = self._create_slider(
+            x0, slider_y, width, slider_h, "Mask threshold", 0.0, 1.0, self.base_cfg.overlap.mask_threshold, 0.01
+        )
+        slider_y -= slider_gap
+        self.pixel_threshold_slider = self._create_slider(
+            x0, slider_y, width, slider_h, "Pixel threshold", 0.0, 1.0, self.base_cfg.overlap.pixel_score_threshold, 0.01
+        )
+
+        self.status_text = self.fig.text(
+            x0,
+            0.02,
+            "",
+            fontsize=9,
+            color="0.25",
+            ha="left",
+            va="bottom",
+        )
+
+    def _create_slider(
+        self,
+        x0: float,
+        y0: float,
+        width: float,
+        height: float,
+        label: str,
+        vmin: float,
+        vmax: float,
+        valinit: float,
+        step,
+    ):
+        label_width = 0.11
+        label_gap = 0.008
+        label_ax = self.fig.add_axes([x0, y0, label_width, height])
+        label_ax.axis("off")
+        label_ax.text(1.0, 0.5, label, ha="right", va="center", fontsize=9)
+
+        slider_ax = self.fig.add_axes([x0 + label_width + label_gap, y0, width - label_width - label_gap, height])
+        slider = Slider(slider_ax, "", vmin, vmax, valinit=valinit, valstep=step, dragging=False)
+        slider.on_changed(self._on_widget_change)
+        return slider
+
+    def _optional_int_to_slider(self, value: Optional[int]) -> int:
+        return 0 if value is None else int(value)
+
+    def _slider_to_optional_int(self, value: float) -> Optional[int]:
+        value = int(round(value))
+        return None if value <= 0 else value
+
+    def _toggle_state(self, label: str) -> bool:
+        return bool(dict(zip(self.toggle_labels, self.toggle_checks.get_status()))[label])
+
+    def _current_inference_cfg(self) -> PrototypeInferenceConfig:
+        cfg = copy.deepcopy(self.base_cfg)
+        cfg.ttt_steps = self._slider_to_optional_int(self.ttt_steps_slider.val)
+        cfg.seed.quality_threshold = float(self.quality_threshold_slider.val)
+        cfg.seed.min_foreground_prob = float(self.min_fg_slider.val)
+        cfg.seed.topk = self._slider_to_optional_int(self.topk_slider.val)
+        cfg.cluster.method = str(self.cluster_method_radio.value_selected)
+        cfg.cluster.cluster_per_class = self._toggle_state("Cluster per class")
+        cfg.cluster.graph_affinity_threshold = float(self.graph_affinity_slider.val)
+        cfg.cluster.dbscan_eps = float(self.dbscan_eps_slider.val)
+        cfg.assign.use_all_queries = self._toggle_state("Use all queries")
+        cfg.assign.use_query_quality = self._toggle_state("Use query quality")
+        cfg.assign.refinement_steps = int(round(self.refinement_slider.val))
+        cfg.overlap.min_prototype_score = float(self.min_proto_slider.val)
+        cfg.overlap.mask_threshold = float(self.mask_threshold_slider.val)
+        cfg.overlap.pixel_score_threshold = float(self.pixel_threshold_slider.val)
+        cfg.overlap.use_foreground_confidence = self._toggle_state("FG confidence")
+        cfg.overlap.use_assignment_strength = self._toggle_state("Assign strength")
+        return cfg
+
+    def _status_summary(self, cfg: PrototypeInferenceConfig) -> str:
+        topk = "all" if cfg.seed.topk is None else str(cfg.seed.topk)
+        ttt = "ckpt" if cfg.ttt_steps is None else str(cfg.ttt_steps)
+        return (
+            f"method={cfg.cluster.method} | ttt={ttt} | quality>={cfg.seed.quality_threshold:.2f} | "
+            f"topk={topk} | refine={cfg.assign.refinement_steps} | proto>={cfg.overlap.min_prototype_score:.2f}"
+        )
+
+    def _set_status(self, message: str, *, error: bool = False):
+        self.status_text.set_text(message)
+        self.status_text.set_color("tab:red" if error else "0.25")
+
+    def _update_sample_text(self):
+        total = max(len(self.images), 1)
+        self.sample_text.set_text(f"Sample {self.current_index + 1}/{total}")
+
+    def _mark_dirty(self):
+        cfg = self._current_inference_cfg()
+        self._dirty = True
+        self._set_status(f"Pending changes. Click Apply. {self._status_summary(cfg)}")
+
+    def _gt_signature_cache_key(self, cfg: PrototypeInferenceConfig) -> tuple:
+        return (
+            self.current_index,
+            cfg.ttt_steps,
+            repr(asdict(cfg.assign)),
+        )
+
+    def _get_cached_raw_outputs(self, cfg: PrototypeInferenceConfig):
+        cache_key = (self.current_index, cfg.ttt_steps)
+        raw = self._raw_cache.get(cache_key)
+        if raw is None:
+            raw = run_raw_outputs(
+                self.system,
+                [self.images[self.current_index]],
+                inference_cfg=cfg,
+                device=self.device,
+            )
+            self._raw_cache[cache_key] = raw
+        return raw
+
+    def refresh_predictions(self, _event=None):
+        if self._suspend_callbacks:
+            return
+
+        cfg = self._current_inference_cfg()
+        current_images = [self.images[self.current_index]]
+        current_targets = [self.targets[self.current_index]]
+        try:
+            raw = self._get_cached_raw_outputs(cfg)
+            predictions = run_predictions(
+                self.system,
+                current_images,
+                raw=raw,
+                inference_cfg=cfg,
+                device=self.device,
+            )
+            signature_reference = None
+            if self.include_gt_proto_predictions:
+                gt_signature_cache_key = self._gt_signature_cache_key(cfg)
+                signature_reference = self._gt_signature_cache.get(gt_signature_cache_key)
+                if signature_reference is None:
+                    signature_reference = run_gt_signature_reference(
+                        self.system,
+                        current_images,
+                        current_targets,
+                        raw=raw,
+                        inference_cfg=cfg,
+                        device=self.device,
+                    )[0]
+                    self._gt_signature_cache[gt_signature_cache_key] = signature_reference
+        except Exception as exc:
+            self._set_status(f"Prediction refresh failed: {exc}", error=True)
+            self.fig.canvas.draw_idle()
+            return
+
+        _draw_interactive_sample_axes(
+            self.display_axes,
+            current_images[0],
+            current_targets[0],
+            predictions[0],
+            signature_reference=signature_reference,
+            class_names=self.class_names,
+        )
+        self._update_sample_text()
+        self._dirty = False
+        self._set_status(self._status_summary(cfg))
+        self.fig.canvas.draw_idle()
+
+    def _on_widget_change(self, _value):
+        if self._suspend_callbacks:
+            return
+        self._mark_dirty()
+
+    def _on_apply_clicked(self, _event):
+        self.refresh_predictions()
+
+    def _step_sample(self, delta: int):
+        if len(self.images) == 0:
+            return
+        self.current_index = (self.current_index + delta) % len(self.images)
+        self.refresh_predictions()
+
+    def _on_prev_sample(self, _event):
+        self._step_sample(-1)
+
+    def _on_next_sample(self, _event):
+        self._step_sample(1)
+
+    def _on_resample_clicked(self, _event):
+        if self.sample_callback is None:
+            return
+        try:
+            images, targets = self.sample_callback()
+        except Exception as exc:
+            self._set_status(f"Resample failed: {exc}", error=True)
+            self.fig.canvas.draw_idle()
+            return
+
+        self.images = list(images)
+        self.targets = list(targets)
+        self.current_index = 0
+        self._raw_cache.clear()
+        self._gt_signature_cache.clear()
+        self.refresh_predictions()
+
+    def _on_reset_clicked(self, _event):
+        self._suspend_callbacks = True
+        try:
+            self.ttt_steps_slider.set_val(self._optional_int_to_slider(self.base_cfg.ttt_steps))
+            self.quality_threshold_slider.set_val(self.base_cfg.seed.quality_threshold)
+            self.min_fg_slider.set_val(self.base_cfg.seed.min_foreground_prob)
+            self.topk_slider.set_val(self._optional_int_to_slider(self.base_cfg.seed.topk))
+            self.refinement_slider.set_val(self.base_cfg.assign.refinement_steps)
+            self.graph_affinity_slider.set_val(self.base_cfg.cluster.graph_affinity_threshold)
+            self.dbscan_eps_slider.set_val(self.base_cfg.cluster.dbscan_eps)
+            self.min_proto_slider.set_val(self.base_cfg.overlap.min_prototype_score)
+            self.mask_threshold_slider.set_val(self.base_cfg.overlap.mask_threshold)
+            self.pixel_threshold_slider.set_val(self.base_cfg.overlap.pixel_score_threshold)
+
+            if self.cluster_method_radio.value_selected != self.base_cfg.cluster.method:
+                self.cluster_method_radio.set_active(self.available_cluster_methods.index(self.base_cfg.cluster.method))
+
+            desired_checks = [
+                self.base_cfg.cluster.cluster_per_class,
+                self.base_cfg.assign.use_all_queries,
+                self.base_cfg.assign.use_query_quality,
+                self.base_cfg.overlap.use_foreground_confidence,
+                self.base_cfg.overlap.use_assignment_strength,
+            ]
+            for idx, (current_state, desired_state) in enumerate(zip(self.toggle_checks.get_status(), desired_checks)):
+                if bool(current_state) != bool(desired_state):
+                    self.toggle_checks.set_active(idx)
+        finally:
+            self._suspend_callbacks = False
+
+        self._mark_dirty()
+        self.refresh_predictions()
+
+
+def show_interactive_prediction_grid(
+    system: PanopticSystem,
+    images: Sequence[torch.Tensor],
+    targets: Sequence[dict],
+    *,
+    class_names: Optional[Sequence[str]] = None,
+    figure_title: Optional[str] = None,
+    window_title: Optional[str] = None,
+    include_gt_proto_predictions: bool = True,
+    device: Optional[torch.device] = None,
+    sample_callback: Optional[Callable[[], Tuple[List[torch.Tensor], List[dict]]]] = None,
+    block: bool = True,
+):
+    viewer = InteractivePredictionGrid(
+        system,
+        images,
+        targets,
+        class_names=class_names,
+        figure_title=figure_title,
+        window_title=window_title,
+        include_gt_proto_predictions=include_gt_proto_predictions,
+        device=device,
+        sample_callback=sample_callback,
+    )
+    if block:
+        plt.show()
+    return viewer

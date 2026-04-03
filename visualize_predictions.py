@@ -7,6 +7,7 @@ from src.visualization import (
     run_predictions_with_gt_prototypes,
     sample_synthetic_examples,
     save_prediction_grid,
+    show_interactive_prediction_grid,
     show_prediction_grid,
 )
 
@@ -22,6 +23,7 @@ def parse_args():
     parser.add_argument("--max-objects", type=int, default=10, help="Maximum objects per synthetic image.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for synthetic sample selection.")
     parser.add_argument("--save-path", default=None, help="Optional PNG path to save the rendered figure.")
+    parser.add_argument("--static", action="store_true", help="Open the original static prediction grid instead of the interactive viewer.")
     parser.add_argument("--no-show", action="store_true", help="Save/render without opening a window.")
     return parser.parse_args()
 
@@ -39,10 +41,12 @@ def main():
         max_objects=args.max_objects,
         seed=args.seed,
     )
-    predictions = run_predictions(system, images)
-    gt_proto_predictions = run_predictions_with_gt_prototypes(system, images, targets)
 
     figure_title = f"Checkpoint preview: {args.checkpoint}"
+    if args.save_path or args.no_show or args.static:
+        predictions = run_predictions(system, images)
+        gt_proto_predictions = run_predictions_with_gt_prototypes(system, images, targets)
+
     if args.save_path:
         save_prediction_grid(
             args.save_path,
@@ -55,15 +59,40 @@ def main():
         )
 
     if not args.no_show:
-        show_prediction_grid(
-            images,
-            targets,
-            predictions,
-            gt_proto_predictions=gt_proto_predictions,
-            class_names=DEFAULT_CLASS_NAMES,
-            figure_title=figure_title,
-            window_title="Synthetic Prediction Viewer",
-        )
+        if args.static:
+            show_prediction_grid(
+                images,
+                targets,
+                predictions,
+                gt_proto_predictions=gt_proto_predictions,
+                class_names=DEFAULT_CLASS_NAMES,
+                figure_title=figure_title,
+                window_title="Synthetic Prediction Viewer",
+            )
+        else:
+            sample_state = {"seed": args.seed}
+
+            def sample_callback():
+                sample_state["seed"] += 1
+                return sample_synthetic_examples(
+                    num_samples=args.num_samples,
+                    dataset_length=args.dataset_length,
+                    height=args.height,
+                    width=args.width,
+                    max_objects=args.max_objects,
+                    seed=sample_state["seed"],
+                )
+
+            show_interactive_prediction_grid(
+                system,
+                images,
+                targets,
+                class_names=DEFAULT_CLASS_NAMES,
+                figure_title=figure_title,
+                window_title="Interactive Synthetic Prediction Viewer",
+                device=args.device,
+                sample_callback=sample_callback,
+            )
 
 
 if __name__ == "__main__":
