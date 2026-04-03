@@ -159,43 +159,68 @@ class ModularPrototypePredictor:
     def _select_seeds(self, flat: Dict[str, torch.Tensor]):
         cfg = self.cfg.seed
         score = flat["q_quality"].clone()
+        all_keep = torch.ones_like(score, dtype=torch.bool)
 
         if cfg.use_foreground_in_score:
             score = score * flat["fg_conf"].pow(cfg.foreground_score_power)
 
-        keep = torch.ones_like(score, dtype=torch.bool)
-
+        passes_background = all_keep.clone()
         if cfg.exclude_background:
-            keep &= (flat["pred_cls"] != 0)
+            passes_background &= (flat["pred_cls"] != 0)
 
+        passes_foreground = all_keep.clone()
         if cfg.min_foreground_prob > 0:
-            keep &= (flat["fg_conf"] >= cfg.min_foreground_prob)
+            passes_foreground &= (flat["fg_conf"] >= cfg.min_foreground_prob)
 
-        keep &= (score >= cfg.quality_threshold)
+        passes_quality = score >= cfg.quality_threshold
+
+        keep = passes_background & passes_foreground & passes_quality
 
         seed_idx = torch.where(keep)[0]
+        fallback_used = False
+        fallback_mask = keep.clone()
 
         if seed_idx.numel() < cfg.min_num_seeds:
+            fallback_used = True
             fallback = torch.ones_like(score, dtype=torch.bool)
             if cfg.exclude_background:
                 fallback &= (flat["pred_cls"] != 0)
             if cfg.min_foreground_prob > 0:
                 fallback &= (flat["fg_conf"] >= cfg.min_foreground_prob)
+            fallback_mask = fallback.clone()
 
             fallback_idx = torch.where(fallback)[0]
             if fallback_idx.numel() == 0:
                 fallback_idx = torch.arange(score.numel(), device=score.device)
+                fallback_mask = all_keep.clone()
 
             k = min(cfg.min_num_seeds, fallback_idx.numel())
             top_local = torch.topk(score[fallback_idx], k=k).indices
             seed_idx = fallback_idx[top_local]
 
+        pre_topk_seed_idx = seed_idx.clone()
         if cfg.topk is not None and seed_idx.numel() > cfg.topk:
             top_local = torch.topk(score[seed_idx], k=cfg.topk).indices
             seed_idx = seed_idx[top_local]
 
         seed_scores = score[seed_idx]
-        return seed_idx, seed_scores
+        selected_seed_mask = torch.zeros_like(score, dtype=torch.bool)
+        selected_seed_mask[seed_idx] = True
+        pre_topk_seed_mask = torch.zeros_like(score, dtype=torch.bool)
+        pre_topk_seed_mask[pre_topk_seed_idx] = True
+
+        diagnostics = {
+            "seed_score": score,
+            "passes_background": passes_background,
+            "passes_foreground": passes_foreground,
+            "passes_quality": passes_quality,
+            "initial_keep": keep,
+            "fallback_candidates": fallback_mask,
+            "fallback_used": fallback_used,
+            "pre_topk_seed_mask": pre_topk_seed_mask,
+            "selected_seed_mask": selected_seed_mask,
+        }
+        return seed_idx, seed_scores, diagnostics
 
     def _cluster_local(self, seed_sigs_np: np.ndarray, seed_scores_np: np.ndarray) -> np.ndarray:
         cfg = self.cfg.cluster
@@ -322,6 +347,17 @@ class ModularPrototypePredictor:
                     next_cluster_id += 1
 
         return seed_labels
+
+    def _expand_seed_cluster_labels(
+        self,
+        flat: Dict[str, torch.Tensor],
+        seed_idx: torch.Tensor,
+        cluster_labels: torch.Tensor,
+    ) -> torch.Tensor:
+        full_labels = -torch.ones(flat["q_sig"].shape[0], dtype=torch.long, device=flat["q_sig"].device)
+        if seed_idx.numel() > 0:
+            full_labels[seed_idx] = cluster_labels
+        return full_labels
 
     def _initialize_prototypes(self, flat: Dict[str, torch.Tensor], seed_idx: torch.Tensor, cluster_labels: torch.Tensor):
         device = flat["q_sig"].device
@@ -545,6 +581,14 @@ class ModularPrototypePredictor:
                 "cluster_members": proto_state["cluster_members"],
                 "assignment_weights": torch.empty((flat["q_sig"].shape[0], 0), device=flat["q_sig"].device),
                 "all_proto_sig": proto_state["proto_sig"],
+                "all_proto_cls": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
+                "all_proto_cls_prob": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
+                "all_proto_mask_emb": torch.empty((0, flat["q_mask_emb"].shape[-1]), device=flat["q_sig"].device),
+                "all_proto_score": torch.empty((0,), device=flat["q_sig"].device),
+                "all_proto_pred_cls": torch.empty((0,), dtype=torch.long, device=flat["q_sig"].device),
+                "all_proto_keep_mask": torch.empty((0,), dtype=torch.bool, device=flat["q_sig"].device),
+                "all_proto_drop_background_mask": torch.empty((0,), dtype=torch.bool, device=flat["q_sig"].device),
+                "all_proto_drop_score_mask": torch.empty((0,), dtype=torch.bool, device=flat["q_sig"].device),
                 "proto_sig": torch.empty((0, flat["q_sig"].shape[-1]), device=flat["q_sig"].device),
                 "proto_cls": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
                 "proto_cls_prob": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
@@ -586,6 +630,8 @@ class ModularPrototypePredictor:
         if cfg.remove_background:
             keep &= (pred_cls != 0)
         keep &= (proto_score >= cfg.min_prototype_score)
+        drop_background = cfg.remove_background & (pred_cls == 0)
+        drop_low_score = proto_score < cfg.min_prototype_score
 
         if keep.sum() == 0:
             return {
@@ -594,6 +640,14 @@ class ModularPrototypePredictor:
                 "cluster_members": proto_state["cluster_members"],
                 "assignment_weights": proto_state["assignment_weights"],
                 "all_proto_sig": proto_state["proto_sig"],
+                "all_proto_cls": proto_cls,
+                "all_proto_cls_prob": cls_prob,
+                "all_proto_mask_emb": proto_mask_emb,
+                "all_proto_score": proto_score,
+                "all_proto_pred_cls": pred_cls,
+                "all_proto_keep_mask": keep,
+                "all_proto_drop_background_mask": drop_background,
+                "all_proto_drop_score_mask": drop_low_score,
                 "proto_sig": torch.empty((0, flat["q_sig"].shape[-1]), device=flat["q_sig"].device),
                 "proto_cls": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
                 "proto_cls_prob": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
@@ -640,6 +694,14 @@ class ModularPrototypePredictor:
             "assignment_weights": proto_state["assignment_weights"],
 
             "all_proto_sig": proto_state["proto_sig"],
+            "all_proto_cls": proto_cls,
+            "all_proto_cls_prob": cls_prob,
+            "all_proto_mask_emb": proto_mask_emb,
+            "all_proto_score": proto_score,
+            "all_proto_pred_cls": pred_cls,
+            "all_proto_keep_mask": keep,
+            "all_proto_drop_background_mask": drop_background,
+            "all_proto_drop_score_mask": drop_low_score,
             "proto_sig": proto_sig_kept,
             "proto_cls": proto_cls_kept,
             "proto_cls_prob": cls_prob_kept,
@@ -656,12 +718,17 @@ class ModularPrototypePredictor:
 
     def _predict_single(self, model: CustomMask2Former, raw: RawOutputs, b: int):
         flat = self._flatten_outputs(raw, b)
-        seed_idx, seed_scores = self._select_seeds(flat)
+        seed_idx, seed_scores, seed_diagnostics = self._select_seeds(flat)
         cluster_labels = self._cluster_seeds(flat, seed_idx, seed_scores)
+        cluster_labels_full = self._expand_seed_cluster_labels(flat, seed_idx, cluster_labels)
         proto_state = self._initialize_prototypes(flat, seed_idx, cluster_labels)
         proto_state = self._soft_refine_prototypes(model, flat, proto_state)
         pred = self._decode_and_resolve(flat, proto_state)
         pred["flat"] = flat
+        pred["diagnostics"] = {
+            **seed_diagnostics,
+            "seed_cluster_labels_full": cluster_labels_full,
+        }
         return pred
 
     def _predict_single_with_gt_prototypes(self, model: CustomMask2Former, raw: RawOutputs, targets, b: int):
@@ -669,4 +736,16 @@ class ModularPrototypePredictor:
         proto_state = self._build_gt_proto_state(model, raw, flat, targets, b)
         pred = self._decode_and_resolve(flat, proto_state)
         pred["flat"] = flat
+        pred["diagnostics"] = {
+            "seed_score": flat["q_quality"],
+            "passes_background": torch.ones_like(flat["q_quality"], dtype=torch.bool),
+            "passes_foreground": torch.ones_like(flat["q_quality"], dtype=torch.bool),
+            "passes_quality": torch.ones_like(flat["q_quality"], dtype=torch.bool),
+            "initial_keep": torch.zeros_like(flat["q_quality"], dtype=torch.bool),
+            "fallback_candidates": torch.zeros_like(flat["q_quality"], dtype=torch.bool),
+            "fallback_used": False,
+            "pre_topk_seed_mask": torch.zeros_like(flat["q_quality"], dtype=torch.bool),
+            "selected_seed_mask": torch.zeros_like(flat["q_quality"], dtype=torch.bool),
+            "seed_cluster_labels_full": -torch.ones_like(flat["pred_cls"], dtype=torch.long),
+        }
         return pred

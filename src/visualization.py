@@ -145,6 +145,30 @@ def _gt_marker(label: int) -> str:
     return markers[int(label) % len(markers)]
 
 
+def _mix_with_gray(color: np.ndarray, gray: float, amount: float) -> np.ndarray:
+    base = np.full((3,), float(gray), dtype=np.float32)
+    return np.clip((1.0 - amount) * np.asarray(color, dtype=np.float32) + amount * base, 0.0, 1.0)
+
+
+def _cluster_colors(num_clusters: int) -> np.ndarray:
+    if num_clusters <= 0:
+        return np.empty((0, 3), dtype=np.float32)
+    cmap = plt.get_cmap("tab20")
+    colors = [cmap(idx % 20)[:3] for idx in range(num_clusters)]
+    return np.asarray(colors, dtype=np.float32)
+
+
+def _edge_threshold_for_cfg(cfg: PrototypeInferenceConfig) -> Optional[float]:
+    method = cfg.cluster.method.lower()
+    if method == "cc":
+        return float(cfg.cluster.graph_affinity_threshold)
+    if method == "dbscan":
+        return float(np.clip(1.0 - cfg.cluster.dbscan_eps, 0.0, 1.0))
+    if method in {"louvain", "leiden"}:
+        return float(cfg.cluster.graph_min_edge_weight)
+    return None
+
+
 def _draw_signature_umap(
     ax,
     image_np: np.ndarray,
@@ -269,6 +293,304 @@ def _draw_signature_umap(
             ha="left",
             zorder=4,
         )
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_alpha(0.3)
+
+
+def _draw_inference_umap(
+    ax,
+    target: dict,
+    prediction: dict,
+    *,
+    inference_cfg: PrototypeInferenceConfig,
+    class_names: Optional[Sequence[str]] = None,
+    gt_reference: Optional[dict] = None,
+    title: str,
+):
+    flat = prediction.get("flat")
+    q_sig = None if flat is None else flat.get("q_sig")
+    all_proto_sig = prediction.get("all_proto_sig")
+
+    if q_sig is None or all_proto_sig is None:
+        ax.set_title(title)
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No inference signatures", ha="center", va="center", fontsize=11, transform=ax.transAxes)
+        return
+
+    q_sig_np = q_sig.detach().cpu().numpy()
+    all_proto_sig_np = all_proto_sig.detach().cpu().numpy()
+    gt_sig = None if gt_reference is None else gt_reference.get("all_proto_sig")
+    gt_sig_np = np.empty((0, q_sig_np.shape[1]), dtype=np.float32)
+    if gt_sig is not None:
+        gt_sig_np = gt_sig.detach().cpu().numpy()
+
+    all_sig_parts = [q_sig_np]
+    if all_proto_sig_np.shape[0] > 0:
+        all_sig_parts.append(all_proto_sig_np)
+    if gt_sig_np.shape[0] > 0:
+        all_sig_parts.append(gt_sig_np)
+    embedding = _project_signatures_2d(np.concatenate(all_sig_parts, axis=0))
+
+    q_end = q_sig_np.shape[0]
+    proto_end = q_end + all_proto_sig_np.shape[0]
+    q_pts = embedding[:q_end]
+    proto_pts = embedding[q_end:proto_end]
+    gt_pts = embedding[proto_end:]
+
+    diagnostics = prediction.get("diagnostics", {})
+    selected_seed_mask = diagnostics.get("selected_seed_mask")
+    pre_topk_seed_mask = diagnostics.get("pre_topk_seed_mask")
+    seed_score = diagnostics.get("seed_score")
+    passes_background = diagnostics.get("passes_background")
+    passes_foreground = diagnostics.get("passes_foreground")
+    passes_quality = diagnostics.get("passes_quality")
+    seed_cluster_labels = diagnostics.get("seed_cluster_labels_full")
+    assignment_weights = prediction.get("assignment_weights")
+
+    q_quality_np = flat["q_quality"].detach().cpu().numpy()
+    q_quality_norm = q_quality_np / max(float(q_quality_np.max()), 1e-6)
+    query_sizes = 16.0 + 52.0 * np.sqrt(np.clip(q_quality_norm, 0.0, 1.0))
+
+    selected_seed_mask_np = np.zeros((q_pts.shape[0],), dtype=bool) if selected_seed_mask is None else selected_seed_mask.detach().cpu().numpy().astype(bool)
+    pre_topk_seed_mask_np = np.zeros((q_pts.shape[0],), dtype=bool) if pre_topk_seed_mask is None else pre_topk_seed_mask.detach().cpu().numpy().astype(bool)
+    passes_background_np = np.ones((q_pts.shape[0],), dtype=bool) if passes_background is None else passes_background.detach().cpu().numpy().astype(bool)
+    passes_foreground_np = np.ones((q_pts.shape[0],), dtype=bool) if passes_foreground is None else passes_foreground.detach().cpu().numpy().astype(bool)
+    passes_quality_np = np.ones((q_pts.shape[0],), dtype=bool) if passes_quality is None else passes_quality.detach().cpu().numpy().astype(bool)
+    seed_cluster_labels_np = -np.ones((q_pts.shape[0],), dtype=np.int64) if seed_cluster_labels is None else seed_cluster_labels.detach().cpu().numpy().astype(np.int64)
+    seed_score_np = np.zeros((q_pts.shape[0],), dtype=np.float32) if seed_score is None else seed_score.detach().cpu().numpy().astype(np.float32)
+
+    num_proto = all_proto_sig_np.shape[0]
+    cluster_colors = _cluster_colors(num_proto)
+    proto_keep_mask = prediction.get("all_proto_keep_mask")
+    proto_drop_background_mask = prediction.get("all_proto_drop_background_mask")
+    proto_drop_score_mask = prediction.get("all_proto_drop_score_mask")
+    proto_pred_cls = prediction.get("all_proto_pred_cls")
+    proto_score = prediction.get("all_proto_score")
+
+    proto_keep_mask_np = np.ones((num_proto,), dtype=bool) if proto_keep_mask is None else proto_keep_mask.detach().cpu().numpy().astype(bool)
+    proto_drop_background_mask_np = np.zeros((num_proto,), dtype=bool) if proto_drop_background_mask is None else proto_drop_background_mask.detach().cpu().numpy().astype(bool)
+    proto_drop_score_mask_np = np.zeros((num_proto,), dtype=bool) if proto_drop_score_mask is None else proto_drop_score_mask.detach().cpu().numpy().astype(bool)
+    proto_pred_cls_np = np.zeros((num_proto,), dtype=np.int64) if proto_pred_cls is None else proto_pred_cls.detach().cpu().numpy().astype(np.int64)
+    proto_score_np = np.zeros((num_proto,), dtype=np.float32) if proto_score is None else proto_score.detach().cpu().numpy().astype(np.float32)
+
+    query_owner = -np.ones((q_pts.shape[0],), dtype=np.int64)
+    query_strength = np.zeros((q_pts.shape[0],), dtype=np.float32)
+    query_used_mask = np.zeros((q_pts.shape[0],), dtype=bool)
+    if assignment_weights is not None and num_proto > 0:
+        assignment_np = assignment_weights.detach().cpu().numpy()
+        if assignment_np.shape[1] > 0:
+            query_owner = assignment_np.argmax(axis=1).astype(np.int64)
+            query_strength = assignment_np.max(axis=1).astype(np.float32)
+            query_used_mask = query_strength > 1e-8
+
+    cluster_owner = query_owner.copy()
+    unresolved_seed_mask = selected_seed_mask_np & (cluster_owner < 0) & (seed_cluster_labels_np >= 0)
+    cluster_owner[unresolved_seed_mask] = seed_cluster_labels_np[unresolved_seed_mask]
+
+    active_kept_mask = query_used_mask & (cluster_owner >= 0)
+    if num_proto > 0:
+        active_kept_mask &= proto_keep_mask_np[cluster_owner]
+    active_dropped_mask = query_used_mask & (cluster_owner >= 0) & (~active_kept_mask)
+
+    background_filtered_mask = (~selected_seed_mask_np) & (~passes_background_np)
+    low_fg_filtered_mask = (~selected_seed_mask_np) & passes_background_np & (~passes_foreground_np)
+    quality_filtered_mask = (~selected_seed_mask_np) & passes_background_np & passes_foreground_np & (~passes_quality_np)
+    topk_filtered_mask = pre_topk_seed_mask_np & (~selected_seed_mask_np)
+    inactive_mask = (~selected_seed_mask_np) & (~query_used_mask) & passes_background_np & passes_foreground_np & passes_quality_np & (~topk_filtered_mask)
+
+    ax.set_title(title)
+    ax.grid(True, alpha=0.15, linewidth=0.5)
+
+    edge_threshold = _edge_threshold_for_cfg(inference_cfg)
+    if edge_threshold is not None and selected_seed_mask_np.sum() > 1:
+        seed_indices = np.where(selected_seed_mask_np)[0]
+        seed_sigs = q_sig_np[seed_indices].astype(np.float32, copy=False)
+        seed_sigs = seed_sigs / np.clip(np.linalg.norm(seed_sigs, axis=1, keepdims=True), 1e-6, None)
+        affinity = np.clip(seed_sigs @ seed_sigs.T, 0.0, 1.0)
+        for src_pos in range(seed_indices.shape[0]):
+            for dst_pos in range(src_pos + 1, seed_indices.shape[0]):
+                strength = float(affinity[src_pos, dst_pos])
+                if strength < edge_threshold:
+                    continue
+                src_idx = seed_indices[src_pos]
+                dst_idx = seed_indices[dst_pos]
+                src_cluster = seed_cluster_labels_np[src_idx]
+                dst_cluster = seed_cluster_labels_np[dst_idx]
+                if src_cluster >= 0 and src_cluster == dst_cluster and src_cluster < cluster_colors.shape[0]:
+                    edge_color = cluster_colors[src_cluster]
+                    edge_alpha = 0.18 + 0.32 * strength
+                else:
+                    edge_color = np.array([0.55, 0.55, 0.55], dtype=np.float32)
+                    edge_alpha = 0.05 + 0.12 * strength
+                ax.plot(
+                    [q_pts[src_idx, 0], q_pts[dst_idx, 0]],
+                    [q_pts[src_idx, 1], q_pts[dst_idx, 1]],
+                    color=edge_color,
+                    alpha=float(np.clip(edge_alpha, 0.0, 0.45)),
+                    linewidth=0.4 + 0.9 * strength,
+                    zorder=1,
+                )
+
+    if background_filtered_mask.any():
+        ax.scatter(
+            q_pts[background_filtered_mask, 0],
+            q_pts[background_filtered_mask, 1],
+            s=query_sizes[background_filtered_mask],
+            c=[[0.87, 0.87, 0.87]],
+            alpha=0.22,
+            marker="o",
+            linewidths=0,
+            zorder=2,
+        )
+
+    muted_filtered_mask = low_fg_filtered_mask | quality_filtered_mask | topk_filtered_mask | inactive_mask
+    if muted_filtered_mask.any():
+        ax.scatter(
+            q_pts[muted_filtered_mask, 0],
+            q_pts[muted_filtered_mask, 1],
+            s=query_sizes[muted_filtered_mask],
+            c=[[0.62, 0.62, 0.62]],
+            alpha=0.34,
+            marker="o",
+            linewidths=0,
+            zorder=2,
+        )
+
+    if active_dropped_mask.any():
+        dropped_colors = []
+        for owner in cluster_owner[active_dropped_mask]:
+            color = cluster_colors[owner] if 0 <= owner < cluster_colors.shape[0] else np.array([0.55, 0.55, 0.55], dtype=np.float32)
+            dropped_colors.append(_mix_with_gray(color, gray=0.72, amount=0.55))
+        ax.scatter(
+            q_pts[active_dropped_mask, 0],
+            q_pts[active_dropped_mask, 1],
+            s=query_sizes[active_dropped_mask],
+            c=np.asarray(dropped_colors, dtype=np.float32),
+            alpha=0.45,
+            marker="o",
+            linewidths=0,
+            zorder=3,
+        )
+
+    active_nonseed_mask = active_kept_mask & (~selected_seed_mask_np)
+    if active_nonseed_mask.any():
+        active_indices = np.where(active_nonseed_mask)[0]
+        active_colors = cluster_colors[cluster_owner[active_nonseed_mask]]
+        active_alpha = 0.38 + 0.32 * np.clip(query_strength[active_nonseed_mask], 0.0, 1.0)
+        for local_idx, (idx, alpha) in enumerate(zip(active_indices.tolist(), active_alpha.tolist())):
+            ax.scatter(
+                q_pts[idx, 0],
+                q_pts[idx, 1],
+                s=float(query_sizes[idx]),
+                c=[active_colors[local_idx]],
+                alpha=float(alpha),
+                marker="o",
+                linewidths=0,
+                zorder=4,
+            )
+
+    seed_mask = selected_seed_mask_np & (cluster_owner >= 0)
+    if seed_mask.any():
+        seed_colors = []
+        seed_edge_colors = []
+        for idx in np.where(seed_mask)[0]:
+            owner = int(cluster_owner[idx])
+            base_color = cluster_colors[owner] if 0 <= owner < cluster_colors.shape[0] else np.array([0.25, 0.25, 0.25], dtype=np.float32)
+            if owner < num_proto and not proto_keep_mask_np[owner]:
+                seed_colors.append(_mix_with_gray(base_color, gray=0.72, amount=0.45))
+                seed_edge_colors.append((0.35, 0.35, 0.35))
+            else:
+                seed_colors.append(base_color)
+                seed_edge_colors.append((0.05, 0.05, 0.05))
+
+        seed_indices = np.where(seed_mask)[0]
+        for local_idx, query_idx in enumerate(seed_indices.tolist()):
+            size_boost = 26.0 * np.clip(seed_score_np[query_idx] / max(float(seed_score_np.max()), 1e-6), 0.0, 1.0)
+            ax.scatter(
+                q_pts[query_idx, 0],
+                q_pts[query_idx, 1],
+                s=float(query_sizes[query_idx] + size_boost),
+                c=[seed_colors[local_idx]],
+                alpha=0.96,
+                marker="o",
+                edgecolors=[seed_edge_colors[local_idx]],
+                linewidths=0.8,
+                zorder=5,
+            )
+
+    for proto_idx in range(num_proto):
+        color = cluster_colors[proto_idx] if proto_idx < cluster_colors.shape[0] else np.array([0.2, 0.2, 0.2], dtype=np.float32)
+        if proto_keep_mask_np[proto_idx]:
+            marker = "*"
+            face_color = color
+            edge_color = "black"
+            alpha = 0.98
+            size = 270.0
+        else:
+            marker = "X" if proto_drop_background_mask_np[proto_idx] else "D"
+            face_color = _mix_with_gray(color, gray=0.74, amount=0.58)
+            edge_color = "0.35"
+            alpha = 0.72
+            size = 180.0
+
+        ax.scatter(
+            proto_pts[proto_idx, 0],
+            proto_pts[proto_idx, 1],
+            s=size,
+            c=[face_color],
+            marker=marker,
+            edgecolors=edge_color,
+            linewidths=1.0,
+            alpha=alpha,
+            zorder=6,
+        )
+
+        if proto_keep_mask_np[proto_idx]:
+            label = int(proto_pred_cls_np[proto_idx]) if proto_idx < proto_pred_cls_np.shape[0] else proto_idx
+            class_name = str(label)
+            if class_names is not None and 0 <= label < len(class_names):
+                class_name = class_names[label]
+            ax.text(
+                proto_pts[proto_idx, 0],
+                proto_pts[proto_idx, 1],
+                f" {class_name} {proto_score_np[proto_idx]:.2f}",
+                fontsize=8,
+                color="black",
+                va="center",
+                ha="left",
+                zorder=7,
+            )
+
+    if gt_pts.shape[0] > 0:
+        gt_labels = [int(label) for label in target["labels"].detach().cpu().tolist()]
+        for idx, pt in enumerate(gt_pts):
+            gt_label = gt_labels[idx] if idx < len(gt_labels) else idx
+            ax.scatter(
+                pt[0],
+                pt[1],
+                s=95.0,
+                facecolors="none",
+                edgecolors="black",
+                linewidths=1.0,
+                marker=_gt_marker(gt_label),
+                alpha=0.55,
+                zorder=6,
+            )
+
+    ax.text(
+        0.01,
+        0.01,
+        "color=active cluster | gray=filtered | *=kept proto | X=dropped proto",
+        transform=ax.transAxes,
+        fontsize=8,
+        color="0.28",
+        ha="left",
+        va="bottom",
+        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none", "pad": 2},
+    )
 
     ax.set_xticks([])
     ax.set_yticks([])
@@ -545,6 +867,7 @@ def _draw_interactive_sample_axes(
     target: dict,
     prediction: dict,
     *,
+    inference_cfg: PrototypeInferenceConfig,
     signature_reference: Optional[dict] = None,
     class_names: Optional[Sequence[str]] = None,
 ):
@@ -578,14 +901,14 @@ def _draw_interactive_sample_axes(
     )
 
     if len(axes) > 2:
-        reference = prediction if signature_reference is None else signature_reference
-        _draw_signature_umap(
+        _draw_inference_umap(
             axes[2],
-            image_np,
             target,
-            reference,
+            prediction,
+            inference_cfg=inference_cfg,
+            gt_reference=signature_reference,
             class_names=class_names,
-            title="GT Signature UMAP",
+            title="Inference UMAP",
         )
 
 
@@ -1012,6 +1335,7 @@ class InteractivePredictionGrid:
             current_images[0],
             current_targets[0],
             predictions[0],
+            inference_cfg=cfg,
             signature_reference=signature_reference,
             class_names=self.class_names,
         )
