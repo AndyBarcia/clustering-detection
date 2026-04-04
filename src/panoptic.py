@@ -63,6 +63,8 @@ def save_system_checkpoint(system: PanopticSystem, path: str, optimizer=None, ex
 
 def load_system_checkpoint(path: str, map_location="cpu", inference_override: Optional[PrototypeInferenceConfig] = None, strict: bool = True):
     ckpt = torch.load(path, map_location=map_location)
+    model_state_dict = dict(ckpt["model_state_dict"])
+    model_state_dict.pop("layer_importance", None)
 
     model_cfg = dataclass_from_dict(ModelConfig, ckpt["model_config"])
     loss_cfg = dataclass_from_dict(LossConfig, ckpt["loss_config"])
@@ -79,5 +81,5 @@ def load_system_checkpoint(path: str, map_location="cpu", inference_override: Op
     )
 
     system = PanopticSystem(cfg)
-    system.model.load_state_dict(ckpt["model_state_dict"], strict=strict)
+    system.model.load_state_dict(model_state_dict, strict=strict)
     return system, ckpt

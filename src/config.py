@@ -107,7 +107,6 @@ class SoftAssignmentConfig:
     use_alpha_focal: bool = True
     similarity_floor: float = 0.0
 
-    use_layer_weights: bool = True
     use_query_quality: bool = True
     query_quality_power: float = 0.6
 

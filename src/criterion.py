@@ -136,11 +136,7 @@ class PanopticCriterion(nn.Module):
             alpha=model.alpha_focal,
             valid_mask=gt_pad_mask,
         )
-
-        layer_weights = raw.layer_importance
-        weights_shaped = weights_raw.view(B_val, L, N_q, M_max)
-        weights_shaped = weights_shaped * layer_weights.view(1, L, 1, 1)
-        weights_flat = weights_shaped.view(B_val, L * N_q, M_max)
+        weights_flat = weights_raw
 
         top2 = sim_masked.topk(k=min(2, M_max), dim=2).values
         s1 = top2[:, :, 0]

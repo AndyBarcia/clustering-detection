@@ -114,11 +114,9 @@ class ModularPrototypePredictor:
         return preds[0] if B == 1 else preds
 
     def _flatten_outputs(self, raw: RawOutputs, b: int) -> Dict[str, torch.Tensor]:
-        device = raw.features.device
         features = raw.features[b]
         H_img, W_img = raw.img_shape
 
-        layer_weights = raw.layer_importance
         q_mask_emb = raw.mask_embs[:, b]
         q_cls = raw.cls_preds[:, b]
         q_sig = raw.sig_embs[:, b]
@@ -136,15 +134,11 @@ class ModularPrototypePredictor:
         q_influence = q_influence.reshape(L * N_q)
         q_margin = q_margin.reshape(L * N_q)
 
-        layer_ids = torch.arange(L, device=device).repeat_interleave(N_q)
-        layer_weights_flat = layer_weights.repeat_interleave(N_q)
-
         q_cls_prob = F.softmax(q_cls, dim=-1)
         pred_cls = q_cls_prob.argmax(dim=-1)
         fg_conf = 1.0 - q_cls_prob[:, 0]
 
         q_quality = torch.sqrt(q_sim.clamp_min(0.0) * q_margin.clamp_min(0.0))
-        q_quality = q_quality * layer_weights_flat
 
         return {
             "features": features,
@@ -162,8 +156,6 @@ class ModularPrototypePredictor:
             "q_quality": q_quality,
             "fg_conf": fg_conf,
             "pred_cls": pred_cls,
-            "layer_ids": layer_ids,
-            "layer_weights_flat": layer_weights_flat,
         }
 
     def _select_seeds(self, flat: Dict[str, torch.Tensor]):
@@ -408,9 +400,6 @@ class ModularPrototypePredictor:
             affinity = _assignment_affinity(sim, flat["q_influence"][q_idx], cfg.similarity_floor)
             raw_w = affinity.pow(alpha)
 
-            if cfg.use_layer_weights:
-                raw_w = raw_w * flat["layer_weights_flat"][q_idx].unsqueeze(1)
-
             if cfg.use_query_quality:
                 raw_w = raw_w * flat["q_quality"][q_idx].pow(cfg.query_quality_power).unsqueeze(1)
 
@@ -499,9 +488,6 @@ class ModularPrototypePredictor:
         sim = torch.matmul(q_sig, gt_sig.T)
         affinity = _assignment_affinity(sim, flat["q_influence"], self.cfg.assign.similarity_floor)
         raw_w = affinity.pow(alpha)
-
-        if self.cfg.assign.use_layer_weights:
-            raw_w = raw_w * flat["layer_weights_flat"].unsqueeze(1)
 
         if self.cfg.assign.use_query_quality:
             raw_w = raw_w * flat["q_quality"].pow(self.cfg.assign.query_quality_power).unsqueeze(1)

@@ -212,8 +212,6 @@ class CustomMask2Former(nn.Module):
         )
         self.transformer_decoder = TTTTransformerDecoder(decoder_layer, num_layers=num_layers)
 
-        self.layer_importance = nn.Parameter(torch.zeros(num_layers))
-
         self.mask_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -354,6 +352,5 @@ class CustomMask2Former(nn.Module):
             sim_scores=sim_scores,
             influence_preds=influence_preds,
             margin_preds=margin_preds,
-            layer_importance=F.softmax(self.layer_importance, dim=0),
             img_shape=(H_img, W_img),
         )
