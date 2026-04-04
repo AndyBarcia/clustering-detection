@@ -123,8 +123,11 @@ class ModularPrototypePredictor:
         q_sim = raw.sim_scores[:, b]
         q_influence = raw.influence_preds[:, b]
         q_margin = raw.margin_preds[:, b]
+        q_seed = raw.seed_probs[:, b]
+        q_graph = raw.graph_embs[:, b]
 
         L, N_q, S = q_sig.shape
+        G = q_graph.shape[-1]
         num_classes = q_cls.shape[-1]
 
         q_mask_emb = q_mask_emb.reshape(L * N_q, -1)
@@ -133,6 +136,8 @@ class ModularPrototypePredictor:
         q_sim = q_sim.reshape(L * N_q)
         q_influence = q_influence.reshape(L * N_q)
         q_margin = q_margin.reshape(L * N_q)
+        q_seed = q_seed.reshape(L * N_q)
+        q_graph = q_graph.reshape(L * N_q, G)
 
         q_cls_prob = F.softmax(q_cls, dim=-1)
         pred_cls = q_cls_prob.argmax(dim=-1)
@@ -153,6 +158,8 @@ class ModularPrototypePredictor:
             "q_sim": q_sim,
             "q_influence": q_influence,
             "q_margin": q_margin,
+            "q_seed": q_seed,
+            "q_graph": q_graph,
             "q_quality": q_quality,
             "fg_conf": fg_conf,
             "pred_cls": pred_cls,
@@ -160,7 +167,7 @@ class ModularPrototypePredictor:
 
     def _select_seeds(self, flat: Dict[str, torch.Tensor]):
         cfg = self.cfg.seed
-        score = flat["q_quality"].clone()
+        score = flat["q_seed"].clone()
 
         if cfg.use_foreground_in_score:
             score = score * flat["fg_conf"].pow(cfg.foreground_score_power)
@@ -196,14 +203,14 @@ class ModularPrototypePredictor:
         seed_scores = score[seed_idx]
         return seed_idx, seed_scores
 
-    def _cluster_local(self, seed_sigs_np: np.ndarray, seed_scores_np: np.ndarray) -> np.ndarray:
+    def _cluster_local(self, seed_graph_np: np.ndarray, seed_scores_np: np.ndarray) -> np.ndarray:
         cfg = self.cfg.cluster
         method = cfg.method.lower()
 
-        if len(seed_sigs_np) == 0:
+        if len(seed_graph_np) == 0:
             return np.empty((0,), dtype=np.int64)
 
-        if len(seed_sigs_np) == 1:
+        if len(seed_graph_np) == 1:
             return np.array([0], dtype=np.int64)
 
         if method == "dbscan":
@@ -215,15 +222,15 @@ class ModularPrototypePredictor:
                 metric="cosine",
             )
             if cfg.dbscan_use_sample_weight:
-                clusterer.fit(seed_sigs_np, sample_weight=seed_scores_np)
+                clusterer.fit(seed_graph_np, sample_weight=seed_scores_np)
             else:
-                clusterer.fit(seed_sigs_np)
+                clusterer.fit(seed_graph_np)
             return clusterer.labels_.astype(np.int64)
 
         if method == "hdbscan":
             if _hdbscan is None:
                 raise ImportError("hdbscan is not installed. pip install hdbscan")
-            dist = _cosine_distance_np(seed_sigs_np)
+            dist = _cosine_distance_np(seed_graph_np)
             clusterer = _hdbscan.HDBSCAN(
                 metric="precomputed",
                 min_cluster_size=cfg.hdbscan_min_cluster_size,
@@ -232,7 +239,7 @@ class ModularPrototypePredictor:
             )
             return clusterer.fit_predict(dist).astype(np.int64)
 
-        affinity = _cosine_affinity_np(seed_sigs_np)
+        affinity = _cosine_affinity_np(seed_graph_np)
 
         if method == "cc":
             return _connected_components_labels(affinity, cfg.graph_affinity_threshold)
@@ -243,7 +250,7 @@ class ModularPrototypePredictor:
             if not hasattr(nx.algorithms.community, "louvain_communities"):
                 raise ImportError("This version of networkx does not expose louvain_communities")
             G = nx.Graph()
-            n = len(seed_sigs_np)
+            n = len(seed_graph_np)
             G.add_nodes_from(range(n))
             edges, weights = _build_weighted_graph_edges(affinity, cfg.graph_min_edge_weight)
             for (u, v), w in zip(edges, weights):
@@ -265,7 +272,7 @@ class ModularPrototypePredictor:
         if method == "leiden":
             if ig is None or leidenalg is None:
                 raise ImportError("igraph + leidenalg are required for Leiden clustering")
-            n = len(seed_sigs_np)
+            n = len(seed_graph_np)
             edges, weights = _build_weighted_graph_edges(affinity, cfg.graph_min_edge_weight)
             if len(edges) == 0:
                 return np.arange(n, dtype=np.int64)
@@ -302,10 +309,10 @@ class ModularPrototypePredictor:
             local_seed_idx = seed_idx[pos_group]
             local_scores = seed_scores[pos_group]
 
-            local_sigs_np = flat["q_sig"][local_seed_idx].detach().cpu().numpy()
+            local_graph_np = flat["q_graph"][local_seed_idx].detach().cpu().numpy()
             local_scores_np = local_scores.detach().cpu().numpy()
 
-            local_labels_np = self._cluster_local(local_sigs_np, local_scores_np)
+            local_labels_np = self._cluster_local(local_graph_np, local_scores_np)
             local_labels = torch.as_tensor(local_labels_np, device=device)
 
             good_ids = [int(x) for x in np.unique(local_labels_np) if x != -1]
@@ -348,7 +355,9 @@ class ModularPrototypePredictor:
             member_seed_idx = seed_idx[cluster_labels == cid]
             cluster_members.append(member_seed_idx)
 
-            w = flat["q_quality"][member_seed_idx]
+            w = flat["q_seed"][member_seed_idx]
+            if float(w.sum().detach().item()) <= 1e-6:
+                w = torch.ones_like(w)
             w = w / (w.sum() + 1e-6)
 
             p_sig = _safe_normalize((flat["q_sig"][member_seed_idx] * w.unsqueeze(1)).sum(dim=0), dim=0)

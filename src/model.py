@@ -186,6 +186,7 @@ class CustomMask2Former(nn.Module):
         hidden_dim = cfg.backbone.hidden_dim
         num_classes = cfg.heads.num_classes
         sig_dim = cfg.heads.sig_dim
+        graph_dim = cfg.heads.graph_dim
         num_queries = cfg.decoder.num_queries
         num_layers = cfg.decoder.num_layers
 
@@ -193,6 +194,7 @@ class CustomMask2Former(nn.Module):
         self.num_classes = num_classes
         self.num_queries = num_queries
         self.sig_dim = sig_dim
+        self.graph_dim = graph_dim
         self.num_layers = num_layers
 
         self.backbone = SimpleBackbone(hidden_dim=hidden_dim)
@@ -241,6 +243,16 @@ class CustomMask2Former(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
+        )
+        self.seed_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.graph_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, graph_dim),
         )
 
         self.gt_cls_embed = nn.Embedding(num_classes, hidden_dim)
@@ -331,7 +343,9 @@ class CustomMask2Former(nn.Module):
         sim_scores = torch.sigmoid(self.sim_head(q).squeeze(-1))
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
         margin_preds = torch.sigmoid(self.margin_head(q).squeeze(-1))
-        return mask_embs, cls_preds, sig_embs, sim_scores, influence_preds, margin_preds
+        seed_probs = torch.sigmoid(self.seed_head(q).squeeze(-1))
+        graph_embs = F.normalize(self.graph_head(q), p=2, dim=-1)
+        return mask_embs, cls_preds, sig_embs, sim_scores, influence_preds, margin_preds, seed_probs, graph_embs
 
     def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
@@ -339,7 +353,7 @@ class CustomMask2Former(nn.Module):
         features, memory = self._build_memory(images)
         q_dec_all, intermediate_ttt_q = self._decode_queries(memory, ttt_steps_override=ttt_steps_override)
 
-        mask_embs, cls_preds, sig_embs, sim_scores, influence_preds, margin_preds = self._run_heads(q_dec_all)
+        mask_embs, cls_preds, sig_embs, sim_scores, influence_preds, margin_preds, seed_probs, graph_embs = self._run_heads(q_dec_all)
 
         return RawOutputs(
             features=features,
@@ -352,5 +366,7 @@ class CustomMask2Former(nn.Module):
             sim_scores=sim_scores,
             influence_preds=influence_preds,
             margin_preds=margin_preds,
+            seed_probs=seed_probs,
+            graph_embs=graph_embs,
             img_shape=(H_img, W_img),
         )

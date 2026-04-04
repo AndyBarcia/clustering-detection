@@ -48,6 +48,13 @@ def soft_iou_loss(inputs, targets, eps=1e-6):
     return 1.0 - iou.mean()
 
 
+def weighted_mean(values: torch.Tensor, weights: torch.Tensor, eps: float = 1e-6):
+    denom = weights.sum()
+    if float(denom.detach().item()) <= eps:
+        return values.sum() * 0.0
+    return (values * weights).sum() / denom.clamp_min(eps)
+
+
 class PanopticCriterion(nn.Module):
     def __init__(self, cfg: LossConfig):
         super().__init__()
@@ -66,6 +73,8 @@ class PanopticCriterion(nn.Module):
         sim_scores = raw.sim_scores
         influence_preds = raw.influence_preds
         margin_preds = raw.margin_preds
+        seed_probs = raw.seed_probs
+        graph_embs = raw.graph_embs
         intermediate_ttt_q = raw.intermediate_ttt_q
         H_img, W_img = raw.img_shape
 
@@ -92,6 +101,10 @@ class PanopticCriterion(nn.Module):
                 "loss_sim": zero,
                 "loss_margin": zero,
                 "loss_inter": zero,
+                "loss_seed_cover": zero,
+                "loss_seed_sparse": zero,
+                "loss_graph_pos": zero,
+                "loss_graph_neg": zero,
             }
 
         B_val = len(valid_b)
@@ -116,8 +129,11 @@ class PanopticCriterion(nn.Module):
         q_sim_score = sim_scores[:, valid_b]
         q_influence = influence_preds[:, valid_b]
         q_margin = margin_preds[:, valid_b]
+        q_seed = seed_probs[:, valid_b]
+        q_graph = graph_embs[:, valid_b]
 
         L, _, N_q, S = q_sig.shape
+        G = q_graph.shape[-1]
 
         q_sig_flat = q_sig.transpose(0, 1).reshape(B_val, L * N_q, S)
         q_mask_emb_flat = q_mask_emb.transpose(0, 1).reshape(B_val, L * N_q, -1)
@@ -125,6 +141,8 @@ class PanopticCriterion(nn.Module):
         q_sim_score_flat = q_sim_score.transpose(0, 1).reshape(B_val, L * N_q)
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
         q_margin_flat = q_margin.transpose(0, 1).reshape(B_val, L * N_q)
+        q_seed_flat = q_seed.transpose(0, 1).reshape(B_val, L * N_q)
+        q_graph_flat = q_graph.transpose(0, 1).reshape(B_val, L * N_q, G)
 
         gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
 
@@ -137,6 +155,9 @@ class PanopticCriterion(nn.Module):
             valid_mask=gt_pad_mask,
         )
         weights_flat = weights_raw
+        sim_pos = sim.clamp_min(0.0).masked_fill(~gt_pad_mask.unsqueeze(1), 0.0)
+        membership = sim_pos / (sim_pos.sum(dim=2, keepdim=True) + 1e-6)
+        membership_detached = membership.detach()
 
         top2 = sim_masked.topk(k=min(2, M_max), dim=2).values
         s1 = top2[:, :, 0]
@@ -202,6 +223,29 @@ class PanopticCriterion(nn.Module):
         loss_sim = loss_sim + F.mse_loss(sim_scores_ttt_val, true_sim_ttt.detach())
 
         loss_proto_ttt = F.relu(model.compact_margin - true_sim_max).pow(model.alpha_focal).mean()
+        seed_support = (membership_detached * q_seed_flat.unsqueeze(-1)).clamp(0.0, 1.0 - 1e-6)
+        log_miss = torch.log1p(-seed_support).sum(dim=1)
+        cover_prob = 1.0 - torch.exp(log_miss)
+        loss_seed_cover = -(cover_prob.clamp_min(1e-6).log())[gt_pad_mask].mean()
+        loss_seed_sparse = q_seed_flat.mean()
+
+        query_support = membership_detached.sum(dim=2).clamp(0.0, 1.0)
+        graph_cos = torch.bmm(q_graph_flat, q_graph_flat.transpose(1, 2))
+        seed_pair = q_seed_flat.unsqueeze(2) * q_seed_flat.unsqueeze(1)
+        support_pair = query_support.unsqueeze(2) * query_support.unsqueeze(1)
+        same_prob = torch.bmm(membership_detached, membership_detached.transpose(1, 2))
+        diff_prob = (support_pair - same_prob).clamp_min(0.0)
+
+        pair_mask = ~torch.eye(L * N_q, dtype=torch.bool, device=features.device).unsqueeze(0)
+        pair_mask_f = pair_mask.float()
+
+        pos_weights = same_prob * seed_pair * pair_mask_f
+        neg_weights = diff_prob * seed_pair * pair_mask_f
+        pos_violation = F.relu(self.cfg.graph_pos_margin - graph_cos).pow(2)
+        neg_violation = F.relu(graph_cos - self.cfg.graph_neg_margin).pow(2)
+        loss_graph_pos = weighted_mean(pos_violation, pos_weights)
+        loss_graph_neg = weighted_mean(neg_violation, neg_weights)
+
         total_loss_mask = self.cfg.w_mask_bce * loss_mask_bce + self.cfg.w_mask_iou * loss_mask_iou
 
         final_loss = (
@@ -211,7 +255,11 @@ class PanopticCriterion(nn.Module):
             total_loss_mask +
             self.cfg.w_sim * loss_sim +
             self.cfg.w_margin * loss_margin +
-            self.cfg.w_inter * loss_inter
+            self.cfg.w_inter * loss_inter +
+            self.cfg.w_seed_cover * loss_seed_cover +
+            self.cfg.w_seed_sparse * loss_seed_sparse +
+            self.cfg.w_graph_pos * loss_graph_pos +
+            self.cfg.w_graph_neg * loss_graph_neg
         )
 
         components = {
@@ -225,6 +273,10 @@ class PanopticCriterion(nn.Module):
             "loss_sim": loss_sim,
             "loss_margin": loss_margin,
             "loss_inter": loss_inter,
+            "loss_seed_cover": loss_seed_cover,
+            "loss_seed_sparse": loss_seed_sparse,
+            "loss_graph_pos": loss_graph_pos,
+            "loss_graph_neg": loss_graph_neg,
         }
 
         return final_loss, components

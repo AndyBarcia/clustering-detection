@@ -115,6 +115,10 @@ def format_epoch_metrics(epoch_metrics):
         "loss_sim",
         "loss_margin",
         "loss_inter",
+        "loss_seed_cover",
+        "loss_seed_sparse",
+        "loss_graph_pos",
+        "loss_graph_neg",
     ]
     return " | ".join(f"{key}={epoch_metrics[key]:.4f}" for key in ordered_keys if key in epoch_metrics)
 

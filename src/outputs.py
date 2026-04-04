@@ -15,4 +15,6 @@ class RawOutputs:
     sim_scores: torch.Tensor        # [L, B, Nq]
     influence_preds: torch.Tensor   # [L, B, Nq]
     margin_preds: torch.Tensor      # [L, B, Nq]
+    seed_probs: torch.Tensor        # [L, B, Nq]
+    graph_embs: torch.Tensor        # [L, B, Nq, G]
     img_shape: Tuple[int, int]

@@ -33,6 +33,7 @@ class HeadConfig:
     num_classes: int = 3
     hidden_dim: int = 1024
     sig_dim: int = 64
+    graph_dim: int = 64
 
 
 @dataclass
@@ -57,8 +58,14 @@ class LossConfig:
     w_margin: float = 2.0
     w_inter: float = 10.0
     w_proto_ttt: float = 1.0
+    w_seed_cover: float = 1.0
+    w_seed_sparse: float = 0.05
+    w_graph_pos: float = 2.0
+    w_graph_neg: float = 2.0
     inter_margin: float = 0.0
     topk_per_gt: int = 3
+    graph_pos_margin: float = 0.76
+    graph_neg_margin: float = 0.66
 
 
 @dataclass
