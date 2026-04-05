@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
+from scipy.optimize import linear_sum_assignment
 
 from .config import LossConfig
 from .model import CustomMask2Former
@@ -48,6 +49,34 @@ def soft_iou_loss(inputs, targets, eps=1e-6):
     return 1.0 - iou.mean()
 
 
+def hungarian_seed_assignment(
+    q_sig_flat: torch.Tensor,
+    gt_sigs_norm: torch.Tensor,
+    gt_pad_mask: torch.Tensor,
+):
+    B, num_queries, _ = q_sig_flat.shape
+    matched_query_mask = torch.zeros((B, num_queries), dtype=torch.bool, device=q_sig_flat.device)
+    matched_gt_indices = torch.full((B, num_queries), -1, dtype=torch.long, device=q_sig_flat.device)
+
+    for b in range(B):
+        valid_gt_idx = torch.where(gt_pad_mask[b])[0]
+        if valid_gt_idx.numel() == 0 or num_queries == 0:
+            continue
+
+        sim = torch.matmul(q_sig_flat[b], gt_sigs_norm[b, valid_gt_idx].T)
+        cost = (1.0 - sim).detach().cpu().numpy()
+        row_ind, col_ind = linear_sum_assignment(cost)
+        if len(row_ind) == 0:
+            continue
+
+        row_ind_t = torch.as_tensor(row_ind, device=q_sig_flat.device, dtype=torch.long)
+        col_ind_t = valid_gt_idx[torch.as_tensor(col_ind, device=q_sig_flat.device, dtype=torch.long)]
+        matched_query_mask[b, row_ind_t] = True
+        matched_gt_indices[b, row_ind_t] = col_ind_t
+
+    return matched_query_mask, matched_gt_indices
+
+
 class PanopticCriterion(nn.Module):
     def __init__(self, cfg: LossConfig):
         super().__init__()
@@ -63,10 +92,8 @@ class PanopticCriterion(nn.Module):
         mask_embs = raw.mask_embs
         cls_preds = raw.cls_preds
         sig_embs = raw.sig_embs
-        sim_scores = raw.sim_scores
+        seed_logits = raw.seed_logits
         influence_preds = raw.influence_preds
-        margin_preds = raw.margin_preds
-        intermediate_ttt_q = raw.intermediate_ttt_q
         H_img, W_img = raw.img_shape
 
         B = features.shape[0]
@@ -83,14 +110,12 @@ class PanopticCriterion(nn.Module):
             zero = features.sum() * 0.0
             return zero, {
                 "loss_total": zero,
-                "loss_proto_sig": zero,
-                "loss_proto_ttt": zero,
+                "loss_seed_sig": zero,
+                "loss_seed": zero,
                 "loss_cls": zero,
                 "loss_mask_bce": zero,
                 "loss_mask_iou": zero,
                 "loss_mask_total": zero,
-                "loss_sim": zero,
-                "loss_margin": zero,
                 "loss_inter": zero,
             }
 
@@ -113,20 +138,19 @@ class PanopticCriterion(nn.Module):
         q_sig = sig_embs[:, valid_b]
         q_mask_emb = mask_embs[:, valid_b]
         q_cls = cls_preds[:, valid_b]
-        q_sim_score = sim_scores[:, valid_b]
+        q_seed_logits = seed_logits[:, valid_b]
         q_influence = influence_preds[:, valid_b]
-        q_margin = margin_preds[:, valid_b]
 
         L, _, N_q, S = q_sig.shape
 
         q_sig_flat = q_sig.transpose(0, 1).reshape(B_val, L * N_q, S)
         q_mask_emb_flat = q_mask_emb.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, L * N_q, -1)
-        q_sim_score_flat = q_sim_score.transpose(0, 1).reshape(B_val, L * N_q)
+        q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
-        q_margin_flat = q_margin.transpose(0, 1).reshape(B_val, L * N_q)
 
         gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
+        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_norm, gt_pad_mask)
 
         sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
         sim_masked = sim.masked_fill(~gt_pad_mask.unsqueeze(1), -1.0)
@@ -137,18 +161,6 @@ class PanopticCriterion(nn.Module):
             valid_mask=gt_pad_mask,
         )
         weights_flat = weights_raw
-
-        top2 = sim_masked.topk(k=min(2, M_max), dim=2).values
-        s1 = top2[:, :, 0]
-        if M_max > 1:
-            s2 = top2[:, :, 1]
-            M_valid = gt_pad_mask.sum(dim=1)
-            s2 = s2 * (M_valid > 1).unsqueeze(1).float()
-        else:
-            s2 = torch.zeros_like(s1)
-
-        true_margin = s1 - s2
-        loss_margin = F.mse_loss(q_margin_flat, true_margin.detach())
 
         loss_inter = features.sum() * 0.0
         if M_max > 1:
@@ -165,12 +177,6 @@ class PanopticCriterion(nn.Module):
         proto_mask_emb = torch.bmm(norm_w.transpose(1, 2), q_mask_emb_flat)
         proto_cls = torch.bmm(norm_w.transpose(1, 2), q_cls_flat)
 
-        proto_signature = torch.bmm(norm_w.transpose(1, 2), q_sig_flat)
-        proto_signature = F.normalize(proto_signature, p=2, dim=-1)
-
-        cos_sim_proto = (proto_signature * gt_sigs_norm).sum(dim=-1)
-        loss_proto_sig = F.relu(model.compact_margin - cos_sim_proto)[gt_pad_mask].pow(2).mean()
-
         proto_cls_flat = proto_cls[gt_pad_mask]
         gt_labels_flat = gt_labels_pad[gt_pad_mask]
         loss_cls = F.cross_entropy(proto_cls_flat, gt_labels_flat)
@@ -184,46 +190,36 @@ class PanopticCriterion(nn.Module):
         loss_mask_bce = F.binary_cross_entropy_with_logits(mask_logits_flat, gt_masks_flat)
         loss_mask_iou = soft_iou_loss(mask_logits_flat, gt_masks_flat)
 
-        true_sim_max, _ = sim_masked.max(dim=2)
-        loss_sim = F.mse_loss(q_sim_score_flat, true_sim_max.detach())
+        seed_targets = matched_query_mask.float()
+        loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
 
-        with torch.no_grad():
-            sig_embs_ttt = F.normalize(model.sig_head(intermediate_ttt_q), p=2, dim=-1)
-            sig_embs_ttt_val = sig_embs_ttt[:, valid_b]
+        loss_seed_sig = features.sum() * 0.0
+        matched_pos = matched_query_mask.nonzero(as_tuple=False)
+        if matched_pos.numel() > 0:
+            matched_gt = matched_gt_indices[matched_query_mask]
+            matched_q_sig = q_sig_flat[matched_query_mask]
+            matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt]
+            cos_sim_seed = (matched_q_sig * matched_gt_sig).sum(dim=-1)
+            loss_seed_sig = (1.0 - cos_sim_seed).mean()
 
-        sim_scores_ttt = torch.sigmoid(model.sim_head(intermediate_ttt_q).squeeze(-1))
-        sim_scores_ttt_val = sim_scores_ttt[:, valid_b]
-
-        with torch.no_grad():
-            sim_ttt = torch.einsum('tbns,bms->tbnm', sig_embs_ttt_val, gt_sigs_norm)
-            sim_ttt_masked = sim_ttt.masked_fill(~gt_pad_mask.view(1, B_val, 1, M_max), -1.0)
-            true_sim_ttt = sim_ttt_masked.max(dim=-1).values
-
-        loss_sim = loss_sim + F.mse_loss(sim_scores_ttt_val, true_sim_ttt.detach())
-
-        loss_proto_ttt = F.relu(model.compact_margin - true_sim_max).pow(model.alpha_focal).mean()
         total_loss_mask = self.cfg.w_mask_bce * loss_mask_bce + self.cfg.w_mask_iou * loss_mask_iou
 
         final_loss = (
-            loss_proto_sig +
-            self.cfg.w_proto_ttt * loss_proto_ttt +
+            loss_seed_sig +
             loss_cls +
             total_loss_mask +
-            self.cfg.w_sim * loss_sim +
-            self.cfg.w_margin * loss_margin +
+            self.cfg.w_seed * loss_seed +
             self.cfg.w_inter * loss_inter
         )
 
         components = {
             "loss_total": final_loss,
-            "loss_proto_sig": loss_proto_sig,
-            "loss_proto_ttt": loss_proto_ttt,
+            "loss_seed_sig": loss_seed_sig,
+            "loss_seed": loss_seed,
             "loss_cls": loss_cls,
             "loss_mask_bce": loss_mask_bce,
             "loss_mask_iou": loss_mask_iou,
             "loss_mask_total": total_loss_mask,
-            "loss_sim": loss_sim,
-            "loss_margin": loss_margin,
             "loss_inter": loss_inter,
         }
 

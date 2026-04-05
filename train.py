@@ -106,14 +106,12 @@ def build_dataloader(args, device):
 def format_epoch_metrics(epoch_metrics):
     ordered_keys = [
         "loss_total",
-        "loss_proto_sig",
-        "loss_proto_ttt",
+        "loss_seed_sig",
+        "loss_seed",
         "loss_cls",
         "loss_mask_bce",
         "loss_mask_iou",
         "loss_mask_total",
-        "loss_sim",
-        "loss_margin",
         "loss_inter",
     ]
     return " | ".join(f"{key}={epoch_metrics[key]:.4f}" for key in ordered_keys if key in epoch_metrics)

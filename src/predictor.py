@@ -120,9 +120,8 @@ class ModularPrototypePredictor:
         q_mask_emb = raw.mask_embs[:, b]
         q_cls = raw.cls_preds[:, b]
         q_sig = raw.sig_embs[:, b]
-        q_sim = raw.sim_scores[:, b]
+        q_seed = raw.seed_scores[:, b]
         q_influence = raw.influence_preds[:, b]
-        q_margin = raw.margin_preds[:, b]
 
         L, N_q, S = q_sig.shape
         num_classes = q_cls.shape[-1]
@@ -130,15 +129,12 @@ class ModularPrototypePredictor:
         q_mask_emb = q_mask_emb.reshape(L * N_q, -1)
         q_cls = q_cls.reshape(L * N_q, num_classes)
         q_sig = q_sig.reshape(L * N_q, S)
-        q_sim = q_sim.reshape(L * N_q)
+        q_seed = q_seed.reshape(L * N_q)
         q_influence = q_influence.reshape(L * N_q)
-        q_margin = q_margin.reshape(L * N_q)
 
         q_cls_prob = F.softmax(q_cls, dim=-1)
         pred_cls = q_cls_prob.argmax(dim=-1)
         fg_conf = 1.0 - q_cls_prob[:, 0]
-
-        q_quality = torch.sqrt(q_sim.clamp_min(0.0) * q_margin.clamp_min(0.0))
 
         return {
             "features": features,
@@ -150,17 +146,15 @@ class ModularPrototypePredictor:
             "q_cls": q_cls,
             "q_cls_prob": q_cls_prob,
             "q_sig": q_sig,
-            "q_sim": q_sim,
+            "q_seed": q_seed,
             "q_influence": q_influence,
-            "q_margin": q_margin,
-            "q_quality": q_quality,
             "fg_conf": fg_conf,
             "pred_cls": pred_cls,
         }
 
     def _select_seeds(self, flat: Dict[str, torch.Tensor]):
         cfg = self.cfg.seed
-        score = flat["q_quality"].clone()
+        score = flat["q_seed"].clone()
 
         if cfg.use_foreground_in_score:
             score = score * flat["fg_conf"].pow(cfg.foreground_score_power)
@@ -177,7 +171,7 @@ class ModularPrototypePredictor:
             eligible &= (flat["q_influence"] <= cfg.max_influence)
 
         keep = eligible.clone()
-        keep &= (score >= cfg.quality_threshold)
+        keep &= (flat["q_seed"] >= cfg.quality_threshold)
 
         seed_idx = torch.where(keep)[0]
 
@@ -333,6 +327,7 @@ class ModularPrototypePredictor:
                 "proto_cls": torch.empty((0, flat["q_cls"].shape[-1]), device=device),
                 "proto_mask_emb": torch.empty((0, flat["q_mask_emb"].shape[-1]), device=device),
                 "cluster_members": [],
+                "proto_seed_idx": torch.empty((0,), dtype=torch.long, device=device),
                 "seed_idx": seed_idx,
                 "seed_cluster_labels": cluster_labels,
             }
@@ -343,19 +338,23 @@ class ModularPrototypePredictor:
         proto_cls = []
         proto_mask_emb = []
         cluster_members = []
+        proto_seed_idx = []
 
         for cid in cluster_ids:
             member_seed_idx = seed_idx[cluster_labels == cid]
             cluster_members.append(member_seed_idx)
 
-            w = flat["q_quality"][member_seed_idx]
+            rep_local = torch.argmax(flat["q_seed"][member_seed_idx])
+            rep_seed_idx = member_seed_idx[rep_local]
+            proto_seed_idx.append(rep_seed_idx)
+
+            w = flat["q_seed"][member_seed_idx]
             w = w / (w.sum() + 1e-6)
 
-            p_sig = _safe_normalize((flat["q_sig"][member_seed_idx] * w.unsqueeze(1)).sum(dim=0), dim=0)
             p_cls = (flat["q_cls"][member_seed_idx] * w.unsqueeze(1)).sum(dim=0)
             p_mask = (flat["q_mask_emb"][member_seed_idx] * w.unsqueeze(1)).sum(dim=0)
 
-            proto_sig.append(p_sig)
+            proto_sig.append(flat["q_sig"][rep_seed_idx])
             proto_cls.append(p_cls)
             proto_mask_emb.append(p_mask)
 
@@ -365,6 +364,7 @@ class ModularPrototypePredictor:
             "proto_cls": torch.stack(proto_cls, dim=0),
             "proto_mask_emb": torch.stack(proto_mask_emb, dim=0),
             "cluster_members": cluster_members,
+            "proto_seed_idx": torch.stack(proto_seed_idx, dim=0),
             "seed_idx": seed_idx,
             "seed_cluster_labels": cluster_labels,
         }
@@ -401,7 +401,7 @@ class ModularPrototypePredictor:
             raw_w = affinity.pow(alpha)
 
             if cfg.use_query_quality:
-                raw_w = raw_w * flat["q_quality"][q_idx].pow(cfg.query_quality_power).unsqueeze(1)
+                raw_w = raw_w * flat["q_seed"][q_idx].pow(cfg.query_quality_power).unsqueeze(1)
 
             if cfg.use_foreground_prob:
                 raw_w = raw_w * flat["fg_conf"][q_idx].pow(cfg.foreground_prob_power).unsqueeze(1)
@@ -418,7 +418,6 @@ class ModularPrototypePredictor:
 
             proto_mask_emb = torch.matmul(norm_w.T, q_mask_emb)
             proto_cls = torch.matmul(norm_w.T, q_cls)
-            proto_sig = _safe_normalize(torch.matmul(norm_w.T, q_sig), dim=-1)
 
             final_raw_w = raw_w
             final_norm_w = norm_w
@@ -460,6 +459,7 @@ class ModularPrototypePredictor:
                 "proto_cls": torch.empty((0, flat["q_cls"].shape[-1]), device=device),
                 "proto_mask_emb": torch.empty((0, flat["q_mask_emb"].shape[-1]), device=device),
                 "cluster_members": [],
+                "proto_seed_idx": torch.empty((0,), dtype=torch.long, device=device),
                 "seed_idx": torch.empty((0,), dtype=torch.long, device=device),
                 "seed_cluster_labels": torch.empty((0,), dtype=torch.long, device=device),
                 "assignment_weights": torch.empty((flat["q_sig"].shape[0], 0), device=device),
@@ -490,7 +490,7 @@ class ModularPrototypePredictor:
         raw_w = affinity.pow(alpha)
 
         if self.cfg.assign.use_query_quality:
-            raw_w = raw_w * flat["q_quality"].pow(self.cfg.assign.query_quality_power).unsqueeze(1)
+            raw_w = raw_w * flat["q_seed"].pow(self.cfg.assign.query_quality_power).unsqueeze(1)
 
         if self.cfg.assign.use_foreground_prob:
             raw_w = raw_w * flat["fg_conf"].pow(self.cfg.assign.foreground_prob_power).unsqueeze(1)
@@ -518,6 +518,7 @@ class ModularPrototypePredictor:
             "proto_cls": proto_cls,
             "proto_mask_emb": proto_mask_emb,
             "cluster_members": [],
+            "proto_seed_idx": torch.full((labels.shape[0],), -1, dtype=torch.long, device=device),
             "seed_idx": torch.arange(labels.shape[0], device=device),
             "seed_cluster_labels": torch.arange(labels.shape[0], device=device),
             "assignment_weights": norm_w,
@@ -538,6 +539,7 @@ class ModularPrototypePredictor:
                 "seed_idx": proto_state["seed_idx"],
                 "seed_cluster_labels": proto_state["seed_cluster_labels"],
                 "cluster_members": proto_state["cluster_members"],
+                "proto_seed_idx": proto_state["proto_seed_idx"],
                 "assignment_weights": torch.empty((flat["q_sig"].shape[0], 0), device=flat["q_sig"].device),
                 "all_proto_sig": proto_state["proto_sig"],
                 "proto_sig": torch.empty((0, flat["q_sig"].shape[-1]), device=flat["q_sig"].device),
@@ -587,6 +589,7 @@ class ModularPrototypePredictor:
                 "seed_idx": proto_state["seed_idx"],
                 "seed_cluster_labels": proto_state["seed_cluster_labels"],
                 "cluster_members": proto_state["cluster_members"],
+                "proto_seed_idx": proto_state["proto_seed_idx"],
                 "assignment_weights": proto_state["assignment_weights"],
                 "all_proto_sig": proto_state["proto_sig"],
                 "proto_sig": torch.empty((0, flat["q_sig"].shape[-1]), device=flat["q_sig"].device),
@@ -632,6 +635,7 @@ class ModularPrototypePredictor:
             "seed_idx": proto_state["seed_idx"],
             "seed_cluster_labels": proto_state["seed_cluster_labels"],
             "cluster_members": proto_state["cluster_members"],
+            "proto_seed_idx": proto_state["proto_seed_idx"][keep] if proto_state["proto_seed_idx"].numel() > 0 else proto_state["proto_seed_idx"],
             "assignment_weights": proto_state["assignment_weights"],
 
             "all_proto_sig": proto_state["proto_sig"],

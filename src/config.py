@@ -44,8 +44,6 @@ class ModelConfig:
 
     learned_alpha: bool = False
     alpha_focal: float = 1.0
-    compact_margin: float = 0.8
-    w_proto_ttt: float = 1.0
     spatial_hw: int = 64
 
 
@@ -53,16 +51,15 @@ class ModelConfig:
 class LossConfig:
     w_mask_bce: float = 2.0
     w_mask_iou: float = 5.0
-    w_sim: float = 2.0
-    w_margin: float = 2.0
+    w_seed: float = 2.0
     w_inter: float = 10.0
-    w_proto_ttt: float = 1.0
     inter_margin: float = 0.0
     topk_per_gt: int = 3
 
 
 @dataclass
 class SeedFilterConfig:
+    # Threshold on predicted seedness used to decide which queries can start clusters.
     quality_threshold: float = 0.17
     topk: Optional[int] = None
     min_num_seeds: int = 1
@@ -107,6 +104,7 @@ class SoftAssignmentConfig:
     use_alpha_focal: bool = True
     similarity_floor: float = 0.0
 
+    # Backward-compatible name: this now uses predicted seedness as the per-query weighting signal.
     use_query_quality: bool = True
     query_quality_power: float = 0.6
 

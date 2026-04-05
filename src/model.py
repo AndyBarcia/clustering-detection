@@ -83,8 +83,8 @@ class TransformerDecoderLayer(nn.Module):
         )
         return tgt + self.dropout2(tgt2)
 
-    def _ttt_block(self, tgt, sim_head):
-        if sim_head is None or self.ttt_steps <= 0:
+    def _ttt_block(self, tgt, seed_head):
+        if seed_head is None or self.ttt_steps <= 0:
             intermediate_q = [tgt]
             intermediate_q = torch.stack(intermediate_q, dim=0) # (TTTSteps,B,Q,C)
             return tgt, intermediate_q
@@ -105,14 +105,12 @@ class TransformerDecoderLayer(nn.Module):
             intermediate_q = [tgt.requires_grad_(True)]
             v = torch.zeros_like(intermediate_q[-1])
             
-            detached_states = {k: v.detach() for k, v in sim_head.named_parameters()}
+            detached_states = {k: v.detach() for k, v in seed_head.named_parameters()}
 
             for _ in range(self.ttt_steps):
-                sim_logits = functional_call(sim_head, detached_states, (intermediate_q[-1],))
-                sim_scores = torch.sigmoid(sim_logits.squeeze(-1))  
-                                
-                #sim_scores = torch.sigmoid(sim_head(intermediate_q[-1]).squeeze(-1))  
-                inner_loss = 1.0 - sim_scores
+                seed_logits = functional_call(seed_head, detached_states, (intermediate_q[-1],))
+                seed_scores = torch.sigmoid(seed_logits.squeeze(-1))
+                inner_loss = 1.0 - seed_scores
                 
                 # Propperly scale losses based on batch size.
                 inner_loss = inner_loss.view(tgt.shape[0],-1).mean(dim=-1).sum()
@@ -145,12 +143,12 @@ class TransformerDecoderLayer(nn.Module):
         memory_mask=None, 
         tgt_key_padding_mask=None, 
         memory_key_padding_mask=None,
-        sim_head=None
+        seed_head=None
     ):
         
         tgt = self._self_attention_block(tgt, tgt_mask, tgt_key_padding_mask)
         tgt = self._cross_attention_block(tgt, memory, memory_mask, memory_key_padding_mask)
-        tgt, intermediate_ttt_q = self._ttt_block(tgt, sim_head)
+        tgt, intermediate_ttt_q = self._ttt_block(tgt, seed_head)
         tgt = self._ff_block(tgt)
 
         return tgt, intermediate_ttt_q
@@ -227,17 +225,12 @@ class CustomMask2Former(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, sig_dim),
         )
-        self.sim_head = nn.Sequential(
+        self.seed_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
         )
         self.influence_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.margin_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
@@ -257,9 +250,6 @@ class CustomMask2Former(nn.Module):
             self.alpha_focal = nn.Parameter(torch.tensor(cfg.alpha_focal, dtype=torch.float32))
         else:
             self.alpha_focal = cfg.alpha_focal
-
-        self.compact_margin = cfg.compact_margin
-        self.w_proto_ttt = cfg.w_proto_ttt
 
     @contextlib.contextmanager
     def _temporary_ttt_steps(self, ttt_steps_override: Optional[int] = None):
@@ -292,7 +282,7 @@ class CustomMask2Former(nn.Module):
             q_dec_all, intermediate_ttt_q = self.transformer_decoder(
                 tgt=query_embed,
                 memory=memory,
-                sim_head=self.sim_head,
+                seed_head=self.seed_head,
             )
         return q_dec_all, intermediate_ttt_q
 
@@ -317,7 +307,7 @@ class CustomMask2Former(nn.Module):
                 tgt=query_init,
                 memory=memory,
                 memory_mask=attn_mask_rep,
-                sim_head=self.sim_head,
+                seed_head=self.seed_head,
             )
         q_gt = q_gt_all[-1]
 
@@ -328,10 +318,10 @@ class CustomMask2Former(nn.Module):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
         sig_embs = F.normalize(self.sig_head(q), p=2, dim=-1)
-        sim_scores = torch.sigmoid(self.sim_head(q).squeeze(-1))
+        seed_logits = self.seed_head(q).squeeze(-1)
+        seed_scores = torch.sigmoid(seed_logits)
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
-        margin_preds = torch.sigmoid(self.margin_head(q).squeeze(-1))
-        return mask_embs, cls_preds, sig_embs, sim_scores, influence_preds, margin_preds
+        return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds
 
     def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
@@ -339,7 +329,7 @@ class CustomMask2Former(nn.Module):
         features, memory = self._build_memory(images)
         q_dec_all, intermediate_ttt_q = self._decode_queries(memory, ttt_steps_override=ttt_steps_override)
 
-        mask_embs, cls_preds, sig_embs, sim_scores, influence_preds, margin_preds = self._run_heads(q_dec_all)
+        mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds = self._run_heads(q_dec_all)
 
         return RawOutputs(
             features=features,
@@ -349,8 +339,8 @@ class CustomMask2Former(nn.Module):
             mask_embs=mask_embs,
             cls_preds=cls_preds,
             sig_embs=sig_embs,
-            sim_scores=sim_scores,
+            seed_logits=seed_logits,
+            seed_scores=seed_scores,
             influence_preds=influence_preds,
-            margin_preds=margin_preds,
             img_shape=(H_img, W_img),
         )
