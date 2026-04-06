@@ -44,7 +44,6 @@ def _filter_background_instances(
 def sample_synthetic_examples(
     *,
     num_samples: int,
-    dataset_length: int,
     height: int,
     width: int,
     max_objects: int,
@@ -66,9 +65,8 @@ def sample_synthetic_examples(
             max_objects=max_objects,
             device=device or "cpu",
         )
-        batch_size = min(num_samples, max(dataset_length, num_samples))
         batch_images, batch_targets = generator.generate_batch(
-            batch_size=batch_size,
+            batch_size=num_samples,
             start_idx=0,
         )
     finally:

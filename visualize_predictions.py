@@ -16,7 +16,6 @@ def parse_args():
     parser.add_argument("checkpoint", help="Path to a saved checkpoint.")
     parser.add_argument("--device", default="cpu", help="Inference device, e.g. cpu or cuda.")
     parser.add_argument("--num-samples", type=int, default=4, help="Number of synthetic samples to visualize.")
-    parser.add_argument("--dataset-length", type=int, default=100, help="Synthetic dataset length used for random sampling.")
     parser.add_argument("--height", type=int, default=256, help="Synthetic image height.")
     parser.add_argument("--width", type=int, default=256, help="Synthetic image width.")
     parser.add_argument("--max-objects", type=int, default=10, help="Maximum objects per synthetic image.")
@@ -33,7 +32,6 @@ def main():
 
     images, targets = sample_synthetic_examples(
         num_samples=args.num_samples,
-        dataset_length=args.dataset_length,
         height=args.height,
         width=args.width,
         max_objects=args.max_objects,

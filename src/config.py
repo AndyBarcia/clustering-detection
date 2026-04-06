@@ -55,7 +55,6 @@ class LossConfig:
     w_seed: float = 2.0
     w_inter: float = 10.0
     inter_margin: float = 0.0
-    topk_per_gt: int = 3
 
 
 @dataclass
