@@ -81,5 +81,16 @@ def load_system_checkpoint(path: str, map_location="cpu", inference_override: Op
     )
 
     system = PanopticSystem(cfg)
-    system.model.load_state_dict(model_state_dict, strict=strict)
+    missing_attn_residuals = (
+        strict and
+        not any(key.startswith("transformer_decoder.attn_residual_queries") for key in model_state_dict)
+    )
+    incompatible = system.model.load_state_dict(model_state_dict, strict=False if missing_attn_residuals else strict)
+
+    if missing_attn_residuals:
+        missing = [k for k in incompatible.missing_keys if not k.startswith("transformer_decoder.attn_residual_")]
+        if missing or incompatible.unexpected_keys:
+            raise RuntimeError(
+                f"Checkpoint load failed. Missing keys: {missing}. Unexpected keys: {incompatible.unexpected_keys}"
+            )
     return system, ckpt

@@ -155,23 +155,41 @@ class TransformerDecoderLayer(nn.Module):
 
 
 class TTTTransformerDecoder(nn.Module):
-    def __init__(self, decoder_layer, num_layers):
+    def __init__(self, decoder_layer, num_layers, use_attention_residuals: bool = True):
         super().__init__()
         self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
         self.num_layers = num_layers
+        self.use_attention_residuals = use_attention_residuals
+
+        d_model = decoder_layer.self_attn.embed_dim
+        self.attn_residual_queries = nn.Parameter(torch.randn(num_layers, d_model) * (d_model ** -0.5))
+        self.attn_residual_key_scale = nn.Parameter(torch.ones(d_model))
+        self.attn_residual_eps = 1e-6
+
+    def _depth_attention_residual(self, history, layer_idx):
+        if not self.use_attention_residuals or len(history) == 1:
+            return history[-1]
+
+        history_stack = torch.stack(history, dim=0)  # (D, B, Q, C)
+        rms = history_stack.pow(2).mean(dim=-1, keepdim=True).add(self.attn_residual_eps).rsqrt()
+        keys = history_stack * rms * self.attn_residual_key_scale.view(1, 1, 1, -1)
+        logits = torch.einsum("c,dbqc->dbq", self.attn_residual_queries[layer_idx], keys)
+        weights = logits.softmax(dim=0)
+        return torch.einsum("dbq,dbqc->bqc", weights, history_stack)
 
     def forward(self, tgt, memory, **kwargs):
         output = tgt
+        history = [tgt]
         ttt_output = []
-        all_outputs = [] # Track outputs from all layers
         
-        for mod in self.layers:
-            output, intermediate_ttt_q = mod(output, memory, **kwargs)
+        for layer_idx, mod in enumerate(self.layers):
+            layer_input = self._depth_attention_residual(history, layer_idx)
+            output, intermediate_ttt_q = mod(layer_input, memory, **kwargs)
+            history.append(output)
             ttt_output.append(intermediate_ttt_q)
-            all_outputs.append(output)
 
         intermediate_ttt_q = torch.cat(ttt_output, dim=0) # (L*TTTSteps, B, Q, C)
-        all_outputs = torch.stack(all_outputs, dim=0)     # (L, B, Q, C)
+        all_outputs = torch.stack(history[1:], dim=0)     # (L, B, Q, C)
         
         return all_outputs, intermediate_ttt_q
 
@@ -208,7 +226,11 @@ class CustomMask2Former(nn.Module):
             ttt_lr=dlcfg.ttt_lr,
             ttt_momentum=dlcfg.ttt_momentum,
         )
-        self.transformer_decoder = TTTTransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.transformer_decoder = TTTTransformerDecoder(
+            decoder_layer,
+            num_layers=num_layers,
+            use_attention_residuals=cfg.decoder.use_attention_residuals,
+        )
 
         self.mask_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),

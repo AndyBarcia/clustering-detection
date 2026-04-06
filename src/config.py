@@ -26,6 +26,7 @@ class DecoderLayerConfig:
 class DecoderConfig:
     num_layers: int = 3
     num_queries: int = 20
+    use_attention_residuals: bool = True
 
 
 @dataclass
