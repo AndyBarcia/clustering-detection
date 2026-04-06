@@ -163,7 +163,6 @@ def build_visualization_batch(args):
 
     return sample_synthetic_examples(
         num_samples=args.vis_samples,
-        dataset_length=args.dataset_length,
         height=args.height,
         width=args.width,
         max_objects=args.max_objects,

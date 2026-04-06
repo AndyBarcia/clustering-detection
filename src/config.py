@@ -117,6 +117,10 @@ class SoftAssignmentConfig:
 
 @dataclass
 class OverlapResolutionConfig:
+    morphology_op: str = "none"
+    morphology_kernel_size: int = 0
+    morphology_iterations: int = 1
+
     remove_background: bool = True
     min_prototype_score: float = 0.06
     min_area: int = 18

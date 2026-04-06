@@ -1,5 +1,8 @@
 import argparse
 
+import torch
+
+from src.config import dataclass_from_dict, PrototypeInferenceConfig
 from src.panoptic import load_system_checkpoint
 from src.visualization import (
     DEFAULT_CLASS_NAMES,

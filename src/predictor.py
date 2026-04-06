@@ -92,9 +92,53 @@ def _build_weighted_graph_edges(affinity: np.ndarray, min_edge_weight: float):
     return edges, weights
 
 
+def _binary_dilate(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    if kernel_size <= 1:
+        return mask.to(dtype=torch.bool)
+    pad = kernel_size // 2
+    pooled = F.max_pool2d(mask.float().unsqueeze(0).unsqueeze(0), kernel_size, stride=1, padding=pad)
+    return pooled[0, 0] > 0
+
+
+def _binary_erode(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    if kernel_size <= 1:
+        return mask.to(dtype=torch.bool)
+    return ~_binary_dilate(~mask.to(dtype=torch.bool), kernel_size)
+
+
 class ModularPrototypePredictor:
     def __init__(self, cfg: PrototypeInferenceConfig):
         self.cfg = cfg
+
+    def _apply_morphology(self, mask: torch.Tensor) -> torch.Tensor:
+        cfg = self.cfg.overlap
+        op = cfg.morphology_op.lower()
+        kernel_size = int(cfg.morphology_kernel_size)
+        iterations = max(1, int(cfg.morphology_iterations))
+
+        if op == "none" or kernel_size <= 1:
+            return mask.to(dtype=torch.bool)
+        if kernel_size % 2 == 0:
+            raise ValueError("overlap.morphology_kernel_size must be odd when morphology is enabled.")
+
+        out = mask.to(dtype=torch.bool)
+
+        for _ in range(iterations):
+            if op == "opening":
+                out = _binary_dilate(_binary_erode(out, kernel_size), kernel_size)
+            elif op == "closing":
+                out = _binary_erode(_binary_dilate(out, kernel_size), kernel_size)
+            elif op == "open_close":
+                out = _binary_erode(_binary_dilate(_binary_dilate(_binary_erode(out, kernel_size), kernel_size), kernel_size), kernel_size)
+            elif op == "close_open":
+                out = _binary_dilate(_binary_erode(_binary_erode(_binary_dilate(out, kernel_size), kernel_size), kernel_size), kernel_size)
+            else:
+                raise ValueError(
+                    "overlap.morphology_op must be one of "
+                    "{'none', 'opening', 'closing', 'open_close', 'close_open'}."
+                )
+
+        return out
 
     @torch.no_grad()
     def predict(self, model: CustomMask2Former, images: torch.Tensor):
@@ -622,6 +666,7 @@ class ModularPrototypePredictor:
         for kept_pos, proto_idx in enumerate(keep_idx.tolist()):
             m = (winners == proto_idx) & (max_pixel_score >= cfg.pixel_score_threshold)
             m &= (mask_probs[proto_idx] >= cfg.mask_threshold)
+            m = self._apply_morphology(m)
 
             if m.sum().item() < cfg.min_area:
                 continue

@@ -10,6 +10,7 @@ os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 import numpy as np
 import torch
 
+from src.config import dataclass_from_dict, PrototypeInferenceConfig
 from src.evaluation import evaluate_system, format_metrics_table
 from src.panoptic import load_system_checkpoint
 
