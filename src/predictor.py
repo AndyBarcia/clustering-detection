@@ -134,7 +134,9 @@ class ModularPrototypePredictor:
 
         q_cls_prob = F.softmax(q_cls, dim=-1)
         pred_cls = q_cls_prob.argmax(dim=-1)
+        bg_conf = q_cls_prob[:, 0]
         fg_conf = 1.0 - q_cls_prob[:, 0]
+        partition_conf = torch.where(pred_cls == 0, bg_conf, fg_conf)
 
         return {
             "features": features,
@@ -148,7 +150,9 @@ class ModularPrototypePredictor:
             "q_sig": q_sig,
             "q_seed": q_seed,
             "q_influence": q_influence,
+            "bg_conf": bg_conf,
             "fg_conf": fg_conf,
+            "partition_conf": partition_conf,
             "pred_cls": pred_cls,
         }
 
@@ -157,7 +161,7 @@ class ModularPrototypePredictor:
         score = flat["q_seed"].clone()
 
         if cfg.use_foreground_in_score:
-            score = score * flat["fg_conf"].pow(cfg.foreground_score_power)
+            score = score * flat["partition_conf"].pow(cfg.foreground_score_power)
 
         eligible = torch.ones_like(score, dtype=torch.bool)
 
@@ -165,7 +169,7 @@ class ModularPrototypePredictor:
             eligible &= (flat["pred_cls"] != 0)
 
         if cfg.min_foreground_prob > 0:
-            eligible &= (flat["fg_conf"] >= cfg.min_foreground_prob)
+            eligible &= (flat["partition_conf"] >= cfg.min_foreground_prob)
 
         if cfg.max_influence is not None:
             eligible &= (flat["q_influence"] <= cfg.max_influence)
@@ -403,11 +407,22 @@ class ModularPrototypePredictor:
             if cfg.use_query_quality:
                 raw_w = raw_w * flat["q_seed"][q_idx].pow(cfg.query_quality_power).unsqueeze(1)
 
+            proto_cls_prob = None
+            if cfg.use_foreground_prob or cfg.class_compat_power > 0:
+                proto_cls_prob = F.softmax(proto_cls, dim=-1)
+
             if cfg.use_foreground_prob:
-                raw_w = raw_w * flat["fg_conf"][q_idx].pow(cfg.foreground_prob_power).unsqueeze(1)
+                q_fg_conf = flat["fg_conf"][q_idx]
+                q_bg_conf = flat["bg_conf"][q_idx]
+                proto_bg_conf = proto_cls_prob[:, 0]
+                proto_fg_conf = 1.0 - proto_bg_conf
+                partition_compat = (
+                    q_fg_conf[:, None] * proto_fg_conf[None, :]
+                    + q_bg_conf[:, None] * proto_bg_conf[None, :]
+                )
+                raw_w = raw_w * partition_compat.clamp_min(1e-6).pow(cfg.foreground_prob_power)
 
             if cfg.class_compat_power > 0:
-                proto_cls_prob = F.softmax(proto_cls, dim=-1)
                 class_compat = torch.matmul(q_cls_prob, proto_cls_prob.T).clamp_min(1e-6)
                 raw_w = raw_w * class_compat.pow(cfg.class_compat_power)
 
@@ -492,10 +507,8 @@ class ModularPrototypePredictor:
         if self.cfg.assign.use_query_quality:
             raw_w = raw_w * flat["q_seed"].pow(self.cfg.assign.query_quality_power).unsqueeze(1)
 
-        if self.cfg.assign.use_foreground_prob:
-            raw_w = raw_w * flat["fg_conf"].pow(self.cfg.assign.foreground_prob_power).unsqueeze(1)
-
-        if self.cfg.assign.class_compat_power > 0:
+        gt_cls_prob = None
+        if self.cfg.assign.use_foreground_prob or self.cfg.assign.class_compat_power > 0:
             gt_cls_logits = torch.full(
                 (labels.shape[0], q_cls.shape[-1]),
                 fill_value=-20.0,
@@ -504,6 +517,17 @@ class ModularPrototypePredictor:
             )
             gt_cls_logits[torch.arange(labels.shape[0], device=device), labels] = 20.0
             gt_cls_prob = F.softmax(gt_cls_logits, dim=-1)
+
+        if self.cfg.assign.use_foreground_prob:
+            gt_bg_conf = gt_cls_prob[:, 0]
+            gt_fg_conf = 1.0 - gt_bg_conf
+            partition_compat = (
+                flat["fg_conf"][:, None] * gt_fg_conf[None, :]
+                + flat["bg_conf"][:, None] * gt_bg_conf[None, :]
+            )
+            raw_w = raw_w * partition_compat.clamp_min(1e-6).pow(self.cfg.assign.foreground_prob_power)
+
+        if self.cfg.assign.class_compat_power > 0:
             class_compat = torch.matmul(q_cls_prob, gt_cls_prob.T).clamp_min(1e-6)
             raw_w = raw_w * class_compat.pow(self.cfg.assign.class_compat_power)
 
@@ -561,7 +585,7 @@ class ModularPrototypePredictor:
             mode="bilinear",
             align_corners=False,
         )[0]
-        mask_probs = torch.sigmoid(mask_logits)
+        mask_probs = F.softmax(mask_logits, dim=0)
 
         cls_prob = F.softmax(proto_cls, dim=-1)
         pred_cls = cls_prob.argmax(dim=-1)
@@ -604,6 +628,7 @@ class ModularPrototypePredictor:
                 "resolved_scores": [],
             }
 
+        keep_idx = torch.where(keep)[0]
         mask_probs_kept = mask_probs[keep]
         mask_logits_kept = mask_logits[keep]
         cls_prob_kept = cls_prob[keep]
@@ -613,23 +638,23 @@ class ModularPrototypePredictor:
         proto_cls_kept = proto_cls[keep]
         proto_mask_emb_kept = proto_mask_emb[keep]
 
-        pixel_scores = mask_probs_kept * proto_score_kept[:, None, None]
+        pixel_scores = mask_probs * proto_score[:, None, None]
         max_pixel_score, winners = pixel_scores.max(dim=0)
 
         resolved_masks = []
         resolved_labels = []
         resolved_scores = []
 
-        for k in range(mask_probs_kept.shape[0]):
-            m = (winners == k) & (max_pixel_score >= cfg.pixel_score_threshold)
-            m &= (mask_probs_kept[k] >= cfg.mask_threshold)
+        for kept_pos, proto_idx in enumerate(keep_idx.tolist()):
+            m = (winners == proto_idx) & (max_pixel_score >= cfg.pixel_score_threshold)
+            m &= (mask_probs[proto_idx] >= cfg.mask_threshold)
 
             if m.sum().item() < cfg.min_area:
                 continue
 
             resolved_masks.append(m)
-            resolved_labels.append(int(pred_cls_kept[k].item()))
-            resolved_scores.append(float(proto_score_kept[k].item()))
+            resolved_labels.append(int(pred_cls_kept[kept_pos].item()))
+            resolved_scores.append(float(proto_score_kept[kept_pos].item()))
 
         return {
             "seed_idx": proto_state["seed_idx"],

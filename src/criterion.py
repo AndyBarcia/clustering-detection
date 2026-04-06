@@ -33,20 +33,25 @@ def sigmoid_focal_loss(inputs, targets, alpha=0.25, gamma=2.0):
     return loss.mean()
 
 
-def soft_iou_loss(inputs, targets, eps=1e-6):
-    """Computes Soft Intersection over Union (IoU) Loss."""
-    # inputs are logits, so apply sigmoid
-    preds = torch.sigmoid(inputs)
-    
-    # Flatten spatial dimensions
-    preds = preds.view(preds.shape[0], -1)
-    targets = targets.view(targets.shape[0], -1)
-    
-    intersection = (preds * targets).sum(dim=1)
-    union = preds.sum(dim=1) + targets.sum(dim=1) - intersection
-    
+def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
+    """Computes a soft IoU loss over a per-pixel instance partition."""
+    neg_inf = torch.finfo(logits.dtype).min
+    masked_logits = logits.masked_fill(~valid_mask[:, :, None, None], neg_inf)
+    preds = F.softmax(masked_logits, dim=1)
+
+    preds = preds * valid_mask[:, :, None, None]
+    targets = targets * valid_mask[:, :, None, None]
+
+    preds = preds.flatten(2)
+    targets = targets.flatten(2)
+
+    intersection = (preds * targets).sum(dim=-1)
+    union = preds.sum(dim=-1) + targets.sum(dim=-1) - intersection
     iou = (intersection + eps) / (union + eps)
-    return 1.0 - iou.mean()
+
+    if valid_mask.any():
+        return 1.0 - iou[valid_mask].mean()
+    return logits.sum() * 0.0
 
 
 def hungarian_seed_assignment(
@@ -113,7 +118,7 @@ class PanopticCriterion(nn.Module):
                 "loss_seed_sig": zero,
                 "loss_seed": zero,
                 "loss_cls": zero,
-                "loss_mask_bce": zero,
+                "loss_mask_ce": zero,
                 "loss_mask_iou": zero,
                 "loss_mask_total": zero,
                 "loss_inter": zero,
@@ -183,12 +188,12 @@ class PanopticCriterion(nn.Module):
 
         mask_logits = torch.einsum("bmc,bchw->bmhw", proto_mask_emb, features_val)
         mask_logits = F.interpolate(mask_logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+        neg_inf = torch.finfo(mask_logits.dtype).min
+        mask_logits_masked = mask_logits.masked_fill(~gt_pad_mask[:, :, None, None], neg_inf)
+        gt_mask_target = gt_masks_pad.argmax(dim=1)
 
-        mask_logits_flat = mask_logits[gt_pad_mask]
-        gt_masks_flat = gt_masks_pad[gt_pad_mask]
-
-        loss_mask_bce = F.binary_cross_entropy_with_logits(mask_logits_flat, gt_masks_flat)
-        loss_mask_iou = soft_iou_loss(mask_logits_flat, gt_masks_flat)
+        loss_mask_ce = F.cross_entropy(mask_logits_masked, gt_mask_target)
+        loss_mask_iou = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
 
         seed_targets = matched_query_mask.float()
         loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
@@ -202,7 +207,7 @@ class PanopticCriterion(nn.Module):
             cos_sim_seed = (matched_q_sig * matched_gt_sig).sum(dim=-1)
             loss_seed_sig = (1.0 - cos_sim_seed).mean()
 
-        total_loss_mask = self.cfg.w_mask_bce * loss_mask_bce + self.cfg.w_mask_iou * loss_mask_iou
+        total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
 
         final_loss = (
             loss_seed_sig +
@@ -217,7 +222,7 @@ class PanopticCriterion(nn.Module):
             "loss_seed_sig": loss_seed_sig,
             "loss_seed": loss_seed,
             "loss_cls": loss_cls,
-            "loss_mask_bce": loss_mask_bce,
+            "loss_mask_ce": loss_mask_ce,
             "loss_mask_iou": loss_mask_iou,
             "loss_mask_total": total_loss_mask,
             "loss_inter": loss_inter,

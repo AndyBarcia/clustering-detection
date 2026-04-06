@@ -49,7 +49,7 @@ class ModelConfig:
 
 @dataclass
 class LossConfig:
-    w_mask_bce: float = 2.0
+    w_mask_ce: float = 2.0
     w_mask_iou: float = 5.0
     w_seed: float = 2.0
     w_inter: float = 10.0
@@ -63,7 +63,7 @@ class SeedFilterConfig:
     quality_threshold: float = 0.07
     topk: Optional[int] = None
     min_num_seeds: int = 1
-    exclude_background: bool = True
+    exclude_background: bool = False
     min_foreground_prob: float = 0.22
     max_influence: Optional[float] = 0.4
     use_foreground_in_score: bool = True

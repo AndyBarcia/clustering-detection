@@ -109,7 +109,7 @@ def format_epoch_metrics(epoch_metrics):
         "loss_seed_sig",
         "loss_seed",
         "loss_cls",
-        "loss_mask_bce",
+        "loss_mask_ce",
         "loss_mask_iou",
         "loss_mask_total",
         "loss_inter",

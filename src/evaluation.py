@@ -32,13 +32,15 @@ def _to_prediction_tensors(prediction: Dict) -> Tuple[torch.Tensor, torch.Tensor
     pred_masks = _stack_masks(prediction.get("resolved_masks", []))
     pred_labels = torch.as_tensor(prediction.get("resolved_labels", []), dtype=torch.long)
     pred_scores = torch.as_tensor(prediction.get("resolved_scores", []), dtype=torch.float32)
-    return pred_masks, pred_labels, pred_scores
+    keep = pred_labels != 0
+    return pred_masks[keep], pred_labels[keep], pred_scores[keep]
 
 
 def _to_target_tensors(target: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
     gt_masks = target["masks"].detach().to(dtype=torch.bool, device="cpu")
     gt_labels = target["labels"].detach().to(dtype=torch.long, device="cpu")
-    return gt_masks, gt_labels
+    keep = gt_labels != 0
+    return gt_masks[keep], gt_labels[keep]
 
 
 def _pairwise_mask_iou(pred_masks: torch.Tensor, gt_masks: torch.Tensor) -> torch.Tensor:
@@ -251,7 +253,7 @@ def evaluate_system(
                         ap_iou_threshold=ap_iou_threshold,
                     )
                 )
-                object_counts.append(int(target["labels"].shape[0]))
+                object_counts.append(int((target["labels"] != 0).sum().item()))
     finally:
         system.train(was_training)
         random.setstate(random_state)
@@ -341,7 +343,7 @@ def evaluate_system_many_configs(
                             )
                         )
 
-            object_counts.extend(int(target["labels"].shape[0]) for target in targets)
+            object_counts.extend(int((target["labels"] != 0).sum().item()) for target in targets)
     finally:
         system.train(was_training)
         random.setstate(random_state)

@@ -25,6 +25,22 @@ from .panoptic import PanopticSystem
 DEFAULT_CLASS_NAMES = ["Background", "Square", "Triangle"]
 
 
+def _filter_background_instances(
+    masks: Sequence[np.ndarray],
+    labels: Sequence[int],
+    scores: Optional[Sequence[float]] = None,
+):
+    keep_indices = [idx for idx, label in enumerate(labels) if int(label) != 0]
+    filtered_masks = [masks[idx] for idx in keep_indices]
+    filtered_labels = [labels[idx] for idx in keep_indices]
+
+    if scores is None:
+        return filtered_masks, filtered_labels, None
+
+    filtered_scores = [scores[idx] for idx in keep_indices]
+    return filtered_masks, filtered_labels, filtered_scores
+
+
 def sample_synthetic_examples(
     *,
     num_samples: int,
@@ -422,6 +438,7 @@ def render_prediction_grid(
 
         gt_masks = [mask.detach().cpu().numpy() for mask in target["masks"]]
         gt_labels = [int(label) for label in target["labels"].detach().cpu().tolist()]
+        gt_masks, gt_labels, _ = _filter_background_instances(gt_masks, gt_labels)
         _draw_instances(
             axes[row_idx, 1],
             image_np,
@@ -437,6 +454,11 @@ def render_prediction_grid(
             pred_masks = [mask.detach().cpu().numpy() for mask in prediction["resolved_masks"]]
             pred_labels = [int(label) for label in prediction["resolved_labels"]]
             pred_scores = [float(score) for score in prediction["resolved_scores"]]
+            pred_masks, pred_labels, pred_scores = _filter_background_instances(
+                pred_masks,
+                pred_labels,
+                pred_scores,
+            )
             _draw_instances(
                 axes[row_idx, next_col_idx],
                 image_np,

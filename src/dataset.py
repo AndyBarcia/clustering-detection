@@ -234,15 +234,26 @@ class SyntheticPanopticBatchGenerator:
         images = palette[batch_idx, instance_map.long()]  # [B, H, W, 3]
         images = images.permute(0, 3, 1, 2).to(torch.float32).div_(255.0)  # [B, 3, H, W]
 
+        background_masks = (instance_map == 0)
+        background_boxes = self._boxes_from_masks(background_masks)
+
         # Package ragged targets per image
         targets = []
         for b in range(B):
             kb = keep[b]
-            masks_b = visible_masks[b][kb].to(torch.uint8)
-            labels_b = class_ids[b][kb].to(torch.int64)
-            boxes_b = boxes_flat[b][kb].to(torch.float32)
+            fg_masks_b = visible_masks[b][kb].to(torch.uint8)
+            fg_labels_b = class_ids[b][kb].to(torch.int64)
+            fg_boxes_b = boxes_flat[b][kb].to(torch.float32)
 
-            area_b = (boxes_b[:, 3] - boxes_b[:, 1]) * (boxes_b[:, 2] - boxes_b[:, 0])
+            bg_masks_b = background_masks[b].unsqueeze(0).to(torch.uint8)
+            bg_labels_b = torch.zeros((1,), dtype=torch.int64, device=device)
+            bg_boxes_b = background_boxes[b].unsqueeze(0).to(torch.float32)
+
+            masks_b = torch.cat([bg_masks_b, fg_masks_b], dim=0)
+            labels_b = torch.cat([bg_labels_b, fg_labels_b], dim=0)
+            boxes_b = torch.cat([bg_boxes_b, fg_boxes_b], dim=0)
+
+            area_b = masks_b.flatten(1).sum(dim=1).to(torch.float32)
             iscrowd_b = torch.zeros((labels_b.numel(),), dtype=torch.int64, device=device)
             image_id_b = torch.tensor([start_idx + b], dtype=torch.int64, device=device)
 
