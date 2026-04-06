@@ -177,6 +177,7 @@ class PanopticCriterion(nn.Module):
             if off_diag_mask.any():
                 loss_inter = F.relu(gt_sim[off_diag_mask] - self.cfg.inter_margin).pow(2).mean()
 
+        # Normalize (B,Q,GT) along Q dimension.
         norm_w = weights_flat / (weights_flat.sum(dim=1, keepdim=True) + 1e-6)
 
         proto_mask_emb = torch.bmm(norm_w.transpose(1, 2), q_mask_emb_flat)
