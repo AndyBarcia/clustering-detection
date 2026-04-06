@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
 from scipy.optimize import linear_sum_assignment
-from typing import Tuple
 
 from .config import LossConfig
 from .model import CustomMask2Former
@@ -55,47 +54,20 @@ def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
     return logits.sum() * 0.0
 
 
-@torch.no_grad()
-def compute_mask_block_counts(
-    targets: torch.Tensor, size: Tuple[int, int]
-) -> Tuple[torch.Tensor, int, int, int]:
-    """Aggregate target mask positives for each low-resolution prediction block."""
-
-    if targets.ndim != 3:
+def total_variation_loss(masks: torch.Tensor) -> torch.Tensor:
+    """Anisotropic total variation regularizer averaged over masks."""
+    if masks.ndim != 3:
         raise ValueError(
-            "Expected targets with shape (N, H, W); got "
-            f"{tuple(targets.shape)} instead"
+            "Expected masks with shape (N, H, W); got "
+            f"{tuple(masks.shape)} instead"
         )
 
-    n, H_t, W_t = targets.shape
-    h, w = size
+    if masks.shape[0] == 0:
+        return masks.sum() * 0.0
 
-    if H_t == h and W_t == w:
-        pos_counts = targets.reshape(n, h * w).to(dtype=torch.float32)
-        return pos_counts, 1, H_t, W_t
-
-    if H_t % h != 0 or W_t % w != 0:
-        raise ValueError(
-            f"Target resolution {(H_t, W_t)} is not divisible by desired size {(h, w)}"
-        )
-
-    step_h = H_t // h
-    step_w = W_t // w
-    block_area = step_h * step_w
-
-    if n == 0:
-        empty = targets.new_zeros((0, h * w), dtype=torch.float32)
-        return empty, block_area, H_t, W_t
-
-    targets_float = targets.unsqueeze(1).to(dtype=torch.float32)
-    unfolded = F.unfold(
-        targets_float,
-        kernel_size=(step_h, step_w),
-        stride=(step_h, step_w),
-    )
-    pos_counts = unfolded.sum(dim=1)
-
-    return pos_counts, block_area, H_t, W_t
+    tv_h = (masks[:, 1:, :] - masks[:, :-1, :]).abs().mean()
+    tv_w = (masks[:, :, 1:] - masks[:, :, :-1]).abs().mean()
+    return tv_h + tv_w
 
 
 def hungarian_seed_assignment(
@@ -164,6 +136,7 @@ class PanopticCriterion(nn.Module):
                 "loss_cls": zero,
                 "loss_mask_ce": zero,
                 "loss_mask_iou": zero,
+                "loss_mask_tv": zero,
                 "loss_mask_total": zero,
                 "loss_inter": zero,
             }
@@ -232,35 +205,15 @@ class PanopticCriterion(nn.Module):
         loss_cls = F.cross_entropy(proto_cls_flat, gt_labels_flat)
 
         mask_logits = torch.einsum("bmc,bchw->bmhw", proto_mask_emb, features_val)
+        mask_logits = F.interpolate(mask_logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+        neg_inf = torch.finfo(mask_logits.dtype).min
+        mask_logits_masked = mask_logits.masked_fill(~gt_pad_mask[:, :, None, None], neg_inf)
+        gt_mask_target = gt_masks_pad.argmax(dim=1)
+        mask_probs = F.softmax(mask_logits_masked, dim=1)
 
-        src_masks = mask_logits[gt_pad_mask]
-        target_masks = gt_masks_pad[gt_pad_mask]
-        num_masks = target_masks.shape[0]
-
-        logits = src_masks.reshape(src_masks.shape[0], -1)
-
-        # Replace non-finite logits with large finite values to keep the loss stable.
-        logits = torch.nan_to_num(logits, nan=0.0, neginf=-1e3, posinf=1e3)
-
-        pos_counts, block_area, H_t, W_t = compute_mask_block_counts(
-            target_masks, src_masks.shape[-2:]
-        )
-        pos_counts = pos_counts.to(device=logits.device, dtype=logits.dtype)
-
-        abs_logits = logits.abs()
-        max_logits = torch.clamp(logits, min=0)
-        logexp = torch.log1p(torch.exp(-abs_logits))
-        loss_block = block_area * max_logits - logits * pos_counts + block_area * logexp
-        loss_block = torch.nan_to_num(loss_block, nan=0.0, neginf=0.0, posinf=0.0)
-        loss_mask_ce = loss_block.sum(dim=1) / (H_t * W_t)
-        loss_mask_ce = loss_mask_ce.sum() / num_masks
-
-        probs = torch.sigmoid(logits)
-        intersection = (probs * pos_counts).sum(dim=1)
-        pred_sum = probs.sum(dim=1) * block_area
-        target_sum = pos_counts.sum(dim=1)
-        loss_mask_iou = 1 - (2 * intersection) / (pred_sum + target_sum + 1e-6)
-        loss_mask_iou = loss_mask_iou.sum() / num_masks
+        loss_mask_ce = F.cross_entropy(mask_logits_masked, gt_mask_target)
+        loss_mask_iou = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
+        loss_mask_tv = total_variation_loss(mask_probs[gt_pad_mask])
 
         seed_targets = matched_query_mask.float()
         loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
@@ -274,7 +227,11 @@ class PanopticCriterion(nn.Module):
             cos_sim_seed = (matched_q_sig * matched_gt_sig).sum(dim=-1)
             loss_seed_sig = (1.0 - cos_sim_seed).mean()
 
-        total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
+        total_loss_mask = (
+            self.cfg.w_mask_ce * loss_mask_ce
+            + self.cfg.w_mask_iou * loss_mask_iou
+            + self.cfg.w_mask_tv * loss_mask_tv
+        )
 
         final_loss = (
             loss_seed_sig +
@@ -291,6 +248,7 @@ class PanopticCriterion(nn.Module):
             "loss_cls": loss_cls,
             "loss_mask_ce": loss_mask_ce,
             "loss_mask_iou": loss_mask_iou,
+            "loss_mask_tv": loss_mask_tv,
             "loss_mask_total": total_loss_mask,
             "loss_inter": loss_inter,
         }
