@@ -255,7 +255,7 @@ class CustomMask2Former(nn.Module):
         self.influence_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, 2),
         )
 
         self.gt_cls_embed = nn.Embedding(num_classes, hidden_dim)
@@ -342,8 +342,10 @@ class CustomMask2Former(nn.Module):
         sig_embs = F.normalize(self.sig_head(q), p=2, dim=-1)
         seed_logits = self.seed_head(q).squeeze(-1)
         seed_scores = torch.sigmoid(seed_logits)
-        influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
-        return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds
+        influence_params = self.influence_head(q)
+        temperature_preds = F.softplus(influence_params[..., 0]) + 1e-4
+        influence_preds = influence_params[..., 1]
+        return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, temperature_preds, influence_preds
 
     def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
@@ -351,7 +353,7 @@ class CustomMask2Former(nn.Module):
         features, memory = self._build_memory(images)
         q_dec_all, intermediate_ttt_q = self._decode_queries(memory, ttt_steps_override=ttt_steps_override)
 
-        mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds = self._run_heads(q_dec_all)
+        mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, temperature_preds, influence_preds = self._run_heads(q_dec_all)
 
         return RawOutputs(
             features=features,
@@ -363,6 +365,7 @@ class CustomMask2Former(nn.Module):
             sig_embs=sig_embs,
             seed_logits=seed_logits,
             seed_scores=seed_scores,
+            temperature_preds=temperature_preds,
             influence_preds=influence_preds,
             img_shape=(H_img, W_img),
         )

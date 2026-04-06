@@ -42,11 +42,26 @@ def _alpha_value(alpha_obj) -> float:
     return float(alpha_obj)
 
 
-def _assignment_affinity(similarity: torch.Tensor, influence: torch.Tensor, similarity_floor: float = 0.0):
-    affinity = (similarity + influence.unsqueeze(1)).clamp(0.0, 1.0)
+def _assignment_logits(
+    similarity: torch.Tensor,
+    temperature: torch.Tensor,
+    influence: torch.Tensor,
+    similarity_floor: float = 0.0,
+):
     if similarity_floor > 0.0:
-        affinity = affinity.clamp_min(similarity_floor)
-    return affinity
+        similarity = similarity.clamp_min(similarity_floor)
+    logits = (similarity + influence.unsqueeze(1)) / temperature.unsqueeze(1).clamp_min(1e-6)
+    return logits
+
+
+def _normalize_assignment_weights(
+    logits: torch.Tensor,
+    dim: int,
+    extra_weights: torch.Tensor | None = None,
+):
+    if extra_weights is not None:
+        logits = logits + extra_weights.clamp_min(1e-6).log()
+    return F.softmax(logits, dim=dim)
 
 
 def _cosine_affinity_np(x: np.ndarray) -> np.ndarray:
@@ -165,6 +180,7 @@ class ModularPrototypePredictor:
         q_cls = raw.cls_preds[:, b]
         q_sig = raw.sig_embs[:, b]
         q_seed = raw.seed_scores[:, b]
+        q_temperature = raw.temperature_preds[:, b]
         q_influence = raw.influence_preds[:, b]
 
         L, N_q, S = q_sig.shape
@@ -174,6 +190,7 @@ class ModularPrototypePredictor:
         q_cls = q_cls.reshape(L * N_q, num_classes)
         q_sig = q_sig.reshape(L * N_q, S)
         q_seed = q_seed.reshape(L * N_q)
+        q_temperature = q_temperature.reshape(L * N_q)
         q_influence = q_influence.reshape(L * N_q)
 
         q_cls_prob = F.softmax(q_cls, dim=-1)
@@ -193,6 +210,7 @@ class ModularPrototypePredictor:
             "q_cls_prob": q_cls_prob,
             "q_sig": q_sig,
             "q_seed": q_seed,
+            "q_temperature": q_temperature,
             "q_influence": q_influence,
             "bg_conf": bg_conf,
             "fg_conf": fg_conf,
@@ -397,7 +415,7 @@ class ModularPrototypePredictor:
             proto_seed_idx.append(rep_seed_idx)
 
             w = flat["q_seed"][member_seed_idx]
-            w = w / (w.sum() + 1e-6)
+            w = F.softmax(w, dim=0)
 
             p_cls = (flat["q_cls"][member_seed_idx] * w.unsqueeze(1)).sum(dim=0)
             p_mask = (flat["q_mask_emb"][member_seed_idx] * w.unsqueeze(1)).sum(dim=0)
@@ -440,16 +458,22 @@ class ModularPrototypePredictor:
         alpha = _alpha_value(model.alpha_focal) if cfg.use_alpha_focal else 1.0
 
         final_norm_w = None
-        final_raw_w = None
+        final_assignment_strength = None
 
         n_steps = max(1, cfg.refinement_steps)
         for _ in range(n_steps):
             sim = torch.matmul(q_sig, proto_sig.T)
-            affinity = _assignment_affinity(sim, flat["q_influence"][q_idx], cfg.similarity_floor)
-            raw_w = affinity.pow(alpha)
+            logits = _assignment_logits(
+                sim,
+                flat["q_temperature"][q_idx],
+                flat["q_influence"][q_idx],
+                cfg.similarity_floor,
+            ) * alpha
+
+            extra_weights = None
 
             if cfg.use_query_quality:
-                raw_w = raw_w * flat["q_seed"][q_idx].pow(cfg.query_quality_power).unsqueeze(1)
+                extra_weights = flat["q_seed"][q_idx].pow(cfg.query_quality_power).unsqueeze(1)
 
             proto_cls_prob = None
             if cfg.use_foreground_prob or cfg.class_compat_power > 0:
@@ -464,22 +488,24 @@ class ModularPrototypePredictor:
                     q_fg_conf[:, None] * proto_fg_conf[None, :]
                     + q_bg_conf[:, None] * proto_bg_conf[None, :]
                 )
-                raw_w = raw_w * partition_compat.clamp_min(1e-6).pow(cfg.foreground_prob_power)
+                part_w = partition_compat.clamp_min(1e-6).pow(cfg.foreground_prob_power)
+                extra_weights = part_w if extra_weights is None else extra_weights * part_w
 
             if cfg.class_compat_power > 0:
                 class_compat = torch.matmul(q_cls_prob, proto_cls_prob.T).clamp_min(1e-6)
-                raw_w = raw_w * class_compat.pow(cfg.class_compat_power)
+                class_w = class_compat.pow(cfg.class_compat_power)
+                extra_weights = class_w if extra_weights is None else extra_weights * class_w
 
             if cfg.normalize_over_queries:
-                norm_w = raw_w / (raw_w.sum(dim=0, keepdim=True) + 1e-6)
+                norm_w = _normalize_assignment_weights(logits, dim=0, extra_weights=extra_weights)
             else:
-                norm_w = raw_w / (raw_w.sum(dim=1, keepdim=True) + 1e-6)
+                norm_w = _normalize_assignment_weights(logits, dim=1, extra_weights=extra_weights)
 
             proto_mask_emb = torch.matmul(norm_w.T, q_mask_emb)
             proto_cls = torch.matmul(norm_w.T, q_cls)
 
-            final_raw_w = raw_w
             final_norm_w = norm_w
+            final_assignment_strength = logits.max(dim=0).values
 
         full_norm_w = torch.zeros(
             flat["q_sig"].shape[0],
@@ -495,7 +521,7 @@ class ModularPrototypePredictor:
             "proto_cls": proto_cls,
             "proto_mask_emb": proto_mask_emb,
             "assignment_weights": full_norm_w,
-            "assignment_strength": final_raw_w.sum(dim=0),
+            "assignment_strength": final_assignment_strength,
         })
         return proto_state
 
@@ -544,12 +570,15 @@ class ModularPrototypePredictor:
 
         alpha = _alpha_value(model.alpha_focal) if self.cfg.assign.use_alpha_focal else 1.0
         sim = torch.matmul(q_sig, gt_sig.T)
-        affinity = _assignment_affinity(sim, flat["q_influence"], self.cfg.assign.similarity_floor)
-        raw_w = affinity.pow(alpha)
+        logits = _assignment_logits(
+            sim,
+            flat["q_temperature"],
+            flat["q_influence"],
+            self.cfg.assign.similarity_floor,
+        ) * alpha
 
-        # Keep GT-oracle assignment aligned with training:
-        # training uses similarity + influence only before query-normalization.
-        norm_w = raw_w / (raw_w.sum(dim=0, keepdim=True) + 1e-6)
+        # Keep GT-oracle assignment aligned with training by using the same query-softmax.
+        norm_w = F.softmax(logits, dim=0)
 
         proto_mask_emb = torch.matmul(norm_w.T, q_mask_emb)
         proto_cls = torch.matmul(norm_w.T, q_cls)
@@ -564,7 +593,7 @@ class ModularPrototypePredictor:
             "seed_idx": torch.arange(labels.shape[0], device=device),
             "seed_cluster_labels": torch.arange(labels.shape[0], device=device),
             "assignment_weights": norm_w,
-            "assignment_strength": raw_w.sum(dim=0),
+            "assignment_strength": logits.max(dim=0).values,
         }
 
     def _decode_and_resolve(self, flat: Dict[str, torch.Tensor], proto_state: Dict[str, Any]):

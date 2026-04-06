@@ -14,5 +14,6 @@ class RawOutputs:
     sig_embs: torch.Tensor          # [L, B, Nq, S]
     seed_logits: torch.Tensor       # [L, B, Nq]
     seed_scores: torch.Tensor       # [L, B, Nq]
+    temperature_preds: torch.Tensor # [L, B, Nq]
     influence_preds: torch.Tensor   # [L, B, Nq]
     img_shape: Tuple[int, int]

@@ -9,16 +9,18 @@ from .model import CustomMask2Former
 from .outputs import RawOutputs
 
 
-def assignment_weights_with_influence(
+def assignment_weights_with_softmax(
     similarity: torch.Tensor,
+    temperature: torch.Tensor,
     influence: torch.Tensor,
     alpha,
     valid_mask: torch.Tensor | None = None,
 ):
-    affinity = (similarity + influence.unsqueeze(-1)).clamp(0.0, 1.0)
+    logits = (similarity + influence.unsqueeze(-1)) / temperature.unsqueeze(-1).clamp_min(1e-6)
+    logits = logits * alpha
     if valid_mask is not None:
-        affinity = affinity.masked_fill(~valid_mask.unsqueeze(1), 0.0)
-    return affinity.pow(alpha)
+        logits = logits.masked_fill(~valid_mask.unsqueeze(1), torch.finfo(logits.dtype).min)
+    return F.softmax(logits, dim=1)
 
 
 def sigmoid_focal_loss(inputs, targets, alpha=0.25, gamma=2.0):
@@ -98,6 +100,7 @@ class PanopticCriterion(nn.Module):
         cls_preds = raw.cls_preds
         sig_embs = raw.sig_embs
         seed_logits = raw.seed_logits
+        temperature_preds = raw.temperature_preds
         influence_preds = raw.influence_preds
         H_img, W_img = raw.img_shape
 
@@ -144,6 +147,7 @@ class PanopticCriterion(nn.Module):
         q_mask_emb = mask_embs[:, valid_b]
         q_cls = cls_preds[:, valid_b]
         q_seed_logits = seed_logits[:, valid_b]
+        q_temperature = temperature_preds[:, valid_b]
         q_influence = influence_preds[:, valid_b]
 
         L, _, N_q, S = q_sig.shape
@@ -152,6 +156,7 @@ class PanopticCriterion(nn.Module):
         q_mask_emb_flat = q_mask_emb.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
+        q_temperature_flat = q_temperature.transpose(0, 1).reshape(B_val, L * N_q)
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
 
         gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
@@ -159,13 +164,13 @@ class PanopticCriterion(nn.Module):
 
         sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
         sim_masked = sim.masked_fill(~gt_pad_mask.unsqueeze(1), -1.0)
-        weights_raw = assignment_weights_with_influence(
+        norm_w = assignment_weights_with_softmax(
             similarity=sim,
+            temperature=q_temperature_flat,
             influence=q_influence_flat,
             alpha=model.alpha_focal,
             valid_mask=gt_pad_mask,
         )
-        weights_flat = weights_raw
 
         loss_inter = features.sum() * 0.0
         if M_max > 1:
@@ -176,9 +181,6 @@ class PanopticCriterion(nn.Module):
 
             if off_diag_mask.any():
                 loss_inter = F.relu(gt_sim[off_diag_mask] - self.cfg.inter_margin).pow(2).mean()
-
-        # Normalize (B,Q,GT) along Q dimension.
-        norm_w = weights_flat / (weights_flat.sum(dim=1, keepdim=True) + 1e-6)
 
         proto_mask_emb = torch.bmm(norm_w.transpose(1, 2), q_mask_emb_flat)
         proto_cls = torch.bmm(norm_w.transpose(1, 2), q_cls_flat)
