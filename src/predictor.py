@@ -496,7 +496,6 @@ class ModularPrototypePredictor:
 
         q_sig = flat["q_sig"]
         q_cls = flat["q_cls"]
-        q_cls_prob = flat["q_cls_prob"]
         q_mask_emb = flat["q_mask_emb"]
 
         alpha = _alpha_value(model.alpha_focal) if self.cfg.assign.use_alpha_focal else 1.0
@@ -504,33 +503,8 @@ class ModularPrototypePredictor:
         affinity = _assignment_affinity(sim, flat["q_influence"], self.cfg.assign.similarity_floor)
         raw_w = affinity.pow(alpha)
 
-        if self.cfg.assign.use_query_quality:
-            raw_w = raw_w * flat["q_seed"].pow(self.cfg.assign.query_quality_power).unsqueeze(1)
-
-        gt_cls_prob = None
-        if self.cfg.assign.use_foreground_prob or self.cfg.assign.class_compat_power > 0:
-            gt_cls_logits = torch.full(
-                (labels.shape[0], q_cls.shape[-1]),
-                fill_value=-20.0,
-                device=device,
-                dtype=q_cls.dtype,
-            )
-            gt_cls_logits[torch.arange(labels.shape[0], device=device), labels] = 20.0
-            gt_cls_prob = F.softmax(gt_cls_logits, dim=-1)
-
-        if self.cfg.assign.use_foreground_prob:
-            gt_bg_conf = gt_cls_prob[:, 0]
-            gt_fg_conf = 1.0 - gt_bg_conf
-            partition_compat = (
-                flat["fg_conf"][:, None] * gt_fg_conf[None, :]
-                + flat["bg_conf"][:, None] * gt_bg_conf[None, :]
-            )
-            raw_w = raw_w * partition_compat.clamp_min(1e-6).pow(self.cfg.assign.foreground_prob_power)
-
-        if self.cfg.assign.class_compat_power > 0:
-            class_compat = torch.matmul(q_cls_prob, gt_cls_prob.T).clamp_min(1e-6)
-            raw_w = raw_w * class_compat.pow(self.cfg.assign.class_compat_power)
-
+        # Keep GT-oracle assignment aligned with training:
+        # training uses similarity + influence only before query-normalization.
         norm_w = raw_w / (raw_w.sum(dim=0, keepdim=True) + 1e-6)
 
         proto_mask_emb = torch.matmul(norm_w.T, q_mask_emb)
