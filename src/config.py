@@ -60,20 +60,20 @@ class LossConfig:
 @dataclass
 class SeedFilterConfig:
     # Threshold on predicted seedness used to decide which queries can start clusters.
-    quality_threshold: float = 0.17
+    quality_threshold: float = 0.07
     topk: Optional[int] = None
     min_num_seeds: int = 1
     exclude_background: bool = True
     min_foreground_prob: float = 0.22
-    max_influence: Optional[float] = None
-    use_foreground_in_score: bool = False
-    foreground_score_power: float = 1.0
+    max_influence: Optional[float] = 0.4
+    use_foreground_in_score: bool = True
+    foreground_score_power: float = 1.74
 
 
 @dataclass
 class ClusterConfig:
     method: str = "cc"   # ["dbscan", "hdbscan", "cc", "louvain", "leiden"]
-    cluster_per_class: bool = True
+    cluster_per_class: bool = False
     promote_noise_to_singletons: bool = True
 
     # DBSCAN
@@ -101,15 +101,15 @@ class SoftAssignmentConfig:
     use_all_queries: bool = True
     refinement_steps: int = 1
 
-    use_alpha_focal: bool = True
-    similarity_floor: float = 0.0
+    use_alpha_focal: bool = False
+    similarity_floor: float = 0.005
 
     # Backward-compatible name: this now uses predicted seedness as the per-query weighting signal.
-    use_query_quality: bool = True
-    query_quality_power: float = 0.6
+    use_query_quality: bool = False
+    query_quality_power: float = 1.2
 
-    use_foreground_prob: bool = False
-    foreground_prob_power: float = 1.0
+    use_foreground_prob: bool = True
+    foreground_prob_power: float = 0.71
 
     class_compat_power: float = 0.0   # 0 disables class-aware assignment
     normalize_over_queries: bool = True
@@ -118,16 +118,16 @@ class SoftAssignmentConfig:
 @dataclass
 class OverlapResolutionConfig:
     remove_background: bool = True
-    min_prototype_score: float = 0.04
-    min_area: int = 20
+    min_prototype_score: float = 0.06
+    min_area: int = 18
 
-    mask_threshold: float = 0.42
-    pixel_score_threshold: float = 0.28
+    mask_threshold: float = 0.51
+    pixel_score_threshold: float = 0.21
 
     use_class_confidence: bool = True
-    use_foreground_confidence: bool = True
-    use_assignment_strength: bool = True
-    assignment_strength_power: float = 0.5
+    use_foreground_confidence: bool = False
+    use_assignment_strength: bool = False
+    assignment_strength_power: float = 0.55
 
 
 @dataclass
