@@ -139,6 +139,7 @@ def _draw_signature_umap(
 ):
     flat = prediction.get("flat")
     q_sig = None if flat is None else flat.get("q_sig")
+    q_seed = None if flat is None else flat.get("q_seed")
     q_influence = None if flat is None else flat.get("q_influence")
     gt_sig = prediction.get("all_proto_sig", prediction.get("proto_sig"))
 
@@ -195,8 +196,11 @@ def _draw_signature_umap(
                     head_length=0.0,
                     zorder=1,
                 )
-
-    if q_influence is not None:
+    
+    if q_seed is not None:
+        q_seed_np = q_seed.detach().cpu().numpy()
+        query_sizes = min_query_marker_size + (max_query_marker_size - min_query_marker_size) * np.clip(q_seed_np, 0.0, 1.0)
+    elif q_influence is not None:
         q_influence_np = q_influence.detach().cpu().numpy()
         influence_min = float(np.min(q_influence_np))
         influence_max = float(np.max(q_influence_np))
