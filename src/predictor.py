@@ -364,7 +364,7 @@ class ModularPrototypePredictor:
 
         return seed_labels
 
-    def _initialize_prototypes(self, flat: Dict[str, torch.Tensor], seed_idx: torch.Tensor, cluster_labels: torch.Tensor):
+    def _initialize_prototypes(self, model: CustomMask2Former, flat: Dict[str, torch.Tensor], seed_idx: torch.Tensor, cluster_labels: torch.Tensor):
         device = flat["q_sig"].device
         valid = (cluster_labels >= 0)
 
@@ -399,8 +399,8 @@ class ModularPrototypePredictor:
             w = flat["q_seed"][member_seed_idx]
             w = w / (w.sum() + 1e-6)
 
-            p_cls = (flat["q_cls"][member_seed_idx] * w.unsqueeze(1)).sum(dim=0)
-            p_mask = (flat["q_mask_emb"][member_seed_idx] * w.unsqueeze(1)).sum(dim=0)
+            p_cls = model.aggregate_cls_logits(w.unsqueeze(0), flat["q_cls"][member_seed_idx])[0]
+            p_mask = model.aggregate_mask_embeddings(w.unsqueeze(0), flat["q_mask_emb"][member_seed_idx])[0]
 
             proto_sig.append(flat["q_sig"][rep_seed_idx])
             proto_cls.append(p_cls)
@@ -475,8 +475,8 @@ class ModularPrototypePredictor:
             else:
                 norm_w = raw_w / (raw_w.sum(dim=1, keepdim=True) + 1e-6)
 
-            proto_mask_emb = torch.matmul(norm_w.T, q_mask_emb)
-            proto_cls = torch.matmul(norm_w.T, q_cls)
+            proto_mask_emb = model.aggregate_mask_embeddings(norm_w.T, q_mask_emb)
+            proto_cls = model.aggregate_cls_logits(norm_w.T, q_cls)
 
             final_raw_w = raw_w
             final_norm_w = norm_w
@@ -551,8 +551,8 @@ class ModularPrototypePredictor:
         # training uses similarity + influence only before query-normalization.
         norm_w = raw_w / (raw_w.sum(dim=0, keepdim=True) + 1e-6)
 
-        proto_mask_emb = torch.matmul(norm_w.T, q_mask_emb)
-        proto_cls = torch.matmul(norm_w.T, q_cls)
+        proto_mask_emb = model.aggregate_mask_embeddings(norm_w.T, q_mask_emb)
+        proto_cls = model.aggregate_cls_logits(norm_w.T, q_cls)
 
         return {
             "num_prototypes": labels.shape[0],
@@ -701,7 +701,7 @@ class ModularPrototypePredictor:
         flat = self._flatten_outputs(raw, b)
         seed_idx, seed_scores = self._select_seeds(flat)
         cluster_labels = self._cluster_seeds(flat, seed_idx, seed_scores)
-        proto_state = self._initialize_prototypes(flat, seed_idx, cluster_labels)
+        proto_state = self._initialize_prototypes(model, flat, seed_idx, cluster_labels)
         proto_state = self._soft_refine_prototypes(model, flat, proto_state)
         pred = self._decode_and_resolve(flat, proto_state)
         pred["flat"] = flat

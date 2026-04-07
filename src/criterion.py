@@ -180,8 +180,8 @@ class PanopticCriterion(nn.Module):
         # Normalize (B,Q,GT) along Q dimension.
         norm_w = weights_flat / (weights_flat.sum(dim=1, keepdim=True) + 1e-6)
 
-        proto_mask_emb = torch.bmm(norm_w.transpose(1, 2), q_mask_emb_flat)
-        proto_cls = torch.bmm(norm_w.transpose(1, 2), q_cls_flat)
+        proto_mask_emb = model.aggregate_mask_embeddings(norm_w.transpose(1, 2), q_mask_emb_flat)
+        proto_cls = model.aggregate_cls_logits(norm_w.transpose(1, 2), q_cls_flat)
 
         proto_cls_flat = proto_cls[gt_pad_mask]
         gt_labels_flat = gt_labels_pad[gt_pad_mask]

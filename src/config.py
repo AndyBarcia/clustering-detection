@@ -37,11 +37,31 @@ class HeadConfig:
 
 
 @dataclass
+class AggregationTransformConfig:
+    kind: str = "identity"  # ["identity", "linear", "linear_nonlinearity", "mlp"]
+    hidden_dim: Optional[int] = None
+    activation: str = "relu"
+
+
+@dataclass
+class PrototypeAggregationConfig:
+    cls_pre: AggregationTransformConfig = field(
+        default_factory=lambda: AggregationTransformConfig(kind="mlp")
+    )
+    cls_post: AggregationTransformConfig = field(default_factory=AggregationTransformConfig)
+    mask_pre: AggregationTransformConfig = field(
+        default_factory=lambda: AggregationTransformConfig(kind="mlp")
+    )
+    mask_post: AggregationTransformConfig = field(default_factory=AggregationTransformConfig)
+
+
+@dataclass
 class ModelConfig:
     backbone: BackboneConfig = field(default_factory=BackboneConfig)
     decoder_layer: DecoderLayerConfig = field(default_factory=DecoderLayerConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     heads: HeadConfig = field(default_factory=HeadConfig)
+    prototype_aggregation: PrototypeAggregationConfig = field(default_factory=PrototypeAggregationConfig)
 
     learned_alpha: bool = False
     alpha_focal: float = 1.0

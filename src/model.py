@@ -6,8 +6,45 @@ import copy
 import contextlib
 from typing import Optional
 
-from .config import ModelConfig
+from .config import ModelConfig, AggregationTransformConfig
 from .outputs import RawOutputs
+
+
+def _build_activation(name: str) -> nn.Module:
+    name = name.lower()
+    if name == "relu":
+        return nn.ReLU(inplace=True)
+    if name == "gelu":
+        return nn.GELU()
+    if name == "silu":
+        return nn.SiLU(inplace=True)
+    raise ValueError(f"Unsupported activation: {name}")
+
+
+def _build_aggregation_transform(cfg: AggregationTransformConfig, input_dim: int, output_dim: int) -> nn.Module:
+    kind = cfg.kind.lower()
+    hidden_dim = cfg.hidden_dim or input_dim
+
+    if kind == "identity":
+        if input_dim != output_dim:
+            raise ValueError(
+                f"Identity aggregation transform requires matching dims, got {input_dim} -> {output_dim}."
+            )
+        return nn.Identity()
+    if kind == "linear":
+        return nn.Linear(input_dim, output_dim)
+    if kind == "linear_nonlinearity":
+        return nn.Sequential(
+            nn.Linear(input_dim, output_dim),
+            _build_activation(cfg.activation),
+        )
+    if kind == "mlp":
+        return nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            _build_activation(cfg.activation),
+            nn.Linear(hidden_dim, output_dim),
+        )
+    raise ValueError(f"Unsupported aggregation transform kind: {cfg.kind}")
 
 
 class SimpleBackbone(nn.Module):
@@ -232,16 +269,6 @@ class CustomMask2Former(nn.Module):
             use_attention_residuals=cfg.decoder.use_attention_residuals,
         )
 
-        self.mask_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.cls_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, num_classes),
-        )
         self.sig_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -257,6 +284,11 @@ class CustomMask2Former(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
         )
+        agg_cfg = cfg.prototype_aggregation
+        self.prototype_cls_pre = _build_aggregation_transform(agg_cfg.cls_pre, hidden_dim, hidden_dim)
+        self.prototype_cls_post = _build_aggregation_transform(agg_cfg.cls_post, hidden_dim, num_classes)
+        self.prototype_mask_pre = _build_aggregation_transform(agg_cfg.mask_pre, hidden_dim, hidden_dim)
+        self.prototype_mask_post = _build_aggregation_transform(agg_cfg.mask_post, hidden_dim, hidden_dim)
 
         self.gt_cls_embed = nn.Embedding(num_classes, hidden_dim)
         self.gt_query_proj = nn.Sequential(
@@ -337,13 +369,27 @@ class CustomMask2Former(nn.Module):
         return F.normalize(sig, p=2, dim=-1)
 
     def _run_heads(self, q):
-        mask_embs = self.mask_head(q)
-        cls_preds = self.cls_head(q)
+        mask_embs = self.project_mask_embeddings(q)
+        cls_preds = self.project_cls_logits(q)
         sig_embs = F.normalize(self.sig_head(q), p=2, dim=-1)
         seed_logits = self.seed_head(q).squeeze(-1)
         seed_scores = torch.sigmoid(seed_logits)
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
         return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds
+
+    def project_mask_embeddings(self, q: torch.Tensor) -> torch.Tensor:
+        return self.prototype_mask_pre(q)
+
+    def project_cls_logits(self, q: torch.Tensor) -> torch.Tensor:
+        return self.prototype_cls_pre(q)
+
+    def aggregate_mask_embeddings(self, weights: torch.Tensor, q_mask_emb: torch.Tensor) -> torch.Tensor:
+        proto_mask_emb = torch.matmul(weights, q_mask_emb)
+        return self.prototype_mask_post(proto_mask_emb)
+
+    def aggregate_cls_logits(self, weights: torch.Tensor, q_cls: torch.Tensor) -> torch.Tensor:
+        proto_cls = torch.matmul(weights, q_cls)
+        return self.prototype_cls_post(proto_cls)
 
     def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
