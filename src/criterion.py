@@ -5,20 +5,33 @@ import torch.utils.data
 from scipy.optimize import linear_sum_assignment
 
 from .config import LossConfig
+from .geometry import (
+    hyperbolic_distance,
+    pairwise_hyperbolic_distance,
+    signed_distance_score,
+    signed_normalize,
+)
 from .model import CustomMask2Former
 from .outputs import RawOutputs
 
 
 def assignment_weights_with_influence(
-    similarity: torch.Tensor,
+    distance: torch.Tensor,
     influence: torch.Tensor,
     alpha,
+    distance_radius: float,
+    distance_scale: float,
     valid_mask: torch.Tensor | None = None,
 ):
-    affinity = (similarity + influence.unsqueeze(-1)).clamp(0.0, 1.0)
+    affinity = signed_distance_score(
+        distance=distance,
+        distance_radius=distance_radius,
+        distance_scale=distance_scale,
+        influence=influence.unsqueeze(-1),
+    )
     if valid_mask is not None:
         affinity = affinity.masked_fill(~valid_mask.unsqueeze(1), 0.0)
-    return affinity.pow(alpha)
+    return affinity.sign() * affinity.abs().pow(alpha)
 
 
 def sigmoid_focal_loss(inputs, targets, alpha=0.25, gamma=2.0):
@@ -56,7 +69,7 @@ def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
 
 def hungarian_seed_assignment(
     q_sig_flat: torch.Tensor,
-    gt_sigs_norm: torch.Tensor,
+    gt_sigs_hyper: torch.Tensor,
     gt_pad_mask: torch.Tensor,
 ):
     B, num_queries, _ = q_sig_flat.shape
@@ -68,8 +81,8 @@ def hungarian_seed_assignment(
         if valid_gt_idx.numel() == 0 or num_queries == 0:
             continue
 
-        sim = torch.matmul(q_sig_flat[b], gt_sigs_norm[b, valid_gt_idx].T)
-        cost = (1.0 - sim).detach().cpu().numpy()
+        dist = pairwise_hyperbolic_distance(q_sig_flat[b], gt_sigs_hyper[b, valid_gt_idx])
+        cost = dist.detach().cpu().numpy()
         row_ind, col_ind = linear_sum_assignment(cost)
         if len(row_ind) == 0:
             continue
@@ -154,31 +167,32 @@ class PanopticCriterion(nn.Module):
         q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
 
-        gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
-        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_norm, gt_pad_mask)
+        gt_sigs_hyper = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
+        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_hyper, gt_pad_mask)
 
-        sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
-        sim_masked = sim.masked_fill(~gt_pad_mask.unsqueeze(1), -1.0)
+        dist = pairwise_hyperbolic_distance(q_sig_flat, gt_sigs_hyper)
         weights_raw = assignment_weights_with_influence(
-            similarity=sim,
+            distance=dist,
             influence=q_influence_flat,
             alpha=model.alpha_focal,
+            distance_radius=model.sig_distance_radius,
+            distance_scale=model.sig_distance_scale,
             valid_mask=gt_pad_mask,
         )
         weights_flat = weights_raw
 
         loss_inter = features.sum() * 0.0
         if M_max > 1:
-            gt_sim = torch.bmm(gt_sigs_norm, gt_sigs_norm.transpose(1, 2))
+            gt_dist = pairwise_hyperbolic_distance(gt_sigs_hyper, gt_sigs_hyper)
             eye = torch.eye(M_max, dtype=torch.bool, device=features.device).unsqueeze(0)
             valid_pair_mask = gt_pad_mask.unsqueeze(2) & gt_pad_mask.unsqueeze(1)
             off_diag_mask = valid_pair_mask & ~eye
 
             if off_diag_mask.any():
-                loss_inter = F.relu(gt_sim[off_diag_mask] - self.cfg.inter_margin).pow(2).mean()
+                loss_inter = F.relu(self.cfg.inter_margin - gt_dist[off_diag_mask]).pow(2).mean()
 
-        # Normalize (B,Q,GT) along Q dimension.
-        norm_w = weights_flat / (weights_flat.sum(dim=1, keepdim=True) + 1e-6)
+        # Normalize signed query contributions along the query axis.
+        norm_w = signed_normalize(weights_flat, dim=1)
 
         proto_mask_emb = model.aggregate_mask_embeddings(norm_w.transpose(1, 2), q_mask_emb_flat)
         proto_cls = model.aggregate_cls_logits(norm_w.transpose(1, 2), q_cls_flat)
@@ -204,9 +218,8 @@ class PanopticCriterion(nn.Module):
         if matched_pos.numel() > 0:
             matched_gt = matched_gt_indices[matched_query_mask]
             matched_q_sig = q_sig_flat[matched_query_mask]
-            matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt]
-            cos_sim_seed = (matched_q_sig * matched_gt_sig).sum(dim=-1)
-            loss_seed_sig = (1.0 - cos_sim_seed).mean()
+            matched_gt_sig = gt_sigs_hyper[matched_pos[:, 0], matched_gt]
+            loss_seed_sig = hyperbolic_distance(matched_q_sig, matched_gt_sig).mean()
 
         total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
 

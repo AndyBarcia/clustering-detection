@@ -29,6 +29,7 @@ except ImportError:
 
 from .model import CustomMask2Former
 from .config import PrototypeInferenceConfig
+from .geometry import hyperbolic_distance_np, pairwise_hyperbolic_distance, signed_distance_score, signed_normalize
 from .outputs import RawOutputs
 
 
@@ -42,20 +43,22 @@ def _alpha_value(alpha_obj) -> float:
     return float(alpha_obj)
 
 
-def _assignment_affinity(similarity: torch.Tensor, influence: torch.Tensor, similarity_floor: float = 0.0):
-    affinity = (similarity + influence.unsqueeze(1)).clamp(0.0, 1.0)
+def _assignment_affinity(score: torch.Tensor, similarity_floor: float = 0.0):
+    affinity = score
     if similarity_floor > 0.0:
-        affinity = affinity.clamp_min(similarity_floor)
+        pos = affinity > 0.0
+        affinity = torch.where(pos, affinity.clamp_min(similarity_floor), affinity)
     return affinity
 
 
-def _cosine_affinity_np(x: np.ndarray) -> np.ndarray:
-    return np.clip(x @ x.T, 0.0, 1.0)
+def _hyperbolic_score_np(x: np.ndarray, distance_radius: float, distance_scale: float) -> np.ndarray:
+    dist = hyperbolic_distance_np(x)
+    score = (distance_radius - dist) / max(distance_scale, 1e-6)
+    return np.ascontiguousarray(score, dtype=np.float64)
 
 
-def _cosine_distance_np(x: np.ndarray) -> np.ndarray:
-    dist = 1.0 - np.clip(x @ x.T, -1.0, 1.0)
-    return np.ascontiguousarray(dist, dtype=np.float64)
+def _hyperbolic_distance_np(x: np.ndarray) -> np.ndarray:
+    return hyperbolic_distance_np(x)
 
 
 def _connected_components_labels(affinity: np.ndarray, threshold: float) -> np.ndarray:
@@ -238,7 +241,13 @@ class ModularPrototypePredictor:
         seed_scores = score[seed_idx]
         return seed_idx, seed_scores
 
-    def _cluster_local(self, seed_sigs_np: np.ndarray, seed_scores_np: np.ndarray) -> np.ndarray:
+    def _cluster_local(
+        self,
+        seed_sigs_np: np.ndarray,
+        seed_scores_np: np.ndarray,
+        distance_radius: float,
+        distance_scale: float,
+    ) -> np.ndarray:
         cfg = self.cfg.cluster
         method = cfg.method.lower()
 
@@ -248,24 +257,30 @@ class ModularPrototypePredictor:
         if len(seed_sigs_np) == 1:
             return np.array([0], dtype=np.int64)
 
+        score = _hyperbolic_score_np(
+            seed_sigs_np,
+            distance_radius=distance_radius,
+            distance_scale=distance_scale,
+        )
+        dist = _hyperbolic_distance_np(seed_sigs_np)
+
         if method == "dbscan":
             if DBSCAN is None:
                 raise ImportError("scikit-learn is not installed. pip install scikit-learn")
             clusterer = DBSCAN(
                 eps=cfg.dbscan_eps,
                 min_samples=cfg.dbscan_min_samples,
-                metric="cosine",
+                metric="precomputed",
             )
             if cfg.dbscan_use_sample_weight:
-                clusterer.fit(seed_sigs_np, sample_weight=seed_scores_np)
+                clusterer.fit(dist, sample_weight=seed_scores_np)
             else:
-                clusterer.fit(seed_sigs_np)
+                clusterer.fit(dist)
             return clusterer.labels_.astype(np.int64)
 
         if method == "hdbscan":
             if _hdbscan is None:
                 raise ImportError("hdbscan is not installed. pip install hdbscan")
-            dist = _cosine_distance_np(seed_sigs_np)
             clusterer = _hdbscan.HDBSCAN(
                 metric="precomputed",
                 min_cluster_size=cfg.hdbscan_min_cluster_size,
@@ -274,7 +289,7 @@ class ModularPrototypePredictor:
             )
             return clusterer.fit_predict(dist).astype(np.int64)
 
-        affinity = _cosine_affinity_np(seed_sigs_np)
+        affinity = np.maximum(score, 0.0)
 
         if method == "cc":
             return _connected_components_labels(affinity, cfg.graph_affinity_threshold)
@@ -323,7 +338,13 @@ class ModularPrototypePredictor:
 
         raise ValueError(f"Unknown clustering method: {cfg.method}")
 
-    def _cluster_seeds(self, flat: Dict[str, torch.Tensor], seed_idx: torch.Tensor, seed_scores: torch.Tensor):
+    def _cluster_seeds(
+        self,
+        model: CustomMask2Former,
+        flat: Dict[str, torch.Tensor],
+        seed_idx: torch.Tensor,
+        seed_scores: torch.Tensor,
+    ):
         cfg = self.cfg.cluster
         device = seed_idx.device
 
@@ -347,7 +368,12 @@ class ModularPrototypePredictor:
             local_sigs_np = flat["q_sig"][local_seed_idx].detach().cpu().numpy()
             local_scores_np = local_scores.detach().cpu().numpy()
 
-            local_labels_np = self._cluster_local(local_sigs_np, local_scores_np)
+            local_labels_np = self._cluster_local(
+                local_sigs_np,
+                local_scores_np,
+                distance_radius=model.sig_distance_radius,
+                distance_scale=model.sig_distance_scale,
+            )
             local_labels = torch.as_tensor(local_labels_np, device=device)
 
             good_ids = [int(x) for x in np.unique(local_labels_np) if x != -1]
@@ -444,9 +470,15 @@ class ModularPrototypePredictor:
 
         n_steps = max(1, cfg.refinement_steps)
         for _ in range(n_steps):
-            sim = torch.matmul(q_sig, proto_sig.T)
-            affinity = _assignment_affinity(sim, flat["q_influence"][q_idx], cfg.similarity_floor)
-            raw_w = affinity.pow(alpha)
+            dist = pairwise_hyperbolic_distance(q_sig, proto_sig)
+            score = signed_distance_score(
+                distance=dist,
+                distance_radius=model.sig_distance_radius,
+                distance_scale=model.sig_distance_scale,
+                influence=flat["q_influence"][q_idx].unsqueeze(1),
+            )
+            affinity = _assignment_affinity(score, cfg.similarity_floor)
+            raw_w = affinity.sign() * affinity.abs().pow(alpha)
 
             if cfg.use_query_quality:
                 raw_w = raw_w * flat["q_seed"][q_idx].pow(cfg.query_quality_power).unsqueeze(1)
@@ -471,9 +503,9 @@ class ModularPrototypePredictor:
                 raw_w = raw_w * class_compat.pow(cfg.class_compat_power)
 
             if cfg.normalize_over_queries:
-                norm_w = raw_w / (raw_w.sum(dim=0, keepdim=True) + 1e-6)
+                norm_w = signed_normalize(raw_w, dim=0)
             else:
-                norm_w = raw_w / (raw_w.sum(dim=1, keepdim=True) + 1e-6)
+                norm_w = signed_normalize(raw_w, dim=1)
 
             proto_mask_emb = model.aggregate_mask_embeddings(norm_w.T, q_mask_emb)
             proto_cls = model.aggregate_cls_logits(norm_w.T, q_cls)
@@ -543,13 +575,18 @@ class ModularPrototypePredictor:
         q_mask_emb = flat["q_mask_emb"]
 
         alpha = _alpha_value(model.alpha_focal) if self.cfg.assign.use_alpha_focal else 1.0
-        sim = torch.matmul(q_sig, gt_sig.T)
-        affinity = _assignment_affinity(sim, flat["q_influence"], self.cfg.assign.similarity_floor)
-        raw_w = affinity.pow(alpha)
+        dist = pairwise_hyperbolic_distance(q_sig, gt_sig)
+        score = signed_distance_score(
+            distance=dist,
+            distance_radius=model.sig_distance_radius,
+            distance_scale=model.sig_distance_scale,
+            influence=flat["q_influence"].unsqueeze(1),
+        )
+        affinity = _assignment_affinity(score, self.cfg.assign.similarity_floor)
+        raw_w = affinity.sign() * affinity.abs().pow(alpha)
 
-        # Keep GT-oracle assignment aligned with training:
-        # training uses similarity + influence only before query-normalization.
-        norm_w = raw_w / (raw_w.sum(dim=0, keepdim=True) + 1e-6)
+        # Keep GT-oracle assignment aligned with training's signed query normalization.
+        norm_w = signed_normalize(raw_w, dim=0)
 
         proto_mask_emb = model.aggregate_mask_embeddings(norm_w.T, q_mask_emb)
         proto_cls = model.aggregate_cls_logits(norm_w.T, q_cls)
@@ -700,7 +737,7 @@ class ModularPrototypePredictor:
     def _predict_single(self, model: CustomMask2Former, raw: RawOutputs, b: int):
         flat = self._flatten_outputs(raw, b)
         seed_idx, seed_scores = self._select_seeds(flat)
-        cluster_labels = self._cluster_seeds(flat, seed_idx, seed_scores)
+        cluster_labels = self._cluster_seeds(model, flat, seed_idx, seed_scores)
         proto_state = self._initialize_prototypes(model, flat, seed_idx, cluster_labels)
         proto_state = self._soft_refine_prototypes(model, flat, proto_state)
         pred = self._decode_and_resolve(flat, proto_state)

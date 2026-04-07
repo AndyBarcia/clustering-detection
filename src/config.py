@@ -34,6 +34,8 @@ class HeadConfig:
     num_classes: int = 3
     hidden_dim: int = 1024
     sig_dim: int = 64
+    sig_distance_radius: float = 1.0
+    sig_distance_scale: float = 1.0
 
 
 @dataclass
@@ -107,7 +109,7 @@ class ClusterConfig:
     hdbscan_cluster_selection_epsilon: float = 0.0
 
     # Graph methods
-    graph_affinity_threshold: float = 0.76
+    graph_affinity_threshold: float = 0.0
     graph_min_edge_weight: float = 0.01
 
     # Louvain / Leiden

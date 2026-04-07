@@ -7,6 +7,7 @@ import contextlib
 from typing import Optional
 
 from .config import ModelConfig, AggregationTransformConfig
+from .geometry import lift_to_hyperboloid
 from .outputs import RawOutputs
 
 
@@ -245,8 +246,11 @@ class CustomMask2Former(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
         self.num_queries = num_queries
-        self.sig_dim = sig_dim
+        self.sig_dim = sig_dim + 1
+        self.raw_sig_dim = sig_dim
         self.num_layers = num_layers
+        self.sig_distance_radius = cfg.heads.sig_distance_radius
+        self.sig_distance_scale = cfg.heads.sig_distance_scale
 
         self.backbone = SimpleBackbone(hidden_dim=hidden_dim)
 
@@ -285,8 +289,8 @@ class CustomMask2Former(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
         agg_cfg = cfg.prototype_aggregation
-        self.prototype_cls_pre = _build_aggregation_transform(agg_cfg.cls_pre, hidden_dim, hidden_dim)
-        self.prototype_cls_post = _build_aggregation_transform(agg_cfg.cls_post, hidden_dim, num_classes)
+        self.prototype_cls_pre = _build_aggregation_transform(agg_cfg.cls_pre, hidden_dim, num_classes)
+        self.prototype_cls_post = _build_aggregation_transform(agg_cfg.cls_post, num_classes, num_classes)
         self.prototype_mask_pre = _build_aggregation_transform(agg_cfg.mask_pre, hidden_dim, hidden_dim)
         self.prototype_mask_post = _build_aggregation_transform(agg_cfg.mask_post, hidden_dim, hidden_dim)
 
@@ -366,12 +370,12 @@ class CustomMask2Former(nn.Module):
         q_gt = q_gt_all[-1]
 
         sig = self.sig_head(q_gt)
-        return F.normalize(sig, p=2, dim=-1)
+        return lift_to_hyperboloid(sig)
 
     def _run_heads(self, q):
         mask_embs = self.project_mask_embeddings(q)
         cls_preds = self.project_cls_logits(q)
-        sig_embs = F.normalize(self.sig_head(q), p=2, dim=-1)
+        sig_embs = lift_to_hyperboloid(self.sig_head(q))
         seed_logits = self.seed_head(q).squeeze(-1)
         seed_scores = torch.sigmoid(seed_logits)
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
