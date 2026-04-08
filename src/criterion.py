@@ -14,10 +14,12 @@ def assignment_weights_with_influence(
     alpha,
     valid_mask: torch.Tensor | None = None,
 ):
-    affinity = (similarity + influence.unsqueeze(-1)).clamp(0.0, 1.0)
+    # Influence is a signed additive bias on cosine similarity. We keep the
+    # signed affinity so a query can reinforce nearby GTs and suppress distant ones.
+    affinity = (similarity + influence.unsqueeze(-1)).clamp(-1.0, 1.0)
     if valid_mask is not None:
         affinity = affinity.masked_fill(~valid_mask.unsqueeze(1), 0.0)
-    return affinity.pow(alpha)
+    return affinity.sign() * affinity.abs().pow(alpha)
 
 
 def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
@@ -234,7 +236,7 @@ class ClusterPanopticCriterion(nn.Module):
             if off_diag_mask.any():
                 loss_inter = F.relu(gt_sim[off_diag_mask] - self.cfg.inter_margin).pow(2).mean()
 
-        norm_w = weights_flat / (weights_flat.sum(dim=1, keepdim=True) + 1e-6)
+        norm_w = weights_flat / (weights_flat.abs().sum(dim=1, keepdim=True) + 1e-6)
 
         proto_mask_emb = torch.bmm(norm_w.transpose(1, 2), q_mask_emb_flat)
         proto_cls = torch.bmm(norm_w.transpose(1, 2), q_cls_flat)
