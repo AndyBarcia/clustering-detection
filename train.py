@@ -113,6 +113,10 @@ def format_epoch_metrics(epoch_metrics):
         "loss_mask_iou",
         "loss_mask_total",
         "loss_inter",
+        "loss_anchor_sim",
+        "loss_anchor_owner",
+        "loss_anchor_margin",
+        "loss_anchor_total",
     ]
     return " | ".join(f"{key}={epoch_metrics[key]:.4f}" for key in ordered_keys if key in epoch_metrics)
 

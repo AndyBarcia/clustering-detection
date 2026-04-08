@@ -54,6 +54,16 @@ def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
     return logits.sum() * 0.0
 
 
+def smooth_max_pool(values: torch.Tensor, valid_mask: torch.Tensor, dim: int, temperature: float, eps: float = 1e-6):
+    """Differentiable max that stays inside the range of `values`."""
+    masked_values = values.masked_fill(~valid_mask, -1e4)
+    weights = F.softmax(masked_values * temperature, dim=dim)
+    weights = weights * valid_mask.to(values.dtype)
+    weights = weights / weights.sum(dim=dim, keepdim=True).clamp_min(eps)
+    pooled = (weights * values.masked_fill(~valid_mask, 0.0)).sum(dim=dim)
+    return pooled
+
+
 def hungarian_seed_assignment(
     q_sig_flat: torch.Tensor,
     gt_sigs_norm: torch.Tensor,
@@ -122,6 +132,10 @@ class PanopticCriterion(nn.Module):
                 "loss_mask_iou": zero,
                 "loss_mask_total": zero,
                 "loss_inter": zero,
+                "loss_anchor_sim": zero,
+                "loss_anchor_owner": zero,
+                "loss_anchor_margin": zero,
+                "loss_anchor_total": zero,
             }
 
         B_val = len(valid_b)
@@ -158,7 +172,6 @@ class PanopticCriterion(nn.Module):
         matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_norm, gt_pad_mask)
 
         sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
-        sim_masked = sim.masked_fill(~gt_pad_mask.unsqueeze(1), -1.0)
         weights_raw = assignment_weights_with_influence(
             similarity=sim,
             influence=q_influence_flat,
@@ -166,6 +179,8 @@ class PanopticCriterion(nn.Module):
             valid_mask=gt_pad_mask,
         )
         weights_flat = weights_raw
+        obj_gt_mask = gt_pad_mask & (gt_labels_pad != 0)
+        obj_query_gt_mask = obj_gt_mask.unsqueeze(1).expand(-1, q_sig_flat.shape[1], -1)
 
         loss_inter = features.sum() * 0.0
         if M_max > 1:
@@ -176,6 +191,52 @@ class PanopticCriterion(nn.Module):
 
             if off_diag_mask.any():
                 loss_inter = F.relu(gt_sim[off_diag_mask] - self.cfg.inter_margin).pow(2).mean()
+
+        zero = features.sum() * 0.0
+        loss_anchor_sim = zero
+        loss_anchor_owner = zero
+        loss_anchor_margin = zero
+
+        if self.cfg.w_anchor_sim > 0.0 and obj_gt_mask.any():
+            best_sim = smooth_max_pool(
+                sim,
+                valid_mask=obj_query_gt_mask,
+                dim=1,
+                temperature=self.cfg.anchor_pool_temperature,
+            )
+            loss_anchor_sim = F.relu(self.cfg.anchor_sim_target - best_sim[obj_gt_mask]).mean()
+
+        if self.cfg.w_anchor_owner > 0.0 and obj_gt_mask.any():
+            owner_raw = weights_raw.masked_fill(~obj_query_gt_mask, 0.0)
+            owner_prob = owner_raw / owner_raw.sum(dim=2, keepdim=True).clamp_min(1e-6)
+            best_owner = smooth_max_pool(
+                owner_prob,
+                valid_mask=obj_query_gt_mask,
+                dim=1,
+                temperature=self.cfg.anchor_pool_temperature,
+            )
+            loss_anchor_owner = F.relu(self.cfg.anchor_owner_target - best_owner[obj_gt_mask]).mean()
+
+        if self.cfg.w_anchor_margin > 0.0 and obj_gt_mask.any():
+            owner_raw = weights_raw.masked_fill(~obj_query_gt_mask, 0.0)
+            owner_prob = owner_raw / owner_raw.sum(dim=2, keepdim=True).clamp_min(1e-6)
+
+            if obj_gt_mask.sum(dim=1).gt(1).any():
+                same_gt = torch.eye(M_max, dtype=torch.bool, device=features.device).unsqueeze(0).unsqueeze(0)
+                other_obj_mask = obj_gt_mask.unsqueeze(1).unsqueeze(2).expand(-1, q_sig_flat.shape[1], M_max, -1)
+                other_owner = owner_prob.unsqueeze(2).expand(-1, -1, M_max, -1)
+                other_owner = other_owner.masked_fill(~other_obj_mask | same_gt, -1e4)
+                other_best = other_owner.max(dim=-1).values
+                margin_scores = owner_prob - other_best
+                margin_gt_mask = obj_gt_mask & obj_gt_mask.sum(dim=1, keepdim=True).gt(1)
+                margin_query_gt_mask = margin_gt_mask.unsqueeze(1).expand(-1, q_sig_flat.shape[1], -1)
+                best_margin = smooth_max_pool(
+                    margin_scores,
+                    valid_mask=margin_query_gt_mask,
+                    dim=1,
+                    temperature=self.cfg.anchor_pool_temperature,
+                )
+                loss_anchor_margin = F.relu(self.cfg.anchor_margin_target - best_margin[margin_gt_mask]).mean()
 
         # Normalize (B,Q,GT) along Q dimension.
         norm_w = weights_flat / (weights_flat.sum(dim=1, keepdim=True) + 1e-6)
@@ -209,11 +270,17 @@ class PanopticCriterion(nn.Module):
             loss_seed_sig = (1.0 - cos_sim_seed).mean()
 
         total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
+        total_loss_anchor = (
+            self.cfg.w_anchor_sim * loss_anchor_sim
+            + self.cfg.w_anchor_owner * loss_anchor_owner
+            + self.cfg.w_anchor_margin * loss_anchor_margin
+        )
 
         final_loss = (
             loss_seed_sig +
             loss_cls +
             total_loss_mask +
+            total_loss_anchor +
             self.cfg.w_seed * loss_seed +
             self.cfg.w_inter * loss_inter
         )
@@ -227,6 +294,10 @@ class PanopticCriterion(nn.Module):
             "loss_mask_iou": loss_mask_iou,
             "loss_mask_total": total_loss_mask,
             "loss_inter": loss_inter,
+            "loss_anchor_sim": loss_anchor_sim,
+            "loss_anchor_owner": loss_anchor_owner,
+            "loss_anchor_margin": loss_anchor_margin,
+            "loss_anchor_total": total_loss_anchor,
         }
 
         return final_loss, components

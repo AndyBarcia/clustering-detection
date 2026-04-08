@@ -55,6 +55,13 @@ class LossConfig:
     w_seed: float = 2.0
     w_inter: float = 10.0
     inter_margin: float = 0.0
+    w_anchor_sim: float = 1.0
+    w_anchor_owner: float = 1.0
+    w_anchor_margin: float = 1.0
+    anchor_pool_temperature: float = 12.0
+    anchor_sim_target: float = 0.9
+    anchor_owner_target: float = 0.6
+    anchor_margin_target: float = 0.1
 
 
 @dataclass
