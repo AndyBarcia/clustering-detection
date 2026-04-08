@@ -296,14 +296,15 @@ class StandardMask2FormerCriterion(nn.Module):
     def forward(self, model: Mask2FormerBase, raw: RawOutputs, targets):
         return self.compute_loss(model, raw, targets)
 
-    def compute_loss(self, model: Mask2FormerBase, raw: RawOutputs, targets):
-        del model
-
-        features = raw.features
-        H_img, W_img = raw.img_shape
-        q_mask_emb = raw.mask_embs[-1]
-        q_cls = raw.cls_preds[-1]
-
+    def _compute_single_layer_loss(
+        self,
+        features: torch.Tensor,
+        q_mask_emb: torch.Tensor,
+        q_cls: torch.Tensor,
+        targets,
+        img_shape: tuple[int, int],
+    ):
+        H_img, W_img = img_shape
         mask_logits = torch.einsum("bqc,bchw->bqhw", q_mask_emb, features)
         mask_logits = F.interpolate(mask_logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
 
@@ -353,6 +354,21 @@ class StandardMask2FormerCriterion(nn.Module):
         else:
             loss_mask_bce = features.sum() * 0.0
             loss_mask_dice = features.sum() * 0.0
+
+        return loss_cls, loss_mask_bce, loss_mask_dice
+
+    def compute_loss(self, model: Mask2FormerBase, raw: RawOutputs, targets):
+        del model
+
+        features = raw.features
+        layer_losses = [
+            self._compute_single_layer_loss(features, q_mask_emb, q_cls, targets, raw.img_shape)
+            for q_mask_emb, q_cls in zip(raw.mask_embs, raw.cls_preds)
+        ]
+
+        loss_cls = torch.stack([loss[0] for loss in layer_losses]).mean()
+        loss_mask_bce = torch.stack([loss[1] for loss in layer_losses]).mean()
+        loss_mask_dice = torch.stack([loss[2] for loss in layer_losses]).mean()
 
         total_loss_mask = self.cfg.w_mask_bce * loss_mask_bce + self.cfg.w_mask_dice * loss_mask_dice
         final_loss = loss_cls + total_loss_mask
