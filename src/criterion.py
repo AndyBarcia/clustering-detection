@@ -54,6 +54,61 @@ def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
     return logits.sum() * 0.0
 
 
+def _exclusive_cumprod(x: torch.Tensor, dim: int) -> torch.Tensor:
+    prod = torch.cumprod(x, dim=dim)
+    prefix = torch.ones_like(prod.narrow(dim, 0, 1))
+    if prod.shape[dim] == 1:
+        return prefix
+    return torch.cat([prefix, prod.narrow(dim, 0, prod.shape[dim] - 1)], dim=dim)
+
+
+def _soft_axis_occupancy(mask_probs: torch.Tensor, dim: int, eps: float = 1e-6) -> torch.Tensor:
+    clamped = mask_probs.clamp(min=0.0, max=1.0 - eps)
+    return 1.0 - torch.exp(torch.log1p(-clamped).sum(dim=dim))
+
+
+def _soft_axis_bounds(occupancy: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor]:
+    empty_prob = (1.0 - occupancy).clamp(min=0.0, max=1.0)
+
+    start_weights = occupancy * _exclusive_cumprod(empty_prob, dim=-1)
+    end_weights = occupancy.flip(-1) * _exclusive_cumprod(empty_prob.flip(-1), dim=-1)
+    end_weights = end_weights.flip(-1)
+
+    coords = torch.linspace(0.0, 1.0, occupancy.shape[-1], device=occupancy.device, dtype=occupancy.dtype)
+
+    start = (start_weights * coords).sum(dim=-1) / start_weights.sum(dim=-1).clamp_min(eps)
+    end = (end_weights * coords).sum(dim=-1) / end_weights.sum(dim=-1).clamp_min(eps)
+    return start, end
+
+
+def masks_to_soft_boxes(mask_probs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    occ_x = _soft_axis_occupancy(mask_probs, dim=2, eps=eps)
+    occ_y = _soft_axis_occupancy(mask_probs, dim=3, eps=eps)
+
+    x_min, x_max = _soft_axis_bounds(occ_x, eps=eps)
+    y_min, y_max = _soft_axis_bounds(occ_y, eps=eps)
+    return torch.stack([x_min, y_min, x_max, y_max], dim=-1)
+
+
+def generalized_box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    top_left = torch.maximum(boxes1[:, :2], boxes2[:, :2])
+    bottom_right = torch.minimum(boxes1[:, 2:], boxes2[:, 2:])
+    wh = (bottom_right - top_left).clamp_min(0.0)
+    intersection = wh[:, 0] * wh[:, 1]
+
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp_min(0.0) * (boxes1[:, 3] - boxes1[:, 1]).clamp_min(0.0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp_min(0.0) * (boxes2[:, 3] - boxes2[:, 1]).clamp_min(0.0)
+    union = area1 + area2 - intersection
+    iou = intersection / union.clamp_min(eps)
+
+    enclosure_top_left = torch.minimum(boxes1[:, :2], boxes2[:, :2])
+    enclosure_bottom_right = torch.maximum(boxes1[:, 2:], boxes2[:, 2:])
+    enclosure_wh = (enclosure_bottom_right - enclosure_top_left).clamp_min(0.0)
+    enclosure_area = enclosure_wh[:, 0] * enclosure_wh[:, 1]
+
+    return iou - (enclosure_area - union) / enclosure_area.clamp_min(eps)
+
+
 def hungarian_seed_assignment(
     q_sig_flat: torch.Tensor,
     gt_sigs_norm: torch.Tensor,
@@ -103,13 +158,14 @@ class PanopticCriterion(nn.Module):
 
         B = features.shape[0]
 
-        valid_b, masks_list, labels_list = [], [], []
+        valid_b, masks_list, labels_list, boxes_list = [], [], [], []
         for b in range(B):
             l = targets[b]["labels"].to(features.device)
             if len(l) > 0:
                 valid_b.append(b)
                 masks_list.append(targets[b]["masks"].to(features.device).float())
                 labels_list.append(l)
+                boxes_list.append(targets[b]["boxes"].to(features.device).float())
 
         if not valid_b:
             zero = features.sum() * 0.0
@@ -121,6 +177,9 @@ class PanopticCriterion(nn.Module):
                 "loss_mask_ce": zero,
                 "loss_mask_iou": zero,
                 "loss_mask_total": zero,
+                "loss_box_l1": zero,
+                "loss_box_giou": zero,
+                "loss_box_total": zero,
                 "loss_inter": zero,
             }
 
@@ -129,12 +188,14 @@ class PanopticCriterion(nn.Module):
 
         gt_masks_pad = torch.zeros(B_val, M_max, H_img, W_img, device=features.device)
         gt_labels_pad = torch.zeros(B_val, M_max, dtype=torch.long, device=features.device)
+        gt_boxes_pad = torch.zeros(B_val, M_max, 4, device=features.device)
         gt_pad_mask = torch.zeros(B_val, M_max, dtype=torch.bool, device=features.device)
 
-        for i, (m, l) in enumerate(zip(masks_list, labels_list)):
+        for i, (m, l, boxes) in enumerate(zip(masks_list, labels_list, boxes_list)):
             M = len(l)
             gt_masks_pad[i, :M] = m
             gt_labels_pad[i, :M] = l
+            gt_boxes_pad[i, :M] = boxes
             gt_pad_mask[i, :M] = True
 
         features_val = features[valid_b]
@@ -191,10 +252,32 @@ class PanopticCriterion(nn.Module):
         mask_logits = F.interpolate(mask_logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
         neg_inf = torch.finfo(mask_logits.dtype).min
         mask_logits_masked = mask_logits.masked_fill(~gt_pad_mask[:, :, None, None], neg_inf)
+        mask_probs = F.softmax(mask_logits_masked, dim=1) * gt_pad_mask[:, :, None, None]
         gt_mask_target = gt_masks_pad.argmax(dim=1)
 
         loss_mask_ce = F.cross_entropy(mask_logits_masked, gt_mask_target)
         loss_mask_iou = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
+
+        loss_box_l1 = features.sum() * 0.0
+        loss_box_giou = features.sum() * 0.0
+        foreground_mask = gt_pad_mask & (gt_labels_pad != 0)
+        if foreground_mask.any():
+            pred_boxes = masks_to_soft_boxes(mask_probs)
+            scale = pred_boxes.new_tensor(
+                [
+                    max(W_img - 1, 1),
+                    max(H_img - 1, 1),
+                    max(W_img - 1, 1),
+                    max(H_img - 1, 1),
+                ]
+            )
+            gt_boxes_norm = gt_boxes_pad / scale
+
+            pred_boxes_fg = pred_boxes[foreground_mask]
+            gt_boxes_fg = gt_boxes_norm[foreground_mask]
+
+            loss_box_l1 = F.l1_loss(pred_boxes_fg, gt_boxes_fg)
+            loss_box_giou = 1.0 - generalized_box_iou(pred_boxes_fg, gt_boxes_fg).mean()
 
         seed_targets = matched_query_mask.float()
         loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
@@ -209,11 +292,13 @@ class PanopticCriterion(nn.Module):
             loss_seed_sig = (1.0 - cos_sim_seed).mean()
 
         total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
+        total_loss_box = self.cfg.w_box_l1 * loss_box_l1 + self.cfg.w_box_giou * loss_box_giou
 
         final_loss = (
             loss_seed_sig +
             loss_cls +
             total_loss_mask +
+            total_loss_box +
             self.cfg.w_seed * loss_seed +
             self.cfg.w_inter * loss_inter
         )
@@ -226,6 +311,9 @@ class PanopticCriterion(nn.Module):
             "loss_mask_ce": loss_mask_ce,
             "loss_mask_iou": loss_mask_iou,
             "loss_mask_total": total_loss_mask,
+            "loss_box_l1": loss_box_l1,
+            "loss_box_giou": loss_box_giou,
+            "loss_box_total": total_loss_box,
             "loss_inter": loss_inter,
         }
 
