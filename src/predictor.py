@@ -27,7 +27,7 @@ except ImportError:
     leidenalg = None
 
 
-from .model import CustomMask2Former
+from .model import CustomMask2Former, Mask2FormerBase
 from .config import PrototypeInferenceConfig
 from .outputs import RawOutputs
 
@@ -713,3 +713,123 @@ class ModularPrototypePredictor:
         pred = self._decode_and_resolve(flat, proto_state)
         pred["flat"] = flat
         return pred
+
+
+class StandardMask2FormerPredictor:
+    def __init__(self, cfg: PrototypeInferenceConfig):
+        self.cfg = cfg
+
+    @torch.no_grad()
+    def predict(self, model: Mask2FormerBase, images: torch.Tensor):
+        raw = model(images)
+        return self.predict_from_raw(model, raw)
+
+    @torch.no_grad()
+    def predict_from_raw(self, model: Mask2FormerBase, raw: RawOutputs):
+        B = raw.features.shape[0]
+        preds = [self._predict_single(model, raw, b) for b in range(B)]
+        return preds[0] if B == 1 else preds
+
+    @torch.no_grad()
+    def predict_from_raw_with_gt_prototypes(self, model: Mask2FormerBase, raw: RawOutputs, targets):
+        del targets
+        return self.predict_from_raw(model, raw)
+
+    def _flatten_outputs(self, raw: RawOutputs, b: int) -> Dict[str, torch.Tensor]:
+        q_mask_emb = raw.mask_embs[-1, b]
+        q_cls = raw.cls_preds[-1, b]
+        q_cls_prob = F.softmax(q_cls, dim=-1)
+
+        return {
+            "features": raw.features[b],
+            "H_img": raw.img_shape[0],
+            "W_img": raw.img_shape[1],
+            "q_mask_emb": q_mask_emb,
+            "q_cls": q_cls,
+            "q_cls_prob": q_cls_prob,
+            "q_seed": q_cls_prob.max(dim=-1).values,
+            "q_influence": None,
+            "pred_cls": q_cls_prob.argmax(dim=-1),
+            "bg_conf": q_cls_prob[:, 0],
+            "fg_conf": 1.0 - q_cls_prob[:, 0],
+        }
+
+    def _predict_single(self, model: Mask2FormerBase, raw: RawOutputs, b: int):
+        del model
+
+        flat = self._flatten_outputs(raw, b)
+        cfg = self.cfg.overlap
+
+        features = flat["features"]
+        q_mask_emb = flat["q_mask_emb"]
+        q_cls = flat["q_cls"]
+        q_cls_prob = flat["q_cls_prob"]
+        pred_cls = flat["pred_cls"]
+
+        mask_logits = torch.einsum("qc,chw->qhw", q_mask_emb, features)
+        mask_logits = F.interpolate(
+            mask_logits.unsqueeze(0),
+            size=(flat["H_img"], flat["W_img"]),
+            mode="bilinear",
+            align_corners=False,
+        )[0]
+        mask_probs = torch.sigmoid(mask_logits)
+        binary_masks = mask_probs >= cfg.mask_threshold
+
+        cls_conf = q_cls_prob.max(dim=-1).values
+        fg_conf = flat["fg_conf"]
+
+        scores = torch.ones_like(cls_conf)
+        if cfg.use_class_confidence:
+            scores = scores * cls_conf
+        if cfg.use_foreground_confidence:
+            scores = scores * fg_conf
+
+        keep = torch.ones_like(scores, dtype=torch.bool)
+        if cfg.remove_background:
+            keep &= pred_cls != 0
+        keep &= scores >= cfg.min_prototype_score
+
+        resolved_masks = []
+        resolved_labels = []
+        resolved_scores = []
+        kept_mask_logits = []
+        kept_mask_probs = []
+        kept_query_idx = []
+
+        for idx in torch.where(keep)[0].tolist():
+            mask = binary_masks[idx]
+            if mask.sum().item() < cfg.min_area:
+                continue
+
+            kept_query_idx.append(idx)
+            kept_mask_logits.append(mask_logits[idx])
+            kept_mask_probs.append(mask_probs[idx])
+            resolved_masks.append(mask)
+            resolved_labels.append(int(pred_cls[idx].item()))
+            resolved_scores.append(float(scores[idx].item()))
+
+        empty_mask_logits = torch.empty((0, flat["H_img"], flat["W_img"]), device=features.device)
+        kept_query_idx = torch.as_tensor(kept_query_idx, device=features.device, dtype=torch.long)
+
+        return {
+            "flat": flat,
+            "proto_cls": q_cls[kept_query_idx],
+            "proto_cls_prob": q_cls_prob[kept_query_idx],
+            "proto_mask_emb": q_mask_emb[kept_query_idx],
+            "proto_score": scores[kept_query_idx],
+            "raw_mask_logits": torch.stack(kept_mask_logits, dim=0) if kept_mask_logits else empty_mask_logits,
+            "raw_mask_probs": torch.stack(kept_mask_probs, dim=0) if kept_mask_probs else empty_mask_logits,
+            "resolved_masks": resolved_masks,
+            "resolved_labels": resolved_labels,
+            "resolved_scores": resolved_scores,
+        }
+
+
+def build_predictor(cfg: PrototypeInferenceConfig, model_variant: str):
+    variant = model_variant.lower()
+    if variant == "standard_mask2former":
+        return StandardMask2FormerPredictor(cfg)
+    if variant == "clustered":
+        return ModularPrototypePredictor(cfg)
+    raise ValueError(f"Unknown model variant: {model_variant}")

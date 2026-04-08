@@ -3,9 +3,9 @@ import torch.nn as nn
 from typing import Optional
 from dataclasses import asdict
 
-from .model import CustomMask2Former
+from .model import build_model
 from .criterion import PanopticCriterion
-from .predictor import ModularPrototypePredictor
+from .predictor import build_predictor
 from .config import (
     PrototypeInferenceConfig, 
     PanopticSystemConfig, 
@@ -19,13 +19,17 @@ class PanopticSystem(nn.Module):
     def __init__(self, cfg: PanopticSystemConfig):
         super().__init__()
         self.cfg = cfg
-        self.model = CustomMask2Former(cfg.model)
-        self.criterion = PanopticCriterion(cfg.loss)
-        self.predictor = ModularPrototypePredictor(cfg.inference)
+        self.model = build_model(cfg.model)
+        self.criterion = PanopticCriterion(cfg.loss, model_variant=cfg.model.variant)
+        self.predictor = build_predictor(cfg.inference, cfg.model.variant)
+
+    @property
+    def supports_gt_prototypes(self) -> bool:
+        return bool(getattr(self.model, "supports_gt_prototypes", False))
 
     def set_inference_config(self, inference_cfg: PrototypeInferenceConfig):
         self.cfg.inference = inference_cfg
-        self.predictor = ModularPrototypePredictor(inference_cfg)
+        self.predictor = build_predictor(inference_cfg, self.cfg.model.variant)
 
     def _resolve_ttt_steps(self, inference_cfg: Optional[PrototypeInferenceConfig]) -> Optional[int]:
         cfg = self.cfg.inference if inference_cfg is None else inference_cfg
@@ -38,13 +42,13 @@ class PanopticSystem(nn.Module):
     @torch.no_grad()
     def predict(self, images, inference_cfg: Optional[PrototypeInferenceConfig] = None):
         raw = self.model(images, ttt_steps_override=self._resolve_ttt_steps(inference_cfg))
-        predictor = self.predictor if inference_cfg is None else ModularPrototypePredictor(inference_cfg)
+        predictor = self.predictor if inference_cfg is None else build_predictor(inference_cfg, self.cfg.model.variant)
         return predictor.predict_from_raw(self.model, raw)
 
     @torch.no_grad()
     def predict_with_gt_prototypes(self, images, targets, inference_cfg: Optional[PrototypeInferenceConfig] = None):
         raw = self.model(images, ttt_steps_override=self._resolve_ttt_steps(inference_cfg))
-        predictor = self.predictor if inference_cfg is None else ModularPrototypePredictor(inference_cfg)
+        predictor = self.predictor if inference_cfg is None else build_predictor(inference_cfg, self.cfg.model.variant)
         return predictor.predict_from_raw_with_gt_prototypes(self.model, raw, targets)
 
 

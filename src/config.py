@@ -38,6 +38,7 @@ class HeadConfig:
 
 @dataclass
 class ModelConfig:
+    variant: str = "clustered"
     backbone: BackboneConfig = field(default_factory=BackboneConfig)
     decoder_layer: DecoderLayerConfig = field(default_factory=DecoderLayerConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
@@ -55,6 +56,14 @@ class LossConfig:
     w_seed: float = 2.0
     w_inter: float = 10.0
     inter_margin: float = 0.0
+
+    matcher_cost_class: float = 2.0
+    matcher_cost_mask_bce: float = 5.0
+    matcher_cost_mask_dice: float = 5.0
+
+    w_mask_bce: float = 5.0
+    w_mask_dice: float = 5.0
+    no_object_weight: float = 0.1
 
 
 @dataclass

@@ -1,8 +1,11 @@
 import argparse
+import os
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 
 import torch
 
-from src.config import dataclass_from_dict, PrototypeInferenceConfig
 from src.panoptic import load_system_checkpoint
 from src.visualization import (
     DEFAULT_CLASS_NAMES,
@@ -41,7 +44,9 @@ def main():
         seed=args.seed,
     )
     predictions = run_predictions(system, images)
-    gt_proto_predictions = run_predictions_with_gt_prototypes(system, images, targets)
+    gt_proto_predictions = None
+    if system.supports_gt_prototypes:
+        gt_proto_predictions = run_predictions_with_gt_prototypes(system, images, targets)
 
     figure_title = f"Checkpoint preview: {args.checkpoint}"
     if args.save_path:

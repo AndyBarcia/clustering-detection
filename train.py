@@ -29,6 +29,12 @@ METRICS_NAME = "training_losses.json"
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train the panoptic system and report disaggregated losses.")
+    parser.add_argument(
+        "--model-variant",
+        choices=["clustered", "standard_mask2former"],
+        default="clustered",
+        help="Model architecture to train.",
+    )
     parser.add_argument("--epochs", type=int, default=10, help="Total number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size.")
     parser.add_argument("--dataset-length", type=int, default=100, help="Number of synthetic samples.")
@@ -111,6 +117,8 @@ def format_epoch_metrics(epoch_metrics):
         "loss_cls",
         "loss_mask_ce",
         "loss_mask_iou",
+        "loss_mask_bce",
+        "loss_mask_dice",
         "loss_mask_total",
         "loss_inter",
     ]
@@ -121,11 +129,17 @@ def format_iteration_metrics(metrics):
     return format_epoch_metrics(metrics)
 
 
-def load_training_state(output_dir: Path, device: torch.device, lr: float, weight_decay: float):
+def load_training_state(output_dir: Path, device: torch.device, lr: float, weight_decay: float, model_variant: str):
     checkpoint_path = output_dir / CHECKPOINT_NAME
     if checkpoint_path.exists():
         system, ckpt = load_system_checkpoint(checkpoint_path, map_location=device)
         system = system.to(device)
+        if system.cfg.model.variant != model_variant:
+            print(
+                f"Requested model variant '{model_variant}', "
+                f"but checkpoint uses '{system.cfg.model.variant}'. Resuming checkpoint variant.",
+                flush=True,
+            )
         optimizer = torch.optim.Adam(system.parameters(), lr=lr, weight_decay=weight_decay)
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -136,6 +150,10 @@ def load_training_state(output_dir: Path, device: torch.device, lr: float, weigh
         return system, optimizer, history, start_epoch
 
     cfg = PanopticSystemConfig()
+    cfg.model.variant = model_variant
+    if model_variant == "standard_mask2former":
+        cfg.model.decoder_layer.ttt_steps = 0
+        cfg.model.decoder.use_attention_residuals = False
     system = PanopticSystem(cfg).to(device)
     optimizer = torch.optim.Adam(system.parameters(), lr=lr, weight_decay=weight_decay)
     return system, optimizer, [], 0
@@ -176,7 +194,9 @@ def save_epoch_visualization(output_dir: Path, system: PanopticSystem, images, t
         return None
 
     predictions = run_predictions(system, images)
-    gt_proto_predictions = run_predictions_with_gt_prototypes(system, images, targets)
+    gt_proto_predictions = None
+    if system.supports_gt_prototypes:
+        gt_proto_predictions = run_predictions_with_gt_prototypes(system, images, targets)
     path = output_dir / f"predictions_epoch_{epoch:03d}.png"
     save_prediction_grid(
         path,
@@ -201,6 +221,7 @@ def main():
         device=device,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        model_variant=args.model_variant,
     )
     data_loader = build_dataloader(args, device)
     vis_images, vis_targets = build_visualization_batch(args)

@@ -11,8 +11,8 @@ class RawOutputs:
     intermediate_ttt_q: torch.Tensor
     mask_embs: torch.Tensor         # [L, B, Nq, C]
     cls_preds: torch.Tensor         # [L, B, Nq, K]
-    sig_embs: torch.Tensor          # [L, B, Nq, S]
-    seed_logits: torch.Tensor       # [L, B, Nq]
-    seed_scores: torch.Tensor       # [L, B, Nq]
-    influence_preds: torch.Tensor   # [L, B, Nq]
     img_shape: Tuple[int, int]
+    sig_embs: Optional[torch.Tensor] = None        # [L, B, Nq, S]
+    seed_logits: Optional[torch.Tensor] = None     # [L, B, Nq]
+    seed_scores: Optional[torch.Tensor] = None     # [L, B, Nq]
+    influence_preds: Optional[torch.Tensor] = None # [L, B, Nq]

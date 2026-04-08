@@ -194,25 +194,24 @@ class TTTTransformerDecoder(nn.Module):
         return all_outputs, intermediate_ttt_q
 
 
-class CustomMask2Former(nn.Module):
+class Mask2FormerBase(nn.Module):
+    supports_gt_prototypes = False
+
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
 
         hidden_dim = cfg.backbone.hidden_dim
         num_classes = cfg.heads.num_classes
-        sig_dim = cfg.heads.sig_dim
         num_queries = cfg.decoder.num_queries
         num_layers = cfg.decoder.num_layers
 
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
         self.num_queries = num_queries
-        self.sig_dim = sig_dim
         self.num_layers = num_layers
 
         self.backbone = SimpleBackbone(hidden_dim=hidden_dim)
-
         self.queries = nn.Embedding(num_queries, hidden_dim)
 
         dlcfg = cfg.decoder_layer
@@ -242,36 +241,12 @@ class CustomMask2Former(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, num_classes),
         )
-        self.sig_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, sig_dim),
-        )
-        self.seed_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.influence_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
-
-        self.gt_cls_embed = nn.Embedding(num_classes, hidden_dim)
-        self.gt_query_proj = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
 
         spatial_tokens = cfg.spatial_hw * cfg.spatial_hw
         self.spatial_pos_embed = nn.Parameter(torch.randn(1, spatial_tokens, hidden_dim) * 0.02)
 
-        if cfg.learned_alpha:
-            self.alpha_focal = nn.Parameter(torch.tensor(cfg.alpha_focal, dtype=torch.float32))
-        else:
-            self.alpha_focal = cfg.alpha_focal
+    def _decoder_seed_head(self):
+        return None
 
     @contextlib.contextmanager
     def _temporary_ttt_steps(self, ttt_steps_override: Optional[int] = None):
@@ -304,22 +279,93 @@ class CustomMask2Former(nn.Module):
             q_dec_all, intermediate_ttt_q = self.transformer_decoder(
                 tgt=query_embed,
                 memory=memory,
-                seed_head=self.seed_head,
+                seed_head=self._decoder_seed_head(),
             )
         return q_dec_all, intermediate_ttt_q
+
+    def _run_heads(self, q):
+        mask_embs = self.mask_head(q)
+        cls_preds = self.cls_head(q)
+        return mask_embs, cls_preds, None, None, None, None
+
+    def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
+        H_img, W_img = images.shape[-2:]
+
+        features, memory = self._build_memory(images)
+        q_dec_all, intermediate_ttt_q = self._decode_queries(memory, ttt_steps_override=ttt_steps_override)
+
+        mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds = self._run_heads(q_dec_all)
+
+        return RawOutputs(
+            features=features,
+            memory=memory,
+            queries=q_dec_all,
+            intermediate_ttt_q=intermediate_ttt_q,
+            mask_embs=mask_embs,
+            cls_preds=cls_preds,
+            img_shape=(H_img, W_img),
+            sig_embs=sig_embs,
+            seed_logits=seed_logits,
+            seed_scores=seed_scores,
+            influence_preds=influence_preds,
+        )
+
+
+class CustomMask2Former(Mask2FormerBase):
+    supports_gt_prototypes = True
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__(cfg)
+
+        hidden_dim = cfg.backbone.hidden_dim
+        num_classes = cfg.heads.num_classes
+        sig_dim = cfg.heads.sig_dim
+
+        self.sig_dim = sig_dim
+
+        self.sig_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, sig_dim),
+        )
+        self.seed_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.influence_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        self.gt_cls_embed = nn.Embedding(num_classes, hidden_dim)
+        self.gt_query_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        if cfg.learned_alpha:
+            self.alpha_focal = nn.Parameter(torch.tensor(cfg.alpha_focal, dtype=torch.float32))
+        else:
+            self.alpha_focal = cfg.alpha_focal
+
+    def _decoder_seed_head(self):
+        return self.seed_head
 
     def encode_gts(self, memory, features, masks, labels, pad_mask, ttt_steps_override: Optional[int] = None):
         B_val, M_max = masks.shape[:2]
         _, C, Hf, Wf = features.shape
 
-        masks_small = F.interpolate(masks.float(), size=(Hf, Wf), mode='bilinear', align_corners=False)
+        masks_small = F.interpolate(masks.float(), size=(Hf, Wf), mode="bilinear", align_corners=False)
         denom = masks_small.flatten(2).sum(dim=2, keepdim=True).clamp_min(1e-6)
-        pooled_feat = torch.einsum('bmhw,bchw->bmc', masks_small, features) / denom
+        pooled_feat = torch.einsum("bmhw,bchw->bmc", masks_small, features) / denom
 
         cls_emb = self.gt_cls_embed(labels)
         query_init = self.gt_query_proj(torch.cat([pooled_feat, cls_emb], dim=-1))
 
-        attn_mask = (masks_small.flatten(2) < 0.5)
+        attn_mask = masks_small.flatten(2) < 0.5
         all_masked = attn_mask.all(dim=2, keepdim=True)
         attn_mask = attn_mask.masked_fill(all_masked, False)
         attn_mask_rep = attn_mask.repeat_interleave(4, dim=0)
@@ -345,24 +391,23 @@ class CustomMask2Former(nn.Module):
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
         return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds
 
-    def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
-        H_img, W_img = images.shape[-2:]
 
-        features, memory = self._build_memory(images)
-        q_dec_all, intermediate_ttt_q = self._decode_queries(memory, ttt_steps_override=ttt_steps_override)
+class StandardMask2Former(Mask2FormerBase):
+    def __init__(self, cfg: ModelConfig):
+        super().__init__(cfg)
+        self.transformer_decoder.use_attention_residuals = False
+        self.transformer_decoder.attn_residual_queries = None
+        self.transformer_decoder.attn_residual_key_scale = None
+        for layer in self.transformer_decoder.layers:
+            layer.ttt_steps = 0
+            layer.ttt_lr = None
+            layer.ttt_momentum = None
 
-        mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds = self._run_heads(q_dec_all)
 
-        return RawOutputs(
-            features=features,
-            memory=memory,
-            queries=q_dec_all,
-            intermediate_ttt_q=intermediate_ttt_q,
-            mask_embs=mask_embs,
-            cls_preds=cls_preds,
-            sig_embs=sig_embs,
-            seed_logits=seed_logits,
-            seed_scores=seed_scores,
-            influence_preds=influence_preds,
-            img_shape=(H_img, W_img),
-        )
+def build_model(cfg: ModelConfig) -> Mask2FormerBase:
+    variant = cfg.variant.lower()
+    if variant == "standard_mask2former":
+        return StandardMask2Former(cfg)
+    if variant == "clustered":
+        return CustomMask2Former(cfg)
+    raise ValueError(f"Unknown model variant: {cfg.variant}")

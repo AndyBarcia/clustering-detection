@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.data
 from scipy.optimize import linear_sum_assignment
 
 from .config import LossConfig
-from .model import CustomMask2Former
+from .model import CustomMask2Former, Mask2FormerBase
 from .outputs import RawOutputs
 
 
@@ -19,18 +18,6 @@ def assignment_weights_with_influence(
     if valid_mask is not None:
         affinity = affinity.masked_fill(~valid_mask.unsqueeze(1), 0.0)
     return affinity.pow(alpha)
-
-
-def sigmoid_focal_loss(inputs, targets, alpha=0.25, gamma=2.0):
-    """Optional: Focal loss is often better than BCE for extreme foreground/background imbalance"""
-    prob = torch.sigmoid(inputs)
-    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-    p_t = prob * targets + (1 - prob) * (1 - targets)
-    loss = ce_loss * ((1 - p_t) ** gamma)
-    if alpha >= 0:
-        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-        loss = alpha_t * loss
-    return loss.mean()
 
 
 def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
@@ -82,7 +69,77 @@ def hungarian_seed_assignment(
     return matched_query_mask, matched_gt_indices
 
 
-class PanopticCriterion(nn.Module):
+def dice_loss_from_logits(mask_logits: torch.Tensor, mask_targets: torch.Tensor, eps: float = 1e-6):
+    probs = torch.sigmoid(mask_logits).flatten(1)
+    targets = mask_targets.flatten(1)
+
+    intersection = 2.0 * (probs * targets).sum(dim=-1)
+    denominator = probs.sum(dim=-1) + targets.sum(dim=-1)
+    return 1.0 - (intersection + eps) / (denominator + eps)
+
+
+@torch.no_grad()
+def pairwise_mask_bce_cost(mask_logits: torch.Tensor, gt_masks: torch.Tensor):
+    num_queries = mask_logits.shape[0]
+    num_gt = gt_masks.shape[0]
+    if num_queries == 0 or num_gt == 0:
+        return mask_logits.new_zeros((num_queries, num_gt))
+
+    expanded_logits = mask_logits[:, None].expand(-1, num_gt, -1, -1)
+    expanded_targets = gt_masks[None].expand(num_queries, -1, -1, -1)
+    bce = F.binary_cross_entropy_with_logits(expanded_logits, expanded_targets, reduction="none")
+    return bce.flatten(2).mean(dim=-1)
+
+
+@torch.no_grad()
+def pairwise_mask_dice_cost(mask_logits: torch.Tensor, gt_masks: torch.Tensor, eps: float = 1e-6):
+    num_queries = mask_logits.shape[0]
+    num_gt = gt_masks.shape[0]
+    if num_queries == 0 or num_gt == 0:
+        return mask_logits.new_zeros((num_queries, num_gt))
+
+    probs = torch.sigmoid(mask_logits).flatten(1)
+    targets = gt_masks.flatten(1)
+
+    intersection = 2.0 * torch.einsum("qc,mc->qm", probs, targets)
+    denominator = probs.sum(dim=-1, keepdim=True) + targets.sum(dim=-1).unsqueeze(0)
+    return 1.0 - (intersection + eps) / (denominator + eps)
+
+
+@torch.no_grad()
+def hungarian_mask2former_assignment(
+    cls_logits: torch.Tensor,
+    mask_logits: torch.Tensor,
+    gt_labels: torch.Tensor,
+    gt_masks: torch.Tensor,
+    cfg: LossConfig,
+):
+    num_queries = cls_logits.shape[0]
+    num_gt = gt_labels.shape[0]
+    device = cls_logits.device
+
+    if num_queries == 0 or num_gt == 0:
+        empty = torch.empty((0,), dtype=torch.long, device=device)
+        return empty, empty
+
+    cls_prob = F.softmax(cls_logits, dim=-1)
+    class_cost = -cls_prob[:, gt_labels]
+    mask_cost = pairwise_mask_bce_cost(mask_logits, gt_masks)
+    dice_cost = pairwise_mask_dice_cost(mask_logits, gt_masks)
+
+    total_cost = (
+        cfg.matcher_cost_class * class_cost
+        + cfg.matcher_cost_mask_bce * mask_cost
+        + cfg.matcher_cost_mask_dice * dice_cost
+    )
+    row_ind, col_ind = linear_sum_assignment(total_cost.detach().cpu().numpy())
+    return (
+        torch.as_tensor(row_ind, device=device, dtype=torch.long),
+        torch.as_tensor(col_ind, device=device, dtype=torch.long),
+    )
+
+
+class ClusterPanopticCriterion(nn.Module):
     def __init__(self, cfg: LossConfig):
         super().__init__()
         self.cfg = cfg
@@ -93,13 +150,15 @@ class PanopticCriterion(nn.Module):
     def compute_loss(self, model: CustomMask2Former, raw: RawOutputs, targets):
         features = raw.features
         memory = raw.memory
-        queries = raw.queries
         mask_embs = raw.mask_embs
         cls_preds = raw.cls_preds
         sig_embs = raw.sig_embs
         seed_logits = raw.seed_logits
         influence_preds = raw.influence_preds
         H_img, W_img = raw.img_shape
+
+        if sig_embs is None or seed_logits is None or influence_preds is None:
+            raise ValueError("Clustered criterion requires signature, seed, and influence predictions.")
 
         B = features.shape[0]
 
@@ -158,14 +217,12 @@ class PanopticCriterion(nn.Module):
         matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_norm, gt_pad_mask)
 
         sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
-        sim_masked = sim.masked_fill(~gt_pad_mask.unsqueeze(1), -1.0)
-        weights_raw = assignment_weights_with_influence(
+        weights_flat = assignment_weights_with_influence(
             similarity=sim,
             influence=q_influence_flat,
             alpha=model.alpha_focal,
             valid_mask=gt_pad_mask,
         )
-        weights_flat = weights_raw
 
         loss_inter = features.sum() * 0.0
         if M_max > 1:
@@ -177,7 +234,6 @@ class PanopticCriterion(nn.Module):
             if off_diag_mask.any():
                 loss_inter = F.relu(gt_sim[off_diag_mask] - self.cfg.inter_margin).pow(2).mean()
 
-        # Normalize (B,Q,GT) along Q dimension.
         norm_w = weights_flat / (weights_flat.sum(dim=1, keepdim=True) + 1e-6)
 
         proto_mask_emb = torch.bmm(norm_w.transpose(1, 2), q_mask_emb_flat)
@@ -211,11 +267,11 @@ class PanopticCriterion(nn.Module):
         total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
 
         final_loss = (
-            loss_seed_sig +
-            loss_cls +
-            total_loss_mask +
-            self.cfg.w_seed * loss_seed +
-            self.cfg.w_inter * loss_inter
+            loss_seed_sig
+            + loss_cls
+            + total_loss_mask
+            + self.cfg.w_seed * loss_seed
+            + self.cfg.w_inter * loss_inter
         )
 
         components = {
@@ -230,3 +286,100 @@ class PanopticCriterion(nn.Module):
         }
 
         return final_loss, components
+
+
+class StandardMask2FormerCriterion(nn.Module):
+    def __init__(self, cfg: LossConfig):
+        super().__init__()
+        self.cfg = cfg
+
+    def forward(self, model: Mask2FormerBase, raw: RawOutputs, targets):
+        return self.compute_loss(model, raw, targets)
+
+    def compute_loss(self, model: Mask2FormerBase, raw: RawOutputs, targets):
+        del model
+
+        features = raw.features
+        H_img, W_img = raw.img_shape
+        q_mask_emb = raw.mask_embs[-1]
+        q_cls = raw.cls_preds[-1]
+
+        mask_logits = torch.einsum("bqc,bchw->bqhw", q_mask_emb, features)
+        mask_logits = F.interpolate(mask_logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+
+        num_classes = q_cls.shape[-1]
+        class_weights = torch.ones(num_classes, device=features.device, dtype=features.dtype)
+        class_weights[0] = self.cfg.no_object_weight
+
+        cls_losses = []
+        matched_mask_logits = []
+        matched_mask_targets = []
+
+        for b in range(features.shape[0]):
+            labels = targets[b]["labels"].to(features.device)
+            masks = targets[b]["masks"].to(features.device).float()
+            fg_keep = labels != 0
+            gt_labels = labels[fg_keep]
+            gt_masks = masks[fg_keep]
+
+            target_classes = torch.zeros(q_cls.shape[1], dtype=torch.long, device=features.device)
+
+            if gt_labels.numel() > 0:
+                matched_query_idx, matched_gt_idx = hungarian_mask2former_assignment(
+                    cls_logits=q_cls[b],
+                    mask_logits=mask_logits[b],
+                    gt_labels=gt_labels,
+                    gt_masks=gt_masks,
+                    cfg=self.cfg,
+                )
+                target_classes[matched_query_idx] = gt_labels[matched_gt_idx]
+
+                if matched_query_idx.numel() > 0:
+                    matched_mask_logits.append(mask_logits[b, matched_query_idx])
+                    matched_mask_targets.append(gt_masks[matched_gt_idx])
+
+            cls_losses.append(F.cross_entropy(q_cls[b], target_classes, weight=class_weights))
+
+        if cls_losses:
+            loss_cls = torch.stack(cls_losses).mean()
+        else:
+            loss_cls = features.sum() * 0.0
+
+        if matched_mask_logits:
+            matched_logits = torch.cat(matched_mask_logits, dim=0)
+            matched_targets = torch.cat(matched_mask_targets, dim=0)
+            loss_mask_bce = F.binary_cross_entropy_with_logits(matched_logits, matched_targets)
+            loss_mask_dice = dice_loss_from_logits(matched_logits, matched_targets).mean()
+        else:
+            loss_mask_bce = features.sum() * 0.0
+            loss_mask_dice = features.sum() * 0.0
+
+        total_loss_mask = self.cfg.w_mask_bce * loss_mask_bce + self.cfg.w_mask_dice * loss_mask_dice
+        final_loss = loss_cls + total_loss_mask
+        zero = features.sum() * 0.0
+
+        components = {
+            "loss_total": final_loss,
+            "loss_seed_sig": zero,
+            "loss_seed": zero,
+            "loss_cls": loss_cls,
+            "loss_mask_bce": loss_mask_bce,
+            "loss_mask_dice": loss_mask_dice,
+            "loss_mask_total": total_loss_mask,
+            "loss_inter": zero,
+        }
+        return final_loss, components
+
+
+class PanopticCriterion(nn.Module):
+    def __init__(self, cfg: LossConfig, model_variant: str = "clustered"):
+        super().__init__()
+        self.cfg = cfg
+        self.model_variant = model_variant.lower()
+        self.cluster_criterion = ClusterPanopticCriterion(cfg)
+        self.standard_criterion = StandardMask2FormerCriterion(cfg)
+
+    def forward(self, model: Mask2FormerBase, raw: RawOutputs, targets):
+        if self.model_variant == "standard_mask2former":
+            return self.standard_criterion(model, raw, targets)
+        return self.cluster_criterion(model, raw, targets)
