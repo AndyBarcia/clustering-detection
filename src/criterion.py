@@ -154,7 +154,14 @@ class PanopticCriterion(nn.Module):
         q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
 
-        gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
+        gt_sigs_norm = model.encode_gts(
+            memory_val,
+            features_val,
+            raw.memory_hw,
+            gt_masks_pad,
+            gt_labels_pad,
+            gt_pad_mask,
+        )
         matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_norm, gt_pad_mask)
 
         sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
@@ -188,7 +195,6 @@ class PanopticCriterion(nn.Module):
         loss_cls = F.cross_entropy(proto_cls_flat, gt_labels_flat)
 
         mask_logits = torch.einsum("bmc,bchw->bmhw", proto_mask_emb, features_val)
-        mask_logits = F.interpolate(mask_logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
         neg_inf = torch.finfo(mask_logits.dtype).min
         mask_logits_masked = mask_logits.masked_fill(~gt_pad_mask[:, :, None, None], neg_inf)
         gt_mask_target = gt_masks_pad.argmax(dim=1)

@@ -13,22 +13,52 @@ from .outputs import RawOutputs
 class SimpleBackbone(nn.Module):
     def __init__(self, hidden_dim=128):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1), 
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-            
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), 
+        )
+        self.down1 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            
-            nn.Conv2d(64, hidden_dim, kernel_size=3, stride=1, padding=1), 
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv2d(64, hidden_dim, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
+        )
+        self.mask_up1 = nn.Sequential(
+            nn.ConvTranspose2d(hidden_dim, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.mask_fuse1 = nn.Sequential(
+            nn.Conv2d(64 + 64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.mask_up2 = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        self.mask_fuse2 = nn.Sequential(
+            nn.Conv2d(32 + 32, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
         )
         
     def forward(self, x):
-        return self.net(x)
+        stem = self.stem(x)
+        mid = self.down1(stem)
+        memory_features = self.down2(mid)
+
+        mask_features = self.mask_up1(memory_features)
+        mask_features = self.mask_fuse1(torch.cat([mask_features, mid], dim=1))
+        mask_features = self.mask_up2(mask_features)
+        mask_features = self.mask_fuse2(torch.cat([mask_features, stem], dim=1))
+        return memory_features, mask_features
 
 
 
@@ -289,11 +319,18 @@ class CustomMask2Former(nn.Module):
                 layer.ttt_steps = previous
 
     def _build_memory(self, images):
-        features = self.backbone(images)
-        B, C, H_f, W_f = features.shape
-        memory = features.view(B, C, -1).permute(0, 2, 1)
-        memory = memory + self.spatial_pos_embed[:, :memory.shape[1], :]
-        return features, memory
+        memory_features, mask_features = self.backbone(images)
+        B, C, H_f, W_f = memory_features.shape
+        memory = memory_features.view(B, C, -1).permute(0, 2, 1)
+
+        pos_embed = self.spatial_pos_embed.transpose(1, 2).reshape(
+            1, self.hidden_dim, self.cfg.spatial_hw, self.cfg.spatial_hw
+        )
+        if pos_embed.shape[-2:] != (H_f, W_f):
+            pos_embed = F.interpolate(pos_embed, size=(H_f, W_f), mode="bilinear", align_corners=False)
+        pos_embed = pos_embed.flatten(2).transpose(1, 2)
+        memory = memory + pos_embed
+        return mask_features, memory, (H_f, W_f)
 
     def _decode_queries(self, memory, query_embed=None, ttt_steps_override: Optional[int] = None):
         B = memory.shape[0]
@@ -308,18 +345,25 @@ class CustomMask2Former(nn.Module):
             )
         return q_dec_all, intermediate_ttt_q
 
-    def encode_gts(self, memory, features, masks, labels, pad_mask, ttt_steps_override: Optional[int] = None):
-        B_val, M_max = masks.shape[:2]
-        _, C, Hf, Wf = features.shape
+    def encode_gts(self, memory, mask_features, memory_hw, masks, labels, pad_mask, ttt_steps_override: Optional[int] = None):
+        Hm, Wm = memory_hw
 
-        masks_small = F.interpolate(masks.float(), size=(Hf, Wf), mode='bilinear', align_corners=False)
-        denom = masks_small.flatten(2).sum(dim=2, keepdim=True).clamp_min(1e-6)
-        pooled_feat = torch.einsum('bmhw,bchw->bmc', masks_small, features) / denom
+        masks = masks.float()
+        denom = masks.flatten(2).sum(dim=2, keepdim=True).clamp_min(1e-6)
+        pooled_feat = torch.einsum('bmhw,bchw->bmc', masks, mask_features) / denom
 
         cls_emb = self.gt_cls_embed(labels)
         query_init = self.gt_query_proj(torch.cat([pooled_feat, cls_emb], dim=-1))
 
-        attn_mask = (masks_small.flatten(2) < 0.5)
+        if masks.shape[-2:] == (Hm, Wm):
+            masks_memory = masks
+        elif masks.shape[-2] % Hm == 0 and masks.shape[-1] % Wm == 0:
+            kernel = (masks.shape[-2] // Hm, masks.shape[-1] // Wm)
+            masks_memory = F.avg_pool2d(masks, kernel_size=kernel, stride=kernel)
+        else:
+            masks_memory = F.adaptive_avg_pool2d(masks, output_size=(Hm, Wm))
+
+        attn_mask = (masks_memory.flatten(2) < 0.5)
         all_masked = attn_mask.all(dim=2, keepdim=True)
         attn_mask = attn_mask.masked_fill(all_masked, False)
         attn_mask_rep = attn_mask.repeat_interleave(4, dim=0)
@@ -348,7 +392,7 @@ class CustomMask2Former(nn.Module):
     def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
 
-        features, memory = self._build_memory(images)
+        features, memory, memory_hw = self._build_memory(images)
         q_dec_all, intermediate_ttt_q = self._decode_queries(memory, ttt_steps_override=ttt_steps_override)
 
         mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds = self._run_heads(q_dec_all)
@@ -364,5 +408,6 @@ class CustomMask2Former(nn.Module):
             seed_logits=seed_logits,
             seed_scores=seed_scores,
             influence_preds=influence_preds,
+            memory_hw=memory_hw,
             img_shape=(H_img, W_img),
         )

@@ -322,12 +322,6 @@ def _single_query_preview(
     q_seed = flat.get("q_seed", None)
 
     mask_logits = torch.einsum("c,chw->hw", q_mask_emb, features)
-    mask_logits = F.interpolate(
-        mask_logits.unsqueeze(0).unsqueeze(0),
-        size=(flat["H_img"], flat["W_img"]),
-        mode="bilinear",
-        align_corners=False,
-    )[0, 0]
 
     mask = mask_logits > 0.0
     if not bool(mask.any()):

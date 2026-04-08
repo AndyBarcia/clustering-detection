@@ -5,7 +5,7 @@ import torch
 
 @dataclass
 class RawOutputs:
-    features: torch.Tensor          # [B, C, Hf, Wf]
+    features: torch.Tensor          # [B, C, H, W]
     memory: torch.Tensor            # [B, HW, C]
     queries: torch.Tensor           # [L, B, Nq, C]
     intermediate_ttt_q: torch.Tensor
@@ -15,4 +15,5 @@ class RawOutputs:
     seed_logits: torch.Tensor       # [L, B, Nq]
     seed_scores: torch.Tensor       # [L, B, Nq]
     influence_preds: torch.Tensor   # [L, B, Nq]
+    memory_hw: Tuple[int, int]
     img_shape: Tuple[int, int]

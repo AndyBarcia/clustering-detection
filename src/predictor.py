@@ -532,6 +532,7 @@ class ModularPrototypePredictor:
         gt_sig = model.encode_gts(
             raw.memory[b:b + 1],
             raw.features[b:b + 1],
+            raw.memory_hw,
             gt_masks,
             gt_labels,
             gt_pad_mask,
@@ -570,8 +571,6 @@ class ModularPrototypePredictor:
     def _decode_and_resolve(self, flat: Dict[str, torch.Tensor], proto_state: Dict[str, Any]):
         cfg = self.cfg.overlap
         features = flat["features"]
-        H_img, W_img = flat["H_img"], flat["W_img"]
-
         proto_mask_emb = proto_state["proto_mask_emb"]
         proto_cls = proto_state["proto_cls"]
         proto_sig = proto_state["proto_sig"]
@@ -589,20 +588,14 @@ class ModularPrototypePredictor:
                 "proto_cls_prob": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
                 "proto_mask_emb": torch.empty((0, flat["q_mask_emb"].shape[-1]), device=flat["q_sig"].device),
                 "proto_score": torch.empty((0,), device=flat["q_sig"].device),
-                "raw_mask_logits": torch.empty((0, H_img, W_img), device=flat["q_sig"].device),
-                "raw_mask_probs": torch.empty((0, H_img, W_img), device=flat["q_sig"].device),
+                "raw_mask_logits": torch.empty((0, *flat["features"].shape[-2:]), device=flat["q_sig"].device),
+                "raw_mask_probs": torch.empty((0, *flat["features"].shape[-2:]), device=flat["q_sig"].device),
                 "resolved_masks": [],
                 "resolved_labels": [],
                 "resolved_scores": [],
             }
 
         mask_logits = torch.einsum("pc,chw->phw", proto_mask_emb, features)
-        mask_logits = F.interpolate(
-            mask_logits.unsqueeze(0),
-            size=(H_img, W_img),
-            mode="bilinear",
-            align_corners=False,
-        )[0]
         mask_probs = F.softmax(mask_logits, dim=0)
 
         cls_prob = F.softmax(proto_cls, dim=-1)
@@ -639,8 +632,8 @@ class ModularPrototypePredictor:
                 "proto_cls_prob": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
                 "proto_mask_emb": torch.empty((0, flat["q_mask_emb"].shape[-1]), device=flat["q_sig"].device),
                 "proto_score": torch.empty((0,), device=flat["q_sig"].device),
-                "raw_mask_logits": torch.empty((0, H_img, W_img), device=flat["q_sig"].device),
-                "raw_mask_probs": torch.empty((0, H_img, W_img), device=flat["q_sig"].device),
+                "raw_mask_logits": torch.empty((0, *flat["features"].shape[-2:]), device=flat["q_sig"].device),
+                "raw_mask_probs": torch.empty((0, *flat["features"].shape[-2:]), device=flat["q_sig"].device),
                 "resolved_masks": [],
                 "resolved_labels": [],
                 "resolved_scores": [],
