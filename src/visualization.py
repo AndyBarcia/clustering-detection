@@ -713,6 +713,23 @@ def _draw_instances(
     return instances
 
 
+def _draw_uncertainty_map(ax, prediction: dict, *, title: str = "Uncertainty"):
+    raw_mask_probs = prediction.get("raw_mask_probs")
+    if raw_mask_probs is None or raw_mask_probs.numel() == 0:
+        uncertainty = np.zeros((1, 1), dtype=np.float32)
+    else:
+        probs = raw_mask_probs.detach().float().cpu().clamp_min(1e-8)
+        entropy = -(probs * probs.log()).sum(dim=0)
+        max_entropy = float(np.log(max(probs.shape[0], 1)))
+        if max_entropy > 0.0:
+            entropy = entropy / max_entropy
+        uncertainty = entropy.numpy()
+
+    ax.imshow(uncertainty, cmap="magma", vmin=0.0, vmax=1.0)
+    ax.set_title(title)
+    ax.axis("off")
+
+
 @torch.no_grad()
 def run_predictions(
     system: PanopticSystem,
@@ -779,7 +796,7 @@ def render_prediction_grid(
 ):
     num_samples = len(images)
     add_signature_column = any("GT Prototype" in title for title, _ in prediction_columns)
-    num_cols = 2 + len(prediction_columns) + int(add_signature_column)
+    num_cols = 1 + (2 * len(prediction_columns)) + int(add_signature_column)
     fig, axes = plt.subplots(num_samples, num_cols, figsize=(5 * num_cols, 5 * max(num_samples, 1)), squeeze=False)
     row_states: List[_RowInteractionState] = []
 
@@ -790,16 +807,13 @@ def render_prediction_grid(
         image_np = _to_numpy_image(image)
         row_state = _RowInteractionState(gt_masks=[])
         row_states.append(row_state)
-        axes[row_idx, 0].imshow(image_np)
-        axes[row_idx, 0].set_title("Input")
-        axes[row_idx, 0].axis("off")
 
         gt_masks = [mask.detach().cpu().numpy() for mask in target["masks"]]
         gt_labels = [int(label) for label in target["labels"].detach().cpu().tolist()]
         gt_masks, gt_labels, _ = _filter_background_instances(gt_masks, gt_labels)
         row_state.gt_masks = gt_masks
         gt_instances = _draw_instances(
-            axes[row_idx, 1],
+            axes[row_idx, 0],
             image_np,
             gt_masks,
             gt_labels,
@@ -808,11 +822,19 @@ def render_prediction_grid(
             gt_masks=gt_masks,
             kind="gt",
         )
-        row_state.axis_instances[axes[row_idx, 1]] = gt_instances
-
-        next_col_idx = 2
+        row_state.axis_instances[axes[row_idx, 0]] = gt_instances
+        next_col_idx = 1
         for column_title, predictions in prediction_columns:
             prediction = predictions[row_idx]
+            uncertainty_axis = axes[row_idx, next_col_idx]
+            uncertainty_title = column_title.replace("Prediction", "Uncertainty")
+            _draw_uncertainty_map(
+                uncertainty_axis,
+                prediction,
+                title=uncertainty_title,
+            )
+            next_col_idx += 1
+
             pred_masks = [mask.detach().cpu().numpy() for mask in prediction["resolved_masks"]]
             pred_labels = [int(label) for label in prediction["resolved_labels"]]
             pred_scores = [float(score) for score in prediction["resolved_scores"]]
