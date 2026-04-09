@@ -1,39 +1,12 @@
 from typing import Dict, Any
-import numpy as np
 import torch
 import torch.nn.functional as F
-
-# Optional clustering backends
-try:
-    from sklearn.cluster import DBSCAN
-except ImportError:
-    DBSCAN = None
-
-try:
-    import hdbscan as _hdbscan
-except ImportError:
-    _hdbscan = None
-
-try:
-    import networkx as nx
-except ImportError:
-    nx = None
-
-try:
-    import igraph as ig
-    import leidenalg
-except ImportError:
-    ig = None
-    leidenalg = None
 
 
 from .model import CustomMask2Former, Mask2FormerBase
 from .config import PrototypeInferenceConfig
 from .outputs import RawOutputs
-
-
-def _safe_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    return x / x.norm(dim=dim, keepdim=True).clamp_min(eps)
+from .query_graph import compute_local_maximum_margin
 
 
 def _alpha_value(alpha_obj) -> float:
@@ -47,49 +20,6 @@ def _assignment_affinity(similarity: torch.Tensor, influence: torch.Tensor, simi
     if similarity_floor > 0.0:
         affinity = affinity.clamp_min(similarity_floor)
     return affinity
-
-
-def _cosine_affinity_np(x: np.ndarray) -> np.ndarray:
-    return np.clip(x @ x.T, 0.0, 1.0)
-
-
-def _cosine_distance_np(x: np.ndarray) -> np.ndarray:
-    dist = 1.0 - np.clip(x @ x.T, -1.0, 1.0)
-    return np.ascontiguousarray(dist, dtype=np.float64)
-
-
-def _connected_components_labels(affinity: np.ndarray, threshold: float) -> np.ndarray:
-    n = affinity.shape[0]
-    adj = affinity >= threshold
-    labels = -np.ones(n, dtype=np.int64)
-    cid = 0
-
-    for i in range(n):
-        if labels[i] != -1:
-            continue
-        stack = [i]
-        labels[i] = cid
-        while stack:
-            u = stack.pop()
-            nbrs = np.where(adj[u])[0]
-            for v in nbrs:
-                if labels[v] == -1:
-                    labels[v] = cid
-                    stack.append(v)
-        cid += 1
-    return labels
-
-
-def _build_weighted_graph_edges(affinity: np.ndarray, min_edge_weight: float):
-    n = affinity.shape[0]
-    edges, weights = [], []
-    for i in range(n):
-        for j in range(i + 1, n):
-            w = float(affinity[i, j])
-            if w >= min_edge_weight:
-                edges.append((i, j))
-                weights.append(w)
-    return edges, weights
 
 
 def _binary_dilate(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
@@ -181,6 +111,11 @@ class ModularPrototypePredictor:
         bg_conf = q_cls_prob[:, 0]
         fg_conf = 1.0 - q_cls_prob[:, 0]
         partition_conf = torch.where(pred_cls == 0, bg_conf, fg_conf)
+        q_seed_margin, q_seed_excluded, q_seed_graph = compute_local_maximum_margin(
+            q_sig=q_sig,
+            seed_values=q_seed,
+            min_similarity=0.0,
+        )
 
         return {
             "features": features,
@@ -193,6 +128,9 @@ class ModularPrototypePredictor:
             "q_cls_prob": q_cls_prob,
             "q_sig": q_sig,
             "q_seed": q_seed,
+            "q_seed_excluded": q_seed_excluded,
+            "q_seed_margin": q_seed_margin,
+            "q_seed_graph": q_seed_graph,
             "q_influence": q_influence,
             "bg_conf": bg_conf,
             "fg_conf": fg_conf,
@@ -200,9 +138,9 @@ class ModularPrototypePredictor:
             "pred_cls": pred_cls,
         }
 
-    def _select_seeds(self, flat: Dict[str, torch.Tensor]):
+    def _select_local_maxima(self, flat: Dict[str, torch.Tensor]):
         cfg = self.cfg.seed
-        score = flat["q_seed"].clone()
+        score = flat["q_seed_margin"].clone()
 
         if cfg.use_foreground_in_score:
             score = score * flat["partition_conf"].pow(cfg.foreground_score_power)
@@ -219,156 +157,31 @@ class ModularPrototypePredictor:
             eligible &= (flat["q_influence"] <= cfg.max_influence)
 
         keep = eligible.clone()
-        keep &= (flat["q_seed"] >= cfg.quality_threshold)
+        keep &= (flat["q_seed_margin"] >= cfg.local_max_margin_threshold)
+        keep &= (score >= cfg.quality_threshold)
 
-        seed_idx = torch.where(keep)[0]
+        proto_idx = torch.where(keep)[0]
 
-        if seed_idx.numel() < cfg.min_num_seeds:
+        if proto_idx.numel() < cfg.min_num_seeds:
             fallback_idx = torch.where(eligible)[0]
 
             if fallback_idx.numel() > 0:
                 k = min(cfg.min_num_seeds, fallback_idx.numel())
                 top_local = torch.topk(score[fallback_idx], k=k).indices
-                seed_idx = fallback_idx[top_local]
+                proto_idx = fallback_idx[top_local]
 
-        if cfg.topk is not None and seed_idx.numel() > cfg.topk:
-            top_local = torch.topk(score[seed_idx], k=cfg.topk).indices
-            seed_idx = seed_idx[top_local]
+        if cfg.topk is not None and proto_idx.numel() > cfg.topk:
+            top_local = torch.topk(score[proto_idx], k=cfg.topk).indices
+            proto_idx = proto_idx[top_local]
 
-        seed_scores = score[seed_idx]
-        return seed_idx, seed_scores
+        proto_scores = score[proto_idx]
+        return proto_idx, proto_scores
 
-    def _cluster_local(self, seed_sigs_np: np.ndarray, seed_scores_np: np.ndarray) -> np.ndarray:
-        cfg = self.cfg.cluster
-        method = cfg.method.lower()
-
-        if len(seed_sigs_np) == 0:
-            return np.empty((0,), dtype=np.int64)
-
-        if len(seed_sigs_np) == 1:
-            return np.array([0], dtype=np.int64)
-
-        if method == "dbscan":
-            if DBSCAN is None:
-                raise ImportError("scikit-learn is not installed. pip install scikit-learn")
-            clusterer = DBSCAN(
-                eps=cfg.dbscan_eps,
-                min_samples=cfg.dbscan_min_samples,
-                metric="cosine",
-            )
-            if cfg.dbscan_use_sample_weight:
-                clusterer.fit(seed_sigs_np, sample_weight=seed_scores_np)
-            else:
-                clusterer.fit(seed_sigs_np)
-            return clusterer.labels_.astype(np.int64)
-
-        if method == "hdbscan":
-            if _hdbscan is None:
-                raise ImportError("hdbscan is not installed. pip install hdbscan")
-            dist = _cosine_distance_np(seed_sigs_np)
-            clusterer = _hdbscan.HDBSCAN(
-                metric="precomputed",
-                min_cluster_size=cfg.hdbscan_min_cluster_size,
-                min_samples=cfg.hdbscan_min_samples,
-                cluster_selection_epsilon=cfg.hdbscan_cluster_selection_epsilon,
-            )
-            return clusterer.fit_predict(dist).astype(np.int64)
-
-        affinity = _cosine_affinity_np(seed_sigs_np)
-
-        if method == "cc":
-            return _connected_components_labels(affinity, cfg.graph_affinity_threshold)
-
-        if method == "louvain":
-            if nx is None:
-                raise ImportError("networkx is required for Louvain clustering")
-            if not hasattr(nx.algorithms.community, "louvain_communities"):
-                raise ImportError("This version of networkx does not expose louvain_communities")
-            G = nx.Graph()
-            n = len(seed_sigs_np)
-            G.add_nodes_from(range(n))
-            edges, weights = _build_weighted_graph_edges(affinity, cfg.graph_min_edge_weight)
-            for (u, v), w in zip(edges, weights):
-                G.add_edge(u, v, weight=w)
-            if G.number_of_edges() == 0:
-                return np.arange(n, dtype=np.int64)
-            comms = nx.algorithms.community.louvain_communities(
-                G,
-                weight="weight",
-                resolution=cfg.louvain_resolution,
-                seed=cfg.random_seed,
-            )
-            labels = -np.ones(n, dtype=np.int64)
-            for cid, comm in enumerate(comms):
-                for node in comm:
-                    labels[node] = cid
-            return labels
-
-        if method == "leiden":
-            if ig is None or leidenalg is None:
-                raise ImportError("igraph + leidenalg are required for Leiden clustering")
-            n = len(seed_sigs_np)
-            edges, weights = _build_weighted_graph_edges(affinity, cfg.graph_min_edge_weight)
-            if len(edges) == 0:
-                return np.arange(n, dtype=np.int64)
-            g = ig.Graph(n=n, edges=edges, directed=False)
-            partition = leidenalg.find_partition(
-                g,
-                leidenalg.RBConfigurationVertexPartition,
-                weights=weights,
-                resolution_parameter=cfg.leiden_resolution,
-                seed=cfg.random_seed,
-            )
-            return np.asarray(partition.membership, dtype=np.int64)
-
-        raise ValueError(f"Unknown clustering method: {cfg.method}")
-
-    def _cluster_seeds(self, flat: Dict[str, torch.Tensor], seed_idx: torch.Tensor, seed_scores: torch.Tensor):
-        cfg = self.cfg.cluster
-        device = seed_idx.device
-
-        if seed_idx.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=device)
-
-        seed_labels = -torch.ones(seed_idx.numel(), dtype=torch.long, device=device)
-        next_cluster_id = 0
-
-        if cfg.cluster_per_class:
-            seed_classes = flat["pred_cls"][seed_idx]
-            unique_classes = seed_classes.unique().tolist()
-            groups = [torch.where(seed_classes == c)[0] for c in unique_classes]
-        else:
-            groups = [torch.arange(seed_idx.numel(), device=device)]
-
-        for pos_group in groups:
-            local_seed_idx = seed_idx[pos_group]
-            local_scores = seed_scores[pos_group]
-
-            local_sigs_np = flat["q_sig"][local_seed_idx].detach().cpu().numpy()
-            local_scores_np = local_scores.detach().cpu().numpy()
-
-            local_labels_np = self._cluster_local(local_sigs_np, local_scores_np)
-            local_labels = torch.as_tensor(local_labels_np, device=device)
-
-            good_ids = [int(x) for x in np.unique(local_labels_np) if x != -1]
-            for old_id in good_ids:
-                m = (local_labels == old_id)
-                seed_labels[pos_group[m]] = next_cluster_id
-                next_cluster_id += 1
-
-            if cfg.promote_noise_to_singletons:
-                noise_pos = pos_group[local_labels == -1]
-                for p in noise_pos:
-                    seed_labels[p] = next_cluster_id
-                    next_cluster_id += 1
-
-        return seed_labels
-
-    def _initialize_prototypes(self, flat: Dict[str, torch.Tensor], seed_idx: torch.Tensor, cluster_labels: torch.Tensor):
+    def _initialize_prototypes(self, flat: Dict[str, torch.Tensor], proto_idx: torch.Tensor):
         device = flat["q_sig"].device
-        valid = (cluster_labels >= 0)
+        num_prototypes = proto_idx.numel()
 
-        if valid.sum() == 0:
+        if num_prototypes == 0:
             return {
                 "num_prototypes": 0,
                 "proto_sig": torch.empty((0, flat["q_sig"].shape[-1]), device=device),
@@ -376,45 +189,19 @@ class ModularPrototypePredictor:
                 "proto_mask_emb": torch.empty((0, flat["q_mask_emb"].shape[-1]), device=device),
                 "cluster_members": [],
                 "proto_seed_idx": torch.empty((0,), dtype=torch.long, device=device),
-                "seed_idx": seed_idx,
-                "seed_cluster_labels": cluster_labels,
+                "seed_idx": proto_idx,
+                "seed_cluster_labels": torch.empty((0,), dtype=torch.long, device=device),
             }
 
-        cluster_ids = cluster_labels[valid].unique().tolist()
-
-        proto_sig = []
-        proto_cls = []
-        proto_mask_emb = []
-        cluster_members = []
-        proto_seed_idx = []
-
-        for cid in cluster_ids:
-            member_seed_idx = seed_idx[cluster_labels == cid]
-            cluster_members.append(member_seed_idx)
-
-            rep_local = torch.argmax(flat["q_seed"][member_seed_idx])
-            rep_seed_idx = member_seed_idx[rep_local]
-            proto_seed_idx.append(rep_seed_idx)
-
-            w = flat["q_seed"][member_seed_idx]
-            w = w / (w.sum() + 1e-6)
-
-            p_cls = (flat["q_cls"][member_seed_idx] * w.unsqueeze(1)).sum(dim=0)
-            p_mask = (flat["q_mask_emb"][member_seed_idx] * w.unsqueeze(1)).sum(dim=0)
-
-            proto_sig.append(flat["q_sig"][rep_seed_idx])
-            proto_cls.append(p_cls)
-            proto_mask_emb.append(p_mask)
-
         return {
-            "num_prototypes": len(cluster_ids),
-            "proto_sig": torch.stack(proto_sig, dim=0),
-            "proto_cls": torch.stack(proto_cls, dim=0),
-            "proto_mask_emb": torch.stack(proto_mask_emb, dim=0),
-            "cluster_members": cluster_members,
-            "proto_seed_idx": torch.stack(proto_seed_idx, dim=0),
-            "seed_idx": seed_idx,
-            "seed_cluster_labels": cluster_labels,
+            "num_prototypes": num_prototypes,
+            "proto_sig": flat["q_sig"][proto_idx],
+            "proto_cls": flat["q_cls"][proto_idx],
+            "proto_mask_emb": flat["q_mask_emb"][proto_idx],
+            "cluster_members": [proto_idx[i:i + 1] for i in range(num_prototypes)],
+            "proto_seed_idx": proto_idx,
+            "seed_idx": proto_idx,
+            "seed_cluster_labels": torch.arange(num_prototypes, dtype=torch.long, device=device),
         }
 
     def _soft_refine_prototypes(self, model: CustomMask2Former, flat: Dict[str, torch.Tensor], proto_state: Dict[str, Any]):
@@ -699,9 +486,8 @@ class ModularPrototypePredictor:
 
     def _predict_single(self, model: CustomMask2Former, raw: RawOutputs, b: int):
         flat = self._flatten_outputs(raw, b)
-        seed_idx, seed_scores = self._select_seeds(flat)
-        cluster_labels = self._cluster_seeds(flat, seed_idx, seed_scores)
-        proto_state = self._initialize_prototypes(flat, seed_idx, cluster_labels)
+        proto_idx, _ = self._select_local_maxima(flat)
+        proto_state = self._initialize_prototypes(flat, proto_idx)
         proto_state = self._soft_refine_prototypes(model, flat, proto_state)
         pred = self._decode_and_resolve(flat, proto_state)
         pred["flat"] = flat

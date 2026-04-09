@@ -76,6 +76,7 @@ from src.panoptic import load_system_checkpoint
 DEFAULT_SEARCH_SPACE = {
     "ttt_steps": {"type": "int", "low": 0, "high": 20},
     "seed.quality_threshold": {"type": "float", "low": 0.03, "high": 0.2},
+    "seed.local_max_margin_threshold": {"type": "float", "low": 0.0, "high": 0.2},
     "seed.topk": {"type": "categorical", "choices": [None, 10, 20, 40]},
     "seed.min_num_seeds": {"type": "int", "low": 1, "high": 4},
     "seed.exclude_background": {"type": "categorical", "choices": [True, False]},
@@ -83,20 +84,6 @@ DEFAULT_SEARCH_SPACE = {
     "seed.max_influence": {"type": "categorical", "choices": [None, 0.2, 0.4, 0.6, 0.8]},
     "seed.use_foreground_in_score": {"type": "categorical", "choices": [False, True]},
     "seed.foreground_score_power": {"type": "float", "low": 0.5, "high": 2.0},
-    #"cluster.method": {"type": "categorical", "choices": ["dbscan", "hdbscan", "cc", "louvain", "leiden"]},
-    #"cluster.method": {"type": "categorical", "choices": ["cc"]},
-    "cluster.cluster_per_class": {"type": "categorical", "choices": [True, False]},
-    "cluster.promote_noise_to_singletons": {"type": "categorical", "choices": [True, False]},
-    "cluster.dbscan_eps": {"type": "float", "low": 0.05, "high": 0.3},
-    "cluster.dbscan_min_samples": {"type": "int", "low": 1, "high": 4},
-    "cluster.dbscan_use_sample_weight": {"type": "categorical", "choices": [True, False]},
-    "cluster.hdbscan_min_cluster_size": {"type": "int", "low": 2, "high": 8},
-    "cluster.hdbscan_min_samples": {"type": "int", "low": 1, "high": 8},
-    "cluster.hdbscan_cluster_selection_epsilon": {"type": "float", "low": 0.0, "high": 0.2},
-    "cluster.graph_affinity_threshold": {"type": "float", "low": 0.5, "high": 0.9},
-    # "cluster.graph_min_edge_weight": {"type": "float", "low": 0.001, "high": 0.1, "log": True},
-    # "cluster.louvain_resolution": {"type": "float", "low": 0.25, "high": 2.0},
-    # "cluster.leiden_resolution": {"type": "float", "low": 0.25, "high": 2.0},
     "assign.use_all_queries": {"type": "categorical", "choices": [True, False]},
     "assign.use_alpha_focal": {"type": "categorical", "choices": [True, False]},
     "assign.similarity_floor": {"type": "float", "low": 0.0, "high": 0.3},
@@ -127,12 +114,6 @@ BEST_KNOWN_PARAMS = {
     "assign.use_all_queries": True,
     "assign.use_query_quality": False,
     "assign.query_quality_power": 1.2,
-    "cluster.graph_affinity_threshold": 0.76,
-    "cluster.cluster_per_class": False,
-    "cluster.dbscan_min_samples": 1,
-    "cluster.dbscan_use_sample_weight": True,
-    "cluster.method": "cc",
-    "cluster.promote_noise_to_singletons": True,
     "overlap.assignment_strength_power": 0.55,
     "overlap.mask_threshold": 0.51,
     "overlap.min_area": 18,
@@ -144,6 +125,7 @@ BEST_KNOWN_PARAMS = {
     "overlap.use_foreground_confidence": False,
     "seed.exclude_background": True,
     "seed.foreground_score_power": 1.74,
+    "seed.local_max_margin_threshold": 0.0,
     "seed.max_influence": 0.4,
     "seed.min_num_seeds": 1,
     "seed.min_foreground_prob": 0.22,
@@ -355,25 +337,7 @@ def suggest_value(trial: optuna.Trial, name: str, spec: Dict[str, Any]):
 def sample_params(trial: optuna.Trial, search_space: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     params: Dict[str, Any] = {}
 
-    if "cluster.method" in search_space:
-        params["cluster.method"] = suggest_value(trial, "cluster.method", search_space["cluster.method"])
-
     for path, spec in search_space.items():
-        if path == "cluster.method":
-            continue
-        method = params.get("cluster.method")
-        if path.startswith("cluster.dbscan_") and method != "dbscan":
-            continue
-        if path.startswith("cluster.hdbscan_") and method != "hdbscan":
-            continue
-        if path == "cluster.graph_affinity_threshold" and method not in {"cc"}:
-            continue
-        if path == "cluster.graph_min_edge_weight" and method not in {"louvain", "leiden"}:
-            continue
-        if path.startswith("cluster.louvain_") and method != "louvain":
-            continue
-        if path.startswith("cluster.leiden_") and method != "leiden":
-            continue
         params[path] = suggest_value(trial, path, spec)
 
     return params

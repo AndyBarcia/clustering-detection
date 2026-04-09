@@ -6,6 +6,7 @@ from scipy.optimize import linear_sum_assignment
 from .config import LossConfig
 from .model import CustomMask2Former, Mask2FormerBase
 from .outputs import RawOutputs
+from .query_graph import compute_local_maximum_margin
 
 
 def assignment_weights_with_influence(
@@ -203,6 +204,7 @@ class ClusterPanopticCriterion(nn.Module):
         q_mask_emb = mask_embs[:, valid_b]
         q_cls = cls_preds[:, valid_b]
         q_seed_logits = seed_logits[:, valid_b]
+        q_seed_scores = raw.seed_scores[:, valid_b]
         q_influence = influence_preds[:, valid_b]
 
         L, _, N_q, S = q_sig.shape
@@ -211,6 +213,7 @@ class ClusterPanopticCriterion(nn.Module):
         q_mask_emb_flat = q_mask_emb.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
+        q_seed_scores_flat = q_seed_scores.transpose(0, 1).reshape(B_val, L * N_q)
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
 
         gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
@@ -252,8 +255,18 @@ class ClusterPanopticCriterion(nn.Module):
         loss_mask_ce = F.cross_entropy(mask_logits_masked, gt_mask_target)
         loss_mask_iou = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
 
+        local_max_logits, _, _ = compute_local_maximum_margin(
+            q_sig=q_sig_flat,
+            seed_values=q_seed_logits_flat,
+            min_similarity=0.0,
+        )
+        local_max_scores, _, _ = compute_local_maximum_margin(
+            q_sig=q_sig_flat,
+            seed_values=q_seed_scores_flat,
+            min_similarity=0.0,
+        )
         seed_targets = matched_query_mask.float()
-        loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
+        loss_seed = F.binary_cross_entropy_with_logits(local_max_logits, seed_targets)
 
         loss_seed_sig = features.sum() * 0.0
         matched_pos = matched_query_mask.nonzero(as_tuple=False)
@@ -278,6 +291,7 @@ class ClusterPanopticCriterion(nn.Module):
             "loss_total": final_loss,
             "loss_seed_sig": loss_seed_sig,
             "loss_seed": loss_seed,
+            "seed_margin_mean": local_max_scores.mean().detach(),
             "loss_cls": loss_cls,
             "loss_mask_ce": loss_mask_ce,
             "loss_mask_iou": loss_mask_iou,

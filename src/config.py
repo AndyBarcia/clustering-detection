@@ -68,8 +68,9 @@ class LossConfig:
 
 @dataclass
 class SeedFilterConfig:
-    # Threshold on predicted seedness used to decide which queries can start clusters.
+    # Threshold on the local-maximum margin used to decide which queries can start objects.
     quality_threshold: float = 0.07
+    local_max_margin_threshold: float = 0.0
     topk: Optional[int] = None
     min_num_seeds: int = 1
     exclude_background: bool = False
@@ -77,32 +78,6 @@ class SeedFilterConfig:
     max_influence: Optional[float] = 0.4
     use_foreground_in_score: bool = True
     foreground_score_power: float = 1.74
-
-
-@dataclass
-class ClusterConfig:
-    method: str = "cc"   # ["dbscan", "hdbscan", "cc", "louvain", "leiden"]
-    cluster_per_class: bool = False
-    promote_noise_to_singletons: bool = True
-
-    # DBSCAN
-    dbscan_eps: float = 0.15
-    dbscan_min_samples: int = 1
-    dbscan_use_sample_weight: bool = True
-
-    # HDBSCAN
-    hdbscan_min_cluster_size: int = 2
-    hdbscan_min_samples: Optional[int] = None
-    hdbscan_cluster_selection_epsilon: float = 0.0
-
-    # Graph methods
-    graph_affinity_threshold: float = 0.76
-    graph_min_edge_weight: float = 0.01
-
-    # Louvain / Leiden
-    louvain_resolution: float = 1.0
-    leiden_resolution: float = 1.0
-    random_seed: int = 42
 
 
 @dataclass
@@ -147,7 +122,6 @@ class OverlapResolutionConfig:
 class PrototypeInferenceConfig:
     ttt_steps: Optional[int] = None
     seed: SeedFilterConfig = field(default_factory=SeedFilterConfig)
-    cluster: ClusterConfig = field(default_factory=ClusterConfig)
     assign: SoftAssignmentConfig = field(default_factory=SoftAssignmentConfig)
     overlap: OverlapResolutionConfig = field(default_factory=OverlapResolutionConfig)
 

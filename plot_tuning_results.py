@@ -12,9 +12,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-METHOD_ORDER = ["dbscan", "hdbscan", "cc", "louvain", "leiden"]
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Create summary plots from an Optuna tuning JSON export."
@@ -45,11 +42,15 @@ def load_trials(path: Path) -> Tuple[Dict, List[Dict]]:
     return payload, trials
 
 
-def group_trials_by_method(trials: List[Dict]) -> Dict[str, List[Dict]]:
+def group_trials_by_seed_mode(trials: List[Dict]) -> Dict[str, List[Dict]]:
     grouped: Dict[str, List[Dict]] = {}
     for trial in trials:
-        method = trial.get("params", {}).get("cluster.method", "unknown")
-        grouped.setdefault(method, []).append(trial)
+        params = trial.get("params", {})
+        mode = (
+            f"fg={params.get('seed.use_foreground_in_score', 'unknown')}, "
+            f"exclude_bg={params.get('seed.exclude_background', 'unknown')}"
+        )
+        grouped.setdefault(mode, []).append(trial)
     return grouped
 
 
@@ -90,29 +91,31 @@ def save_optimization_history(trials: List[Dict], metric_name: str, output_path:
     plt.close(fig)
 
 
-def save_method_summary(trials: List[Dict], metric_name: str, output_path: Path):
+def save_seed_mode_summary(trials: List[Dict], metric_name: str, output_path: Path):
     grouped: Dict[str, List[float]] = {}
     for trial in trials:
-        method = trial.get("params", {}).get("cluster.method", "unknown")
-        grouped.setdefault(method, []).append(float(trial["value"]))
+        params = trial.get("params", {})
+        mode = (
+            f"fg={params.get('seed.use_foreground_in_score', 'unknown')}, "
+            f"exclude_bg={params.get('seed.exclude_background', 'unknown')}"
+        )
+        grouped.setdefault(mode, []).append(float(trial["value"]))
 
-    methods = [name for name in METHOD_ORDER if name in grouped] + sorted(
-        name for name in grouped if name not in METHOD_ORDER
-    )
-    means = [float(np.mean(grouped[name])) for name in methods]
-    bests = [float(np.max(grouped[name])) for name in methods]
-    counts = [len(grouped[name]) for name in methods]
+    modes = sorted(grouped)
+    means = [float(np.mean(grouped[name])) for name in modes]
+    bests = [float(np.max(grouped[name])) for name in modes]
+    counts = [len(grouped[name]) for name in modes]
 
-    x = np.arange(len(methods))
+    x = np.arange(len(modes))
     width = 0.38
 
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.bar(x - width / 2, means, width=width, label=f"mean {metric_name}", color="#5B8FF9")
     ax.bar(x + width / 2, bests, width=width, label=f"best {metric_name}", color="#61DDAA")
     ax.set_xticks(x)
-    ax.set_xticklabels(methods, rotation=20)
-    ax.set_title("Clustering Method Performance")
-    ax.set_xlabel("Method")
+    ax.set_xticklabels(modes, rotation=20)
+    ax.set_title("Seed Selection Mode Performance")
+    ax.set_xlabel("Seed Selection Mode")
     ax.set_ylabel(metric_name)
     ax.grid(True, axis="y", alpha=0.25)
     ax.legend()
@@ -256,15 +259,15 @@ def save_top_trials_table(trials: List[Dict], metric_name: str, output_path: Pat
         rows.append([
             str(trial["number"]),
             f"{float(trial['value']):.4f}",
-            str(params.get("cluster.method", "")),
             f"{params.get('seed.quality_threshold', '')}",
+            f"{params.get('seed.local_max_margin_threshold', '')}",
             f"{params.get('overlap.pixel_score_threshold', '')}",
             f"{params.get('overlap.min_prototype_score', '')}",
         ])
 
     table = ax.table(
         cellText=rows,
-        colLabels=["trial", metric_name, "method", "seed.q", "pixel.th", "proto.score"],
+        colLabels=["trial", metric_name, "seed.q", "seed.margin", "pixel.th", "proto.score"],
         loc="center",
     )
     table.auto_set_font_size(False)
@@ -282,13 +285,14 @@ def save_method_specific_plots(
     top_k: int,
     output_dir: Path,
 ):
-    methods = [name for name in METHOD_ORDER if name in grouped_trials] + sorted(
-        name for name in grouped_trials if name not in METHOD_ORDER
-    )
-
-    for method in methods:
-        trials = grouped_trials[method]
-        method_dir = output_dir / f"method_{method}"
+    for mode, trials in sorted(grouped_trials.items()):
+        slug = (
+            mode.replace(" ", "_")
+            .replace(",", "")
+            .replace("=", "-")
+            .replace("/", "_")
+        )
+        method_dir = output_dir / f"seed_mode_{slug}"
         method_dir.mkdir(parents=True, exist_ok=True)
         numeric_names = collect_numeric_param_names(trials)
 
@@ -318,10 +322,10 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     numeric_names = collect_numeric_param_names(trials)
-    grouped_trials = group_trials_by_method(trials)
+    grouped_trials = group_trials_by_seed_mode(trials)
 
     save_optimization_history(trials, metric_name, output_dir / "optimization_history.png")
-    save_method_summary(trials, metric_name, output_dir / "method_summary.png")
+    save_seed_mode_summary(trials, metric_name, output_dir / "seed_mode_summary.png")
     save_param_scatter_grid(
         trials,
         metric_name,
