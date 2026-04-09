@@ -202,7 +202,7 @@ class ClusterPanopticCriterion(nn.Module):
         q_sig = sig_embs[:, valid_b]
         q_mask_emb = mask_embs[:, valid_b]
         q_cls = cls_preds[:, valid_b]
-        q_seed_logits = seed_logits[:, valid_b]
+        q_seed_logits = seed_logits[valid_b]
         q_influence = influence_preds[:, valid_b]
 
         L, _, N_q, S = q_sig.shape
@@ -210,11 +210,11 @@ class ClusterPanopticCriterion(nn.Module):
         q_sig_flat = q_sig.transpose(0, 1).reshape(B_val, L * N_q, S)
         q_mask_emb_flat = q_mask_emb.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, L * N_q, -1)
-        q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
+        q_sig_final = q_sig[-1]
 
         gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
-        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_norm, gt_pad_mask)
+        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_final, gt_sigs_norm, gt_pad_mask)
 
         sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
         weights_flat = assignment_weights_with_influence(
@@ -253,13 +253,13 @@ class ClusterPanopticCriterion(nn.Module):
         loss_mask_iou = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
 
         seed_targets = matched_query_mask.float()
-        loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
+        loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits, seed_targets)
 
         loss_seed_sig = features.sum() * 0.0
         matched_pos = matched_query_mask.nonzero(as_tuple=False)
         if matched_pos.numel() > 0:
             matched_gt = matched_gt_indices[matched_query_mask]
-            matched_q_sig = q_sig_flat[matched_query_mask]
+            matched_q_sig = q_sig_final[matched_query_mask]
             matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt]
             cos_sim_seed = (matched_q_sig * matched_gt_sig).sum(dim=-1)
             loss_seed_sig = (1.0 - cos_sim_seed).mean()

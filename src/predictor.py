@@ -164,7 +164,7 @@ class ModularPrototypePredictor:
         q_mask_emb = raw.mask_embs[:, b]
         q_cls = raw.cls_preds[:, b]
         q_sig = raw.sig_embs[:, b]
-        q_seed = raw.seed_scores[:, b]
+        q_seed_final = raw.seed_scores[b]
         q_influence = raw.influence_preds[:, b]
 
         L, N_q, S = q_sig.shape
@@ -173,8 +173,11 @@ class ModularPrototypePredictor:
         q_mask_emb = q_mask_emb.reshape(L * N_q, -1)
         q_cls = q_cls.reshape(L * N_q, num_classes)
         q_sig = q_sig.reshape(L * N_q, S)
-        q_seed = q_seed.reshape(L * N_q)
         q_influence = q_influence.reshape(L * N_q)
+        q_seed = torch.zeros((L * N_q,), dtype=q_seed_final.dtype, device=q_seed_final.device)
+        seed_query_mask = torch.zeros((L * N_q,), dtype=torch.bool, device=q_seed_final.device)
+        seed_query_mask[(L - 1) * N_q :] = True
+        q_seed[seed_query_mask] = q_seed_final
 
         q_cls_prob = F.softmax(q_cls, dim=-1)
         pred_cls = q_cls_prob.argmax(dim=-1)
@@ -193,6 +196,7 @@ class ModularPrototypePredictor:
             "q_cls_prob": q_cls_prob,
             "q_sig": q_sig,
             "q_seed": q_seed,
+            "seed_query_mask": seed_query_mask,
             "q_influence": q_influence,
             "bg_conf": bg_conf,
             "fg_conf": fg_conf,
@@ -207,7 +211,7 @@ class ModularPrototypePredictor:
         if cfg.use_foreground_in_score:
             score = score * flat["partition_conf"].pow(cfg.foreground_score_power)
 
-        eligible = torch.ones_like(score, dtype=torch.bool)
+        eligible = flat["seed_query_mask"].clone()
 
         if cfg.exclude_background:
             eligible &= (flat["pred_cls"] != 0)

@@ -386,7 +386,7 @@ class CustomMask2Former(Mask2FormerBase):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
         sig_embs = F.normalize(self.sig_head(q), p=2, dim=-1)
-        seed_logits = self.seed_head(q).squeeze(-1)
+        seed_logits = self.seed_head(q[-1]).squeeze(-1)
         seed_scores = torch.sigmoid(seed_logits)
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
         return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds

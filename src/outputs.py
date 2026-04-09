@@ -13,6 +13,6 @@ class RawOutputs:
     cls_preds: torch.Tensor         # [L, B, Nq, K]
     img_shape: Tuple[int, int]
     sig_embs: Optional[torch.Tensor] = None        # [L, B, Nq, S]
-    seed_logits: Optional[torch.Tensor] = None     # [L, B, Nq]
-    seed_scores: Optional[torch.Tensor] = None     # [L, B, Nq]
+    seed_logits: Optional[torch.Tensor] = None     # [B, Nq]
+    seed_scores: Optional[torch.Tensor] = None     # [B, Nq]
     influence_preds: Optional[torch.Tensor] = None # [L, B, Nq]
