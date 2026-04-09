@@ -164,6 +164,10 @@ def evaluate_image(
     )
 
 
+def _ensure_prediction_list(predictions):
+    return predictions if isinstance(predictions, list) else [predictions]
+
+
 def _compute_average_precision(prediction_records: Iterable[Tuple[float, int]], num_gt: int) -> float:
     if num_gt == 0:
         return 0.0
@@ -194,7 +198,6 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
     num_images = len(image_evaluations)
     total_gt = sum(item.num_gt for item in image_evaluations)
     total_pred = sum(item.num_pred for item in image_evaluations)
-    total_tp = sum(item.num_tp for item in image_evaluations)
     total_matched_iou = sum(item.matched_iou_sum for item in image_evaluations)
     total_matched_box_iou = sum(item.matched_box_iou_sum for item in image_evaluations)
 
@@ -205,20 +208,45 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
     mean_iou = total_matched_iou / total_gt if total_gt > 0 else 0.0
     mean_iou_box = total_matched_box_iou / total_gt if total_gt > 0 else 0.0
     ap = _compute_average_precision(prediction_records, total_gt)
-    precision = total_tp / total_pred if total_pred > 0 else 0.0
-    recall = total_tp / total_gt if total_gt > 0 else 0.0
 
     return {
         "num_images": num_images,
         "num_gt_instances": total_gt,
         "num_predictions": total_pred,
-        "num_true_positives": total_tp,
         "mean_iou": mean_iou,
         "mean_iou_box": mean_iou_box,
         "ap": ap,
-        "precision": precision,
-        "recall": recall,
     }
+
+
+def _merge_metric_summaries(
+    primary: Dict[str, float],
+    oracle: Dict[str, float] | None,
+) -> Dict[str, float]:
+    if oracle is None:
+        oracle = primary
+
+    return {
+        "num_images": primary["num_images"],
+        "num_gt_instances": primary["num_gt_instances"],
+        "num_predictions": primary["num_predictions"],
+        "num_oracle_predictions": oracle["num_predictions"],
+        "mean_iou_mask": primary["mean_iou"],
+        "mean_iou_mask_oracle": oracle["mean_iou"],
+        "mean_iou_box": primary["mean_iou_box"],
+        "mean_iou_box_oracle": oracle["mean_iou_box"],
+        "ap": primary["ap"],
+        "ap_oracle": oracle["ap"],
+    }
+
+
+def _summarize_merged_evaluations(
+    primary_evaluations: Sequence[ImageEvaluation],
+    oracle_evaluations: Sequence[ImageEvaluation] | None,
+) -> Dict[str, float]:
+    primary_summary = summarize_evaluations(primary_evaluations)
+    oracle_summary = None if oracle_evaluations is None else summarize_evaluations(oracle_evaluations)
+    return _merge_metric_summaries(primary_summary, oracle_summary)
 
 
 def summarize_by_object_count(
@@ -273,20 +301,27 @@ def evaluate_system(
     system.eval()
 
     image_evaluations = []
+    oracle_image_evaluations = [] if system.supports_gt_prototypes else None
     object_counts = []
 
     try:
         for batch, targets in dataset:
             batch = batch.to(device)
+            raw = system.model(batch, ttt_steps_override=system.cfg.inference.ttt_steps)
+
             if use_gt_prototypes:
-                predictions = system.predict_with_gt_prototypes(batch, targets)
+                predictions = system.predictor.predict_from_raw_with_gt_prototypes(system.model, raw, targets)
             else:
-                predictions = system.predict(batch)
+                predictions = system.predictor.predict_from_raw(system.model, raw)
 
-            if not isinstance(predictions, list):
-                predictions = [predictions]
+            oracle_predictions = predictions
+            if oracle_image_evaluations is not None:
+                oracle_predictions = system.predictor.predict_from_raw_with_gt_prototypes(system.model, raw, targets)
 
-            for prediction, target in zip(predictions, targets):
+            predictions = _ensure_prediction_list(predictions)
+            oracle_predictions = _ensure_prediction_list(oracle_predictions)
+
+            for idx, (prediction, target) in enumerate(zip(predictions, targets)):
                 image_evaluations.append(
                     evaluate_image(
                         prediction,
@@ -294,6 +329,14 @@ def evaluate_system(
                         ap_iou_threshold=ap_iou_threshold,
                     )
                 )
+                if oracle_image_evaluations is not None:
+                    oracle_image_evaluations.append(
+                        evaluate_image(
+                            oracle_predictions[idx],
+                            target,
+                            ap_iou_threshold=ap_iou_threshold,
+                        )
+                    )
                 object_counts.append(int((target["labels"] != 0).sum().item()))
     finally:
         system.train(was_training)
@@ -301,8 +344,22 @@ def evaluate_system(
         np.random.set_state(py_state)
         torch.random.set_rng_state(torch_state)
 
-    overall = summarize_evaluations(image_evaluations)
-    by_count = summarize_by_object_count(image_evaluations, object_counts)
+    overall = _summarize_merged_evaluations(image_evaluations, oracle_image_evaluations)
+
+    grouped_primary = defaultdict(list)
+    grouped_oracle = defaultdict(list) if oracle_image_evaluations is not None else None
+    for idx, object_count in enumerate(object_counts):
+        grouped_primary[int(object_count)].append(image_evaluations[idx])
+        if grouped_oracle is not None:
+            grouped_oracle[int(object_count)].append(oracle_image_evaluations[idx])
+
+    by_count = {
+        count: _summarize_merged_evaluations(
+            grouped_primary[count],
+            None if grouped_oracle is None else grouped_oracle[count],
+        )
+        for count in sorted(grouped_primary)
+    }
     return overall, by_count
 
 
@@ -349,6 +406,7 @@ def evaluate_system_many_configs(
         for key, cfg in inference_cfgs.items()
     }
     image_evaluations = {key: [] for key in inference_cfgs}
+    oracle_image_evaluations = {key: [] for key in inference_cfgs} if system.supports_gt_prototypes else None
     object_counts = []
 
     try:
@@ -371,11 +429,18 @@ def evaluate_system_many_configs(
                         for key, predictor in group
                     }
 
-                for key, predictions in predictions_by_key.items():
-                    if not isinstance(predictions, list):
-                        predictions = [predictions]
+                oracle_predictions_by_key = predictions_by_key
+                if oracle_image_evaluations is not None:
+                    oracle_predictions_by_key = {
+                        key: predictor.predict_from_raw_with_gt_prototypes(system.model, raw, targets)
+                        for key, predictor in group
+                    }
 
-                    for prediction, target in zip(predictions, targets):
+                for key, predictions in predictions_by_key.items():
+                    predictions = _ensure_prediction_list(predictions)
+                    oracle_predictions = _ensure_prediction_list(oracle_predictions_by_key[key])
+
+                    for idx, (prediction, target) in enumerate(zip(predictions, targets)):
                         image_evaluations[key].append(
                             evaluate_image(
                                 prediction,
@@ -383,6 +448,14 @@ def evaluate_system_many_configs(
                                 ap_iou_threshold=ap_iou_threshold,
                             )
                         )
+                        if oracle_image_evaluations is not None:
+                            oracle_image_evaluations[key].append(
+                                evaluate_image(
+                                    oracle_predictions[idx],
+                                    target,
+                                    ap_iou_threshold=ap_iou_threshold,
+                                )
+                            )
 
             object_counts.extend(int((target["labels"] != 0).sum().item()) for target in targets)
     finally:
@@ -393,8 +466,23 @@ def evaluate_system_many_configs(
 
     results = {}
     for key, evaluations in image_evaluations.items():
-        overall = summarize_evaluations(evaluations)
-        by_count = summarize_by_object_count(evaluations, object_counts)
+        oracle_evals = None if oracle_image_evaluations is None else oracle_image_evaluations[key]
+        overall = _summarize_merged_evaluations(evaluations, oracle_evals)
+
+        grouped_primary = defaultdict(list)
+        grouped_oracle = defaultdict(list) if oracle_evals is not None else None
+        for idx, object_count in enumerate(object_counts):
+            grouped_primary[int(object_count)].append(evaluations[idx])
+            if grouped_oracle is not None:
+                grouped_oracle[int(object_count)].append(oracle_evals[idx])
+
+        by_count = {
+            count: _summarize_merged_evaluations(
+                grouped_primary[count],
+                None if grouped_oracle is None else grouped_oracle[count],
+            )
+            for count in sorted(grouped_primary)
+        }
         results[key] = (overall, by_count)
     return results
 
@@ -405,17 +493,31 @@ def format_metrics_table(
     *,
     ap_threshold: float,
 ) -> str:
-    headers = ["split", "images", "gt", "pred", "mIoU", "mIoU_box", f"AP@{ap_threshold:.2f}", "P", "R"]
+    headers = [
+        "split",
+        "images",
+        "gt",
+        "pred",
+        "pred_oracle",
+        "mIoU_mask",
+        "mIoU_mask_oracle",
+        "mIoU_box",
+        "mIoU_box_oracle",
+        f"AP@{ap_threshold:.2f}",
+        f"AP@{ap_threshold:.2f}_oracle",
+    ]
     rows = [[
         "overall",
         str(overall["num_images"]),
         str(overall["num_gt_instances"]),
         str(overall["num_predictions"]),
-        f"{overall['mean_iou']:.4f}",
+        str(overall["num_oracle_predictions"]),
+        f"{overall['mean_iou_mask']:.4f}",
+        f"{overall['mean_iou_mask_oracle']:.4f}",
         f"{overall['mean_iou_box']:.4f}",
+        f"{overall['mean_iou_box_oracle']:.4f}",
         f"{overall['ap']:.4f}",
-        f"{overall['precision']:.4f}",
-        f"{overall['recall']:.4f}",
+        f"{overall['ap_oracle']:.4f}",
     ]]
 
     for object_count, metrics in by_count.items():
@@ -424,11 +526,13 @@ def format_metrics_table(
             str(metrics["num_images"]),
             str(metrics["num_gt_instances"]),
             str(metrics["num_predictions"]),
-            f"{metrics['mean_iou']:.4f}",
+            str(metrics["num_oracle_predictions"]),
+            f"{metrics['mean_iou_mask']:.4f}",
+            f"{metrics['mean_iou_mask_oracle']:.4f}",
             f"{metrics['mean_iou_box']:.4f}",
+            f"{metrics['mean_iou_box_oracle']:.4f}",
             f"{metrics['ap']:.4f}",
-            f"{metrics['precision']:.4f}",
-            f"{metrics['recall']:.4f}",
+            f"{metrics['ap_oracle']:.4f}",
         ])
 
     widths = [

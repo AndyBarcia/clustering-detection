@@ -154,10 +154,11 @@ BEST_KNOWN_PARAMS = {
 
 METRIC_ALIASES = {
     "ap": ("overall", "ap"),
-    "mean_iou": ("overall", "mean_iou"),
+    "mean_iou_mask": ("overall", "mean_iou_mask"),
+    "mean_iou_mask_oracle": ("overall", "mean_iou_mask_oracle"),
     "mean_iou_box": ("overall", "mean_iou_box"),
-    "precision": ("overall", "precision"),
-    "recall": ("overall", "recall"),
+    "mean_iou_box_oracle": ("overall", "mean_iou_box_oracle"),
+    "ap_oracle": ("overall", "ap_oracle"),
 }
 
 
