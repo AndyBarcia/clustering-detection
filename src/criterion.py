@@ -214,7 +214,22 @@ class ClusterPanopticCriterion(nn.Module):
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
 
         gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
-        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_norm, gt_pad_mask)
+
+        layer_matched_query_masks = []
+        layer_matched_gt_indices = []
+        for layer_idx in range(L):
+            matched_query_mask_layer, matched_gt_indices_layer = hungarian_seed_assignment(
+                q_sig[layer_idx],
+                gt_sigs_norm,
+                gt_pad_mask,
+            )
+            layer_matched_query_masks.append(matched_query_mask_layer)
+            layer_matched_gt_indices.append(matched_gt_indices_layer)
+
+        matched_query_mask = torch.stack(layer_matched_query_masks, dim=0)
+        matched_gt_indices = torch.stack(layer_matched_gt_indices, dim=0)
+        matched_query_mask_flat = matched_query_mask.transpose(0, 1).reshape(B_val, L * N_q)
+        matched_gt_indices_flat = matched_gt_indices.transpose(0, 1).reshape(B_val, L * N_q)
 
         sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
         weights_flat = assignment_weights_with_influence(
@@ -252,14 +267,14 @@ class ClusterPanopticCriterion(nn.Module):
         loss_mask_ce = F.cross_entropy(mask_logits_masked, gt_mask_target)
         loss_mask_iou = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
 
-        seed_targets = matched_query_mask.float()
+        seed_targets = matched_query_mask_flat.float()
         loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
 
         loss_seed_sig = features.sum() * 0.0
-        matched_pos = matched_query_mask.nonzero(as_tuple=False)
+        matched_pos = matched_query_mask_flat.nonzero(as_tuple=False)
         if matched_pos.numel() > 0:
-            matched_gt = matched_gt_indices[matched_query_mask]
-            matched_q_sig = q_sig_flat[matched_query_mask]
+            matched_gt = matched_gt_indices_flat[matched_query_mask_flat]
+            matched_q_sig = q_sig_flat[matched_query_mask_flat]
             matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt]
             cos_sim_seed = (matched_q_sig * matched_gt_sig).sum(dim=-1)
             loss_seed_sig = (1.0 - cos_sim_seed).mean()
