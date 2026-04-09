@@ -275,7 +275,6 @@ def evaluate_system(
     device,
     seed: int = 0,
     ap_iou_threshold: float = 0.5,
-    use_gt_prototypes: bool = False,
 ):
     random_state = random.getstate()
     py_state = np.random.get_state()
@@ -308,11 +307,7 @@ def evaluate_system(
         for batch, targets in dataset:
             batch = batch.to(device)
             raw = system.model(batch, ttt_steps_override=system.cfg.inference.ttt_steps)
-
-            if use_gt_prototypes:
-                predictions = system.predictor.predict_from_raw_with_gt_prototypes(system.model, raw, targets)
-            else:
-                predictions = system.predictor.predict_from_raw(system.model, raw)
+            predictions = system.predictor.predict_from_raw(system.model, raw)
 
             oracle_predictions = predictions
             if oracle_image_evaluations is not None:
@@ -376,7 +371,6 @@ def evaluate_system_many_configs(
     device,
     seed: int = 0,
     ap_iou_threshold: float = 0.5,
-    use_gt_prototypes: bool = False,
 ):
     random_state = random.getstate()
     py_state = np.random.get_state()
@@ -418,16 +412,10 @@ def evaluate_system_many_configs(
 
             for ttt_steps, group in configs_by_ttt_steps.items():
                 raw = system.model(batch, ttt_steps_override=ttt_steps)
-                if use_gt_prototypes:
-                    predictions_by_key = {
-                        key: predictor.predict_from_raw_with_gt_prototypes(system.model, raw, targets)
-                        for key, predictor in group
-                    }
-                else:
-                    predictions_by_key = {
-                        key: predictor.predict_from_raw(system.model, raw)
-                        for key, predictor in group
-                    }
+                predictions_by_key = {
+                    key: predictor.predict_from_raw(system.model, raw)
+                    for key, predictor in group
+                }
 
                 oracle_predictions_by_key = predictions_by_key
                 if oracle_image_evaluations is not None:

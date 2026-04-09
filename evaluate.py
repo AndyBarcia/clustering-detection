@@ -29,11 +29,6 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0, help="Random seed for dataset generation.")
     parser.add_argument("--ap-threshold", type=float, default=0.5, help="IoU threshold used for AP.")
     parser.add_argument(
-        "--use-gt-prototypes",
-        action="store_true",
-        help="Evaluate the GT-prototype decoding path instead of clustered predictions.",
-    )
-    parser.add_argument(
         "--output-json",
         default=None,
         help="Optional path where the aggregate metrics JSON will be written.",
@@ -64,7 +59,6 @@ def main():
         device=args.device,
         seed=args.seed,
         ap_iou_threshold=args.ap_threshold,
-        use_gt_prototypes=args.use_gt_prototypes,
     )
 
     print(f"Checkpoint: {Path(args.checkpoint).resolve()}")
@@ -84,7 +78,6 @@ def main():
             "max_objects": args.max_objects,
             "seed": args.seed,
             "ap_threshold": args.ap_threshold,
-            "use_gt_prototypes": args.use_gt_prototypes,
             "overall": overall,
             "by_object_count": by_count,
         }

@@ -52,11 +52,10 @@ def parse_args():
     parser.add_argument("--device", default=None, help="Training device, e.g. cpu or cuda.")
     parser.add_argument("--vis-samples", type=int, default=4, help="Number of synthetic samples rendered after each epoch.")
     parser.add_argument("--vis-seed", type=int, default=0, help="Random seed for the fixed visualization batch.")
-    parser.add_argument("--eval-dataset-length", type=int, default=32, help="Number of synthetic samples used for epoch evaluation.")
+    parser.add_argument("--eval-dataset-length", type=int, default=256, help="Number of synthetic samples used for epoch evaluation.")
     parser.add_argument("--eval-batch-size", type=int, default=None, help="Batch size used for epoch evaluation. Defaults to training batch size.")
     parser.add_argument("--eval-seed", type=int, default=123, help="Base random seed used for synthetic evaluation.")
     parser.add_argument("--eval-ap-threshold", type=float, default=0.5, help="IoU threshold used for AP during evaluation.")
-    parser.add_argument("--use-gt-prototypes-for-eval", action="store_true", help="Evaluate the GT-prototype decoding path instead of clustered predictions.")
     parser.add_argument(
         "--skip-epoch-vis",
         action="store_true",
@@ -276,7 +275,6 @@ def main():
                 device=device,
                 seed=args.eval_seed + epoch_idx,
                 ap_iou_threshold=args.eval_ap_threshold,
-                use_gt_prototypes=args.use_gt_prototypes_for_eval,
             )
             epoch_metrics["evaluation"] = {
                 "overall": overall_eval,
@@ -284,7 +282,6 @@ def main():
                 "ap_threshold": args.eval_ap_threshold,
                 "dataset_length": args.eval_dataset_length,
                 "seed": args.eval_seed + epoch_idx,
-                "use_gt_prototypes": args.use_gt_prototypes_for_eval,
             }
             print("Evaluation", flush=True)
             print(format_metrics_table(overall_eval, per_count_eval, ap_threshold=args.eval_ap_threshold), flush=True)

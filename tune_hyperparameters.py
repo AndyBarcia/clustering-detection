@@ -255,11 +255,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--use-gt-prototypes",
-        action="store_true",
-        help="Evaluate the GT-prototype decoding path instead of clustered predictions.",
-    )
-    parser.add_argument(
         "--continue-on-error",
         action="store_true",
         help="Mark failed trials and continue instead of aborting the study run.",
@@ -442,7 +437,6 @@ def evaluate_trial_batch(system, batch_records: List[Dict[str, Any]], *, args):
         device=args.device,
         seed=args.seed,
         ap_iou_threshold=args.ap_threshold,
-        use_gt_prototypes=args.use_gt_prototypes,
     )
 
 
@@ -472,7 +466,6 @@ def export_study_summary(
             "max_objects": args.max_objects,
             "seed": args.seed,
             "ap_threshold": args.ap_threshold,
-            "use_gt_prototypes": args.use_gt_prototypes,
         },
         "best_trial": None if best_trial is None else {
             "number": best_trial.number,
@@ -536,7 +529,6 @@ def main():
             "max_objects": args.max_objects,
             "seed": args.seed,
             "ap_threshold": args.ap_threshold,
-            "use_gt_prototypes": args.use_gt_prototypes,
         },
     )
 
