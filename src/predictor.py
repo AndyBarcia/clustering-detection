@@ -219,7 +219,12 @@ class ModularPrototypePredictor:
             eligible &= (flat["q_influence"] <= cfg.max_influence)
 
         keep = eligible.clone()
-        keep &= (flat["q_seed"] >= cfg.quality_threshold)
+        eligible_idx = torch.where(eligible)[0]
+        if eligible_idx.numel() > 0:
+            rel_threshold = score[eligible_idx].max() * cfg.quality_threshold
+            keep &= (score >= rel_threshold)
+        else:
+            keep &= False
 
         seed_idx = torch.where(keep)[0]
 

@@ -253,7 +253,15 @@ class ClusterPanopticCriterion(nn.Module):
         loss_mask_iou = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
 
         seed_targets = matched_query_mask.float()
-        loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
+        seed_target_mass = seed_targets.sum(dim=1, keepdim=True)
+        seed_target_dist = seed_targets / seed_target_mass.clamp_min(1.0)
+        seed_log_probs = F.log_softmax(q_seed_logits_flat, dim=1)
+        loss_seed = -(seed_target_dist * seed_log_probs).sum(dim=1)
+        has_seed_targets = seed_target_mass.squeeze(1) > 0
+        if has_seed_targets.any():
+            loss_seed = loss_seed[has_seed_targets].mean()
+        else:
+            loss_seed = features.sum() * 0.0
 
         loss_seed_sig = features.sum() * 0.0
         matched_pos = matched_query_mask.nonzero(as_tuple=False)

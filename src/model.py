@@ -109,11 +109,8 @@ class TransformerDecoderLayer(nn.Module):
 
             for _ in range(self.ttt_steps):
                 seed_logits = functional_call(seed_head, detached_states, (intermediate_q[-1],))
-                seed_scores = torch.sigmoid(seed_logits.squeeze(-1))
-                inner_loss = 1.0 - seed_scores
-                
-                # Propperly scale losses based on batch size.
-                inner_loss = inner_loss.view(tgt.shape[0],-1).mean(dim=-1).sum()
+                seed_scores = F.softmax(seed_logits.squeeze(-1), dim=1)
+                inner_loss = -(seed_scores * torch.log(seed_scores.clamp_min(1e-8))).sum(dim=1).mean()
 
                 grad = torch.autograd.grad(
                     inner_loss, 
@@ -387,7 +384,8 @@ class CustomMask2Former(Mask2FormerBase):
         cls_preds = self.cls_head(q)
         sig_embs = F.normalize(self.sig_head(q), p=2, dim=-1)
         seed_logits = self.seed_head(q).squeeze(-1)
-        seed_scores = torch.sigmoid(seed_logits)
+        seed_scores = F.softmax(seed_logits.permute(1, 0, 2).reshape(seed_logits.shape[1], -1), dim=-1)
+        seed_scores = seed_scores.view(seed_logits.shape[1], seed_logits.shape[0], seed_logits.shape[2]).permute(1, 0, 2)
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
         return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds
 
