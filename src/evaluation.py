@@ -322,6 +322,10 @@ def _append_value_summary(summary: Dict[str, float], prefix: str, values: Sequen
         return
     summary[f"{prefix}_count"] = int(len(values))
     summary[f"{prefix}_mean"] = float(sum(values) / len(values))
+    if len(values) > 1:
+        summary[f"{prefix}_std"] = float(np.std(np.asarray(values, dtype=np.float64), ddof=0))
+    else:
+        summary[f"{prefix}_std"] = 0.0
     summary[f"{prefix}_min"] = float(min(values))
     summary[f"{prefix}_max"] = float(max(values))
 
@@ -340,6 +344,9 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
     count_gt: List[int] = []
     chamfer_values: List[float] = []
     hausdorff_values: List[float] = []
+    per_image_mean_iou: List[float] = []
+    per_image_mean_iou_box: List[float] = []
+    per_image_ap: List[float] = []
 
     for item in image_evaluations:
         prediction_records.extend(item.prediction_records)
@@ -347,6 +354,9 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
         unmatched_query_distances.extend(item.unmatched_query_closest_gt_distances)
         count_pred.append(int(item.num_pred))
         count_gt.append(int(item.num_gt))
+        per_image_mean_iou.append(item.matched_iou_sum / item.num_gt if item.num_gt > 0 else 0.0)
+        per_image_mean_iou_box.append(item.matched_box_iou_sum / item.num_gt if item.num_gt > 0 else 0.0)
+        per_image_ap.append(_compute_average_precision(item.prediction_records, item.num_gt))
         if item.signature_chamfer_distance is not None:
             chamfer_values.append(float(item.signature_chamfer_distance))
         if item.signature_hausdorff_distance is not None:
@@ -364,6 +374,9 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
         "mean_iou_box": mean_iou_box,
         "ap": ap,
     }
+    _append_value_summary(summary, "mean_iou", per_image_mean_iou)
+    _append_value_summary(summary, "mean_iou_box", per_image_mean_iou_box)
+    _append_value_summary(summary, "ap", per_image_ap)
 
     _append_value_summary(summary, "matched_query_cosine_distance", matched_query_distances)
     _append_value_summary(summary, "unmatched_query_closest_gt_cosine_distance", unmatched_query_distances)
@@ -377,11 +390,30 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
         "overpredict_rate": float(sum(error > 0 for error in count_errors) / len(count_errors)),
         "underpredict_rate": float(sum(error < 0 for error in count_errors) / len(count_errors)),
     })
+    _append_value_summary(summary, "mean_count_error", count_errors)
+    _append_value_summary(summary, "mean_abs_count_error", abs_count_errors)
+    _append_value_summary(
+        summary,
+        "exact_count_accuracy",
+        [1.0 if error == 0 else 0.0 for error in count_errors],
+    )
+    _append_value_summary(
+        summary,
+        "overpredict_rate",
+        [1.0 if error > 0 else 0.0 for error in count_errors],
+    )
+    _append_value_summary(
+        summary,
+        "underpredict_rate",
+        [1.0 if error < 0 else 0.0 for error in count_errors],
+    )
 
     if chamfer_values:
         summary["signature_chamfer_distance_mean"] = float(sum(chamfer_values) / len(chamfer_values))
+        summary["signature_chamfer_distance_std"] = float(np.std(np.asarray(chamfer_values, dtype=np.float64), ddof=0))
     if hausdorff_values:
         summary["signature_hausdorff_distance_mean"] = float(sum(hausdorff_values) / len(hausdorff_values))
+        summary["signature_hausdorff_distance_std"] = float(np.std(np.asarray(hausdorff_values, dtype=np.float64), ddof=0))
 
     return summary
 
@@ -657,12 +689,29 @@ def evaluate_system_many_configs(
     return results
 
 
-def _format_float(value: float | None, digits: int = 4) -> str:
+def _format_float(value: float | None, digits: int = 2) -> str:
     if value is None:
         return "-"
     if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
         return "-"
     return f"{value:.{digits}f}"
+
+
+def _format_metric(metrics: Dict[str, Any], metric_key: str | None) -> str:
+    if metric_key is None:
+        return "-"
+
+    value = metrics.get(metric_key)
+    if metric_key.endswith("_mean"):
+        std_key = metric_key[:-5] + "_std"
+    else:
+        std_key = f"{metric_key}_std"
+    deviation = metrics.get(std_key)
+
+    formatted_value = _format_float(value)
+    if deviation is None:
+        return formatted_value
+    return f"{formatted_value}±{_format_float(deviation)}"
 
 
 def _format_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
@@ -695,7 +744,7 @@ def _append_overall_row(
         elif column_type == "pred":
             row.append(str(metrics["num_predictions"]))
         elif column_type == "metric":
-            row.append(_format_float(metrics.get(metric_key)))
+            row.append(_format_metric(metrics, metric_key))
         else:
             raise ValueError(f"Unsupported overall row column type: {column_type}")
     rows.append(row)
@@ -807,7 +856,7 @@ def format_metrics_table(
                 elif column_type == "pred":
                     row.append(str(eval_metrics["num_predictions"]))
                 elif column_type == "metric":
-                    row.append(_format_float(eval_metrics.get(metric_key)))
+                    row.append(_format_metric(eval_metrics, metric_key))
                 else:
                     raise ValueError(f"Unsupported table column type: {column_type}")
             rows.append(row)
