@@ -22,6 +22,7 @@ except ImportError:
     umap = None
 
 from .dataset import SyntheticPanopticBatchGenerator
+from .outputs import FlatQueryOutputs, ResolvedPrediction
 from .panoptic import PanopticSystem
 
 
@@ -55,7 +56,7 @@ class _UmapArtistGroup:
 class _PredictionPanelState:
     axis: object
     image_np: np.ndarray
-    prediction: dict
+    prediction: ResolvedPrediction
     gt_masks: List[np.ndarray]
     class_names: Optional[Sequence[str]]
     title: str
@@ -309,22 +310,22 @@ def _hit_test_umap_queries(row_state: _RowInteractionState, x: float, y: float) 
 
 
 def _single_query_preview(
-    prediction: dict,
+    prediction: ResolvedPrediction,
     query_index: int,
 ):
-    flat = prediction.get("flat")
+    flat = prediction.flat_queries
     if flat is None:
         return [], [], [], "Query preview"
 
-    features = flat["features"]
-    q_mask_emb = flat["q_mask_emb"][query_index]
-    q_cls_prob = flat["q_cls_prob"][query_index]
-    q_seed = flat.get("q_seed", None)
+    features = flat.features
+    q_mask_emb = flat.mask_embeddings[query_index]
+    q_cls_prob = flat.class_probabilities[query_index]
+    q_seed = flat.seed_scores
 
     mask_logits = torch.einsum("c,chw->hw", q_mask_emb, features)
     mask_logits = F.interpolate(
         mask_logits.unsqueeze(0).unsqueeze(0),
-        size=(flat["H_img"], flat["W_img"]),
+        size=(flat.image_height, flat.image_width),
         mode="bilinear",
         align_corners=False,
     )[0, 0]
@@ -339,7 +340,7 @@ def _single_query_preview(
         mask = mask.view_as(mask_logits)
 
     label = int(q_cls_prob.argmax().item())
-    score = float(q_seed[query_index].item()) if q_seed is not None else float(q_cls_prob.max().item())
+    score = float(q_seed[query_index].item()) if q_seed.numel() > 0 else float(q_cls_prob.max().item())
 
     return [mask.detach().cpu().numpy()], [label], [score], f"Query {query_index} by itself"
 
@@ -354,9 +355,9 @@ def _render_prediction_panel(
         return
 
     if query_index is None:
-        masks = [mask.detach().cpu().numpy() for mask in panel.prediction["resolved_masks"]]
-        labels = [int(label) for label in panel.prediction["resolved_labels"]]
-        scores = [float(score) for score in panel.prediction["resolved_scores"]]
+        masks = [mask.detach().cpu().numpy() for mask in panel.prediction.resolved_masks]
+        labels = [int(label) for label in panel.prediction.resolved_labels]
+        scores = [float(score) for score in panel.prediction.resolved_scores]
         title = panel.title
     else:
         masks, labels, scores, title = _single_query_preview(panel.prediction, query_index)
@@ -470,17 +471,17 @@ def _draw_signature_umap(
     ax,
     image_np: np.ndarray,
     target: dict,
-    prediction: dict,
+    prediction: ResolvedPrediction,
     *,
     class_names: Optional[Sequence[str]] = None,
     title: str,
     row_state: Optional[_RowInteractionState] = None,
 ):
-    flat = prediction.get("flat")
-    q_sig = None if flat is None else flat.get("q_sig")
-    q_seed = None if flat is None else flat.get("q_seed")
-    q_influence = None if flat is None else flat.get("q_influence")
-    gt_sig = prediction.get("all_proto_sig", prediction.get("proto_sig"))
+    flat: Optional[FlatQueryOutputs] = prediction.flat_queries
+    q_sig = None if flat is None else flat.signature_embeddings
+    q_seed = None if flat is None else flat.seed_scores
+    q_influence = None if flat is None else flat.influence_scores
+    gt_sig = prediction.all_signature_embeddings
 
     if q_sig is None or gt_sig is None:
         ax.set_title(title)
@@ -559,15 +560,6 @@ def _draw_signature_umap(
 
     query_colors = np.full((q_pts.shape[0], 3), 0.7, dtype=np.float32)
     query_alpha = np.full((q_pts.shape[0],), 0.72, dtype=np.float32)
-    if gt_sig_np.shape[0] > 0 and prediction.get("assignment_weights") is not None:
-        assignment = prediction["assignment_weights"].detach().cpu().numpy()
-        if assignment.shape[1] == len(gt_labels_all):
-            assignment = assignment[:, fg_indices]
-        if assignment.shape[1] > 0:
-            query_owner = assignment.argmax(axis=1)
-            query_strength = assignment.max(axis=1)
-            query_colors = np.asarray([gt_colors[idx] for idx in query_owner], dtype=np.float32)
-            query_alpha = 0.55 + 0.35 * np.clip(query_strength, 0.0, 1.0)
 
     if row_state is not None:
         row_state.umap_query_points = q_pts
@@ -819,9 +811,9 @@ def render_prediction_grid(
         next_col_idx = 2
         for column_title, predictions in prediction_columns:
             prediction = predictions[row_idx]
-            pred_masks = [mask.detach().cpu().numpy() for mask in prediction["resolved_masks"]]
-            pred_labels = [int(label) for label in prediction["resolved_labels"]]
-            pred_scores = [float(score) for score in prediction["resolved_scores"]]
+            pred_masks = [mask.detach().cpu().numpy() for mask in prediction.resolved_masks]
+            pred_labels = [int(label) for label in prediction.resolved_labels]
+            pred_scores = [float(score) for score in prediction.resolved_scores]
             pred_masks, pred_labels, pred_scores = _filter_background_instances(
                 pred_masks,
                 pred_labels,

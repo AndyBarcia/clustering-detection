@@ -153,12 +153,21 @@ BEST_KNOWN_PARAMS = {
 }
 
 METRIC_ALIASES = {
-    "ap": ("overall", "ap"),
-    "mean_iou_mask": ("overall", "mean_iou_mask"),
-    "mean_iou_mask_oracle": ("overall", "mean_iou_mask_oracle"),
-    "mean_iou_box": ("overall", "mean_iou_box"),
-    "mean_iou_box_oracle": ("overall", "mean_iou_box_oracle"),
-    "ap_oracle": ("overall", "ap_oracle"),
+    "clustering_ap": ("overall", "clustering.ap"),
+    "clustering_mean_iou_mask": ("overall", "clustering.mean_iou"),
+    "clustering_mean_iou_box": ("overall", "clustering.mean_iou_box"),
+    "clustering_count_mae": ("overall", "clustering.mean_abs_count_error"),
+    "clustering_count_accuracy": ("overall", "clustering.exact_count_accuracy"),
+    "clustering_signature_chamfer": ("overall", "clustering.signature_chamfer_distance_mean"),
+    "clustering_signature_hausdorff": ("overall", "clustering.signature_hausdorff_distance_mean"),
+    "gt_signatures_ap": ("overall", "gt_signatures.ap"),
+    "gt_signatures_mean_iou_mask": ("overall", "gt_signatures.mean_iou"),
+    "gt_signatures_mean_iou_box": ("overall", "gt_signatures.mean_iou_box"),
+    "golden_queries_ap": ("overall", "golden_queries.ap"),
+    "golden_queries_mean_iou_mask": ("overall", "golden_queries.mean_iou"),
+    "golden_queries_mean_iou_box": ("overall", "golden_queries.mean_iou_box"),
+    "golden_queries_matched_distance_mean": ("overall", "golden_queries.matched_query_cosine_distance_mean"),
+    "golden_queries_unmatched_distance_mean": ("overall", "golden_queries.unmatched_query_closest_gt_cosine_distance_mean"),
 }
 
 
@@ -214,7 +223,7 @@ def parse_args():
     parser.add_argument(
         "--metric",
         choices=sorted(METRIC_ALIASES),
-        default="ap",
+        default="clustering_ap",
         help="Metric used as the Optuna objective.",
     )
     parser.add_argument(
@@ -324,7 +333,10 @@ def build_inference_config(base_cfg: PrototypeInferenceConfig, params: Dict[str,
 
 def read_metric(metrics: Dict[str, Any], metric_name: str) -> float:
     scope, key = METRIC_ALIASES[metric_name]
-    return float(metrics[scope][key])
+    value = metrics[scope]
+    for part in key.split("."):
+        value = value[part]
+    return float(value)
 
 
 def suggest_value(trial: optuna.Trial, name: str, spec: Dict[str, Any]):

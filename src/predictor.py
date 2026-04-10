@@ -1,7 +1,11 @@
-from typing import Dict, Any
+from __future__ import annotations
+
+from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
 
 # Optional clustering backends
 try:
@@ -27,9 +31,18 @@ except ImportError:
     leidenalg = None
 
 
-from .model import CustomMask2Former, Mask2FormerBase
 from .config import PrototypeInferenceConfig
-from .outputs import RawOutputs
+from .model import CustomMask2Former, Mask2FormerBase
+from .outputs import (
+    EvaluationPredictionSet,
+    FlatQueryOutputs,
+    GoldenQueryDiagnostics,
+    PrototypeState,
+    RawOutputs,
+    ResolvedPrediction,
+    SeedClustering,
+    SeedSelection,
+)
 
 
 def _safe_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
@@ -56,6 +69,13 @@ def _cosine_affinity_np(x: np.ndarray) -> np.ndarray:
 def _cosine_distance_np(x: np.ndarray) -> np.ndarray:
     dist = 1.0 - np.clip(x @ x.T, -1.0, 1.0)
     return np.ascontiguousarray(dist, dtype=np.float64)
+
+
+def _pairwise_cosine_distance(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    if lhs.shape[0] == 0 or rhs.shape[0] == 0:
+        return torch.zeros((lhs.shape[0], rhs.shape[0]), dtype=torch.float32, device=lhs.device)
+    similarity = torch.matmul(lhs, rhs.T).clamp(-1.0, 1.0)
+    return 1.0 - similarity
 
 
 def _connected_components_labels(affinity: np.ndarray, threshold: float) -> np.ndarray:
@@ -147,96 +167,101 @@ class ModularPrototypePredictor:
 
     @torch.no_grad()
     def predict_from_raw(self, model: CustomMask2Former, raw: RawOutputs):
-        B = raw.features.shape[0]
-        preds = [self._predict_single(model, raw, b) for b in range(B)]
-        return preds[0] if B == 1 else preds
+        batch_predictions = [self.predict_clustered_single(model, raw, batch_index) for batch_index in range(raw.features.shape[0])]
+        return batch_predictions[0] if len(batch_predictions) == 1 else batch_predictions
 
     @torch.no_grad()
     def predict_from_raw_with_gt_prototypes(self, model: CustomMask2Former, raw: RawOutputs, targets):
-        B = raw.features.shape[0]
-        preds = [self._predict_single_with_gt_prototypes(model, raw, targets, b) for b in range(B)]
-        return preds[0] if B == 1 else preds
+        batch_predictions = [self.predict_with_gt_signatures_single(model, raw, targets, batch_index) for batch_index in range(raw.features.shape[0])]
+        return batch_predictions[0] if len(batch_predictions) == 1 else batch_predictions
 
-    def _flatten_outputs(self, raw: RawOutputs, b: int) -> Dict[str, torch.Tensor]:
-        features = raw.features[b]
-        H_img, W_img = raw.img_shape
+    @torch.no_grad()
+    def predict_evaluation_views_from_raw(self, model: CustomMask2Former, raw: RawOutputs, targets):
+        batch_predictions = [self.predict_evaluation_views_single(model, raw, targets, batch_index) for batch_index in range(raw.features.shape[0])]
+        return batch_predictions[0] if len(batch_predictions) == 1 else batch_predictions
 
-        q_mask_emb = raw.mask_embs[:, b]
-        q_cls = raw.cls_preds[:, b]
-        q_sig = raw.sig_embs[:, b]
-        q_seed = raw.seed_scores[:, b]
-        q_influence = raw.influence_preds[:, b]
+    def flatten_outputs(self, raw: RawOutputs, batch_index: int) -> FlatQueryOutputs:
+        features = raw.features[batch_index]
+        image_height, image_width = raw.img_shape
 
-        L, N_q, S = q_sig.shape
-        num_classes = q_cls.shape[-1]
+        query_mask_embeddings = raw.mask_embs[:, batch_index]
+        query_class_logits = raw.cls_preds[:, batch_index]
+        query_signature_embeddings = raw.sig_embs[:, batch_index]
+        query_seed_scores = raw.seed_scores[:, batch_index]
+        query_influence_scores = raw.influence_preds[:, batch_index]
 
-        q_mask_emb = q_mask_emb.reshape(L * N_q, -1)
-        q_cls = q_cls.reshape(L * N_q, num_classes)
-        q_sig = q_sig.reshape(L * N_q, S)
-        q_seed = q_seed.reshape(L * N_q)
-        q_influence = q_influence.reshape(L * N_q)
+        num_layers, queries_per_layer, signature_dim = query_signature_embeddings.shape
+        num_classes = query_class_logits.shape[-1]
 
-        q_cls_prob = F.softmax(q_cls, dim=-1)
-        pred_cls = q_cls_prob.argmax(dim=-1)
-        bg_conf = q_cls_prob[:, 0]
-        fg_conf = 1.0 - q_cls_prob[:, 0]
-        partition_conf = torch.where(pred_cls == 0, bg_conf, fg_conf)
+        query_mask_embeddings = query_mask_embeddings.reshape(num_layers * queries_per_layer, -1)
+        query_class_logits = query_class_logits.reshape(num_layers * queries_per_layer, num_classes)
+        query_signature_embeddings = query_signature_embeddings.reshape(num_layers * queries_per_layer, signature_dim)
+        query_seed_scores = query_seed_scores.reshape(num_layers * queries_per_layer)
+        query_influence_scores = query_influence_scores.reshape(num_layers * queries_per_layer)
 
-        return {
-            "features": features,
-            "H_img": H_img,
-            "W_img": W_img,
-            "L": L,
-            "N_q": N_q,
-            "q_mask_emb": q_mask_emb,
-            "q_cls": q_cls,
-            "q_cls_prob": q_cls_prob,
-            "q_sig": q_sig,
-            "q_seed": q_seed,
-            "q_influence": q_influence,
-            "bg_conf": bg_conf,
-            "fg_conf": fg_conf,
-            "partition_conf": partition_conf,
-            "pred_cls": pred_cls,
-        }
+        query_class_probabilities = F.softmax(query_class_logits, dim=-1)
+        predicted_labels = query_class_probabilities.argmax(dim=-1)
+        background_confidence = query_class_probabilities[:, 0]
+        foreground_confidence = 1.0 - query_class_probabilities[:, 0]
+        partition_confidence = torch.where(predicted_labels == 0, background_confidence, foreground_confidence)
 
-    def _select_seeds(self, flat: Dict[str, torch.Tensor]):
+        return FlatQueryOutputs(
+            features=features,
+            image_height=image_height,
+            image_width=image_width,
+            num_decoder_layers=num_layers,
+            queries_per_layer=queries_per_layer,
+            mask_embeddings=query_mask_embeddings,
+            class_logits=query_class_logits,
+            class_probabilities=query_class_probabilities,
+            signature_embeddings=query_signature_embeddings,
+            seed_scores=query_seed_scores,
+            influence_scores=query_influence_scores,
+            background_confidence=background_confidence,
+            foreground_confidence=foreground_confidence,
+            partition_confidence=partition_confidence,
+            predicted_labels=predicted_labels,
+        )
+
+    def select_seed_queries(self, flat_queries: FlatQueryOutputs) -> SeedSelection:
         cfg = self.cfg.seed
-        score = flat["q_seed"].clone()
+        effective_scores = flat_queries.seed_scores.clone()
 
         if cfg.use_foreground_in_score:
-            score = score * flat["partition_conf"].pow(cfg.foreground_score_power)
+            effective_scores = effective_scores * flat_queries.partition_confidence.pow(cfg.foreground_score_power)
 
-        eligible = torch.ones_like(score, dtype=torch.bool)
+        eligible_mask = torch.ones_like(effective_scores, dtype=torch.bool)
 
         if cfg.exclude_background:
-            eligible &= (flat["pred_cls"] != 0)
+            eligible_mask &= flat_queries.predicted_labels != 0
 
         if cfg.min_foreground_prob > 0:
-            eligible &= (flat["partition_conf"] >= cfg.min_foreground_prob)
+            eligible_mask &= flat_queries.partition_confidence >= cfg.min_foreground_prob
 
         if cfg.max_influence is not None:
-            eligible &= (flat["q_influence"] <= cfg.max_influence)
+            eligible_mask &= flat_queries.influence_scores <= cfg.max_influence
 
-        keep = eligible.clone()
-        keep &= (flat["q_seed"] >= cfg.quality_threshold)
+        selected_mask = eligible_mask.clone()
+        selected_mask &= flat_queries.seed_scores >= cfg.quality_threshold
+        selected_indices = torch.where(selected_mask)[0]
 
-        seed_idx = torch.where(keep)[0]
+        if selected_indices.numel() < cfg.min_num_seeds:
+            fallback_indices = torch.where(eligible_mask)[0]
+            if fallback_indices.numel() > 0:
+                k = min(cfg.min_num_seeds, fallback_indices.numel())
+                top_local = torch.topk(effective_scores[fallback_indices], k=k).indices
+                selected_indices = fallback_indices[top_local]
 
-        if seed_idx.numel() < cfg.min_num_seeds:
-            fallback_idx = torch.where(eligible)[0]
+        if cfg.topk is not None and selected_indices.numel() > cfg.topk:
+            top_local = torch.topk(effective_scores[selected_indices], k=cfg.topk).indices
+            selected_indices = selected_indices[top_local]
 
-            if fallback_idx.numel() > 0:
-                k = min(cfg.min_num_seeds, fallback_idx.numel())
-                top_local = torch.topk(score[fallback_idx], k=k).indices
-                seed_idx = fallback_idx[top_local]
-
-        if cfg.topk is not None and seed_idx.numel() > cfg.topk:
-            top_local = torch.topk(score[seed_idx], k=cfg.topk).indices
-            seed_idx = seed_idx[top_local]
-
-        seed_scores = score[seed_idx]
-        return seed_idx, seed_scores
+        return SeedSelection(
+            indices=selected_indices,
+            scores=effective_scores[selected_indices],
+            effective_scores=effective_scores,
+            eligible_mask=eligible_mask,
+        )
 
     def _cluster_local(self, seed_sigs_np: np.ndarray, seed_scores_np: np.ndarray) -> np.ndarray:
         cfg = self.cfg.cluster
@@ -284,36 +309,36 @@ class ModularPrototypePredictor:
                 raise ImportError("networkx is required for Louvain clustering")
             if not hasattr(nx.algorithms.community, "louvain_communities"):
                 raise ImportError("This version of networkx does not expose louvain_communities")
-            G = nx.Graph()
-            n = len(seed_sigs_np)
-            G.add_nodes_from(range(n))
+            graph = nx.Graph()
+            num_nodes = len(seed_sigs_np)
+            graph.add_nodes_from(range(num_nodes))
             edges, weights = _build_weighted_graph_edges(affinity, cfg.graph_min_edge_weight)
-            for (u, v), w in zip(edges, weights):
-                G.add_edge(u, v, weight=w)
-            if G.number_of_edges() == 0:
-                return np.arange(n, dtype=np.int64)
-            comms = nx.algorithms.community.louvain_communities(
-                G,
+            for (node_u, node_v), weight in zip(edges, weights):
+                graph.add_edge(node_u, node_v, weight=weight)
+            if graph.number_of_edges() == 0:
+                return np.arange(num_nodes, dtype=np.int64)
+            communities = nx.algorithms.community.louvain_communities(
+                graph,
                 weight="weight",
                 resolution=cfg.louvain_resolution,
                 seed=cfg.random_seed,
             )
-            labels = -np.ones(n, dtype=np.int64)
-            for cid, comm in enumerate(comms):
-                for node in comm:
-                    labels[node] = cid
+            labels = -np.ones(num_nodes, dtype=np.int64)
+            for cluster_id, community in enumerate(communities):
+                for node in community:
+                    labels[node] = cluster_id
             return labels
 
         if method == "leiden":
             if ig is None or leidenalg is None:
                 raise ImportError("igraph + leidenalg are required for Leiden clustering")
-            n = len(seed_sigs_np)
+            num_nodes = len(seed_sigs_np)
             edges, weights = _build_weighted_graph_edges(affinity, cfg.graph_min_edge_weight)
             if len(edges) == 0:
-                return np.arange(n, dtype=np.int64)
-            g = ig.Graph(n=n, edges=edges, directed=False)
+                return np.arange(num_nodes, dtype=np.int64)
+            graph = ig.Graph(n=num_nodes, edges=edges, directed=False)
             partition = leidenalg.find_partition(
-                g,
+                graph,
                 leidenalg.RBConfigurationVertexPartition,
                 weights=weights,
                 resolution_parameter=cfg.leiden_resolution,
@@ -323,396 +348,503 @@ class ModularPrototypePredictor:
 
         raise ValueError(f"Unknown clustering method: {cfg.method}")
 
-    def _cluster_seeds(self, flat: Dict[str, torch.Tensor], seed_idx: torch.Tensor, seed_scores: torch.Tensor):
+    def cluster_seed_queries(self, flat_queries: FlatQueryOutputs, selection: SeedSelection) -> SeedClustering:
         cfg = self.cfg.cluster
-        device = seed_idx.device
+        device = selection.indices.device
 
-        if seed_idx.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=device)
+        if selection.indices.numel() == 0:
+            return SeedClustering(selection=selection, cluster_labels=torch.empty((0,), dtype=torch.long, device=device))
 
-        seed_labels = -torch.ones(seed_idx.numel(), dtype=torch.long, device=device)
+        cluster_labels = -torch.ones(selection.indices.numel(), dtype=torch.long, device=device)
+        cluster_members: list[torch.Tensor] = []
         next_cluster_id = 0
 
         if cfg.cluster_per_class:
-            seed_classes = flat["pred_cls"][seed_idx]
-            unique_classes = seed_classes.unique().tolist()
-            groups = [torch.where(seed_classes == c)[0] for c in unique_classes]
+            seed_classes = flat_queries.predicted_labels[selection.indices]
+            groups = [torch.where(seed_classes == class_id)[0] for class_id in seed_classes.unique().tolist()]
         else:
-            groups = [torch.arange(seed_idx.numel(), device=device)]
+            groups = [torch.arange(selection.indices.numel(), device=device)]
 
-        for pos_group in groups:
-            local_seed_idx = seed_idx[pos_group]
-            local_scores = seed_scores[pos_group]
+        for position_group in groups:
+            local_seed_indices = selection.indices[position_group]
+            local_seed_scores = selection.scores[position_group]
 
-            local_sigs_np = flat["q_sig"][local_seed_idx].detach().cpu().numpy()
-            local_scores_np = local_scores.detach().cpu().numpy()
+            local_signatures_np = flat_queries.signature_embeddings[local_seed_indices].detach().cpu().numpy()
+            local_scores_np = local_seed_scores.detach().cpu().numpy()
 
-            local_labels_np = self._cluster_local(local_sigs_np, local_scores_np)
+            local_labels_np = self._cluster_local(local_signatures_np, local_scores_np)
             local_labels = torch.as_tensor(local_labels_np, device=device)
 
-            good_ids = [int(x) for x in np.unique(local_labels_np) if x != -1]
-            for old_id in good_ids:
-                m = (local_labels == old_id)
-                seed_labels[pos_group[m]] = next_cluster_id
+            valid_cluster_ids = [int(value) for value in np.unique(local_labels_np) if value != -1]
+            for old_cluster_id in valid_cluster_ids:
+                member_positions = position_group[local_labels == old_cluster_id]
+                cluster_labels[member_positions] = next_cluster_id
+                cluster_members.append(selection.indices[member_positions])
                 next_cluster_id += 1
 
             if cfg.promote_noise_to_singletons:
-                noise_pos = pos_group[local_labels == -1]
-                for p in noise_pos:
-                    seed_labels[p] = next_cluster_id
+                noise_positions = position_group[local_labels == -1]
+                for position in noise_positions:
+                    cluster_labels[position] = next_cluster_id
+                    cluster_members.append(selection.indices[position].unsqueeze(0))
                     next_cluster_id += 1
 
-        return seed_labels
+        return SeedClustering(
+            selection=selection,
+            cluster_labels=cluster_labels,
+            cluster_members=cluster_members,
+        )
 
-    def _initialize_prototypes(self, flat: Dict[str, torch.Tensor], seed_idx: torch.Tensor, cluster_labels: torch.Tensor):
-        device = flat["q_sig"].device
-        valid = (cluster_labels >= 0)
+    def _empty_prototype_state(self, flat_queries: FlatQueryOutputs, *, source_query_indices: Optional[torch.Tensor] = None, source_cluster_labels: Optional[torch.Tensor] = None) -> PrototypeState:
+        device = flat_queries.signature_embeddings.device
+        if source_query_indices is None:
+            source_query_indices = torch.empty((0,), dtype=torch.long, device=device)
+        if source_cluster_labels is None:
+            source_cluster_labels = torch.empty((0,), dtype=torch.long, device=device)
+
+        return PrototypeState(
+            signature_embeddings=torch.empty((0, flat_queries.signature_embeddings.shape[-1]), device=device),
+            class_logits=torch.empty((0, flat_queries.class_logits.shape[-1]), device=device),
+            mask_embeddings=torch.empty((0, flat_queries.mask_embeddings.shape[-1]), device=device),
+            cluster_members=[],
+            prototype_seed_indices=torch.empty((0,), dtype=torch.long, device=device),
+            target_indices=None,
+            source_query_indices=source_query_indices,
+            source_cluster_labels=source_cluster_labels,
+            assignment_weights=torch.empty((flat_queries.num_queries, 0), device=device),
+            assignment_strength=torch.empty((0,), device=device),
+        )
+
+    def initialize_clustered_prototypes(self, flat_queries: FlatQueryOutputs, clustering: SeedClustering) -> PrototypeState:
+        device = flat_queries.signature_embeddings.device
+        valid = clustering.cluster_labels >= 0
 
         if valid.sum() == 0:
-            return {
-                "num_prototypes": 0,
-                "proto_sig": torch.empty((0, flat["q_sig"].shape[-1]), device=device),
-                "proto_cls": torch.empty((0, flat["q_cls"].shape[-1]), device=device),
-                "proto_mask_emb": torch.empty((0, flat["q_mask_emb"].shape[-1]), device=device),
-                "cluster_members": [],
-                "proto_seed_idx": torch.empty((0,), dtype=torch.long, device=device),
-                "seed_idx": seed_idx,
-                "seed_cluster_labels": cluster_labels,
-            }
+            return self._empty_prototype_state(
+                flat_queries,
+                source_query_indices=clustering.selection.indices,
+                source_cluster_labels=clustering.cluster_labels,
+            )
 
-        cluster_ids = cluster_labels[valid].unique().tolist()
+        prototype_signatures = []
+        prototype_logits = []
+        prototype_mask_embeddings = []
+        prototype_seed_indices = []
 
-        proto_sig = []
-        proto_cls = []
-        proto_mask_emb = []
-        cluster_members = []
-        proto_seed_idx = []
+        for member_query_indices in clustering.cluster_members:
+            representative_local = torch.argmax(flat_queries.seed_scores[member_query_indices])
+            representative_query_index = member_query_indices[representative_local]
+            prototype_seed_indices.append(representative_query_index)
 
-        for cid in cluster_ids:
-            member_seed_idx = seed_idx[cluster_labels == cid]
-            cluster_members.append(member_seed_idx)
+            weights = flat_queries.seed_scores[member_query_indices]
+            weights = weights / (weights.sum() + 1e-6)
 
-            rep_local = torch.argmax(flat["q_seed"][member_seed_idx])
-            rep_seed_idx = member_seed_idx[rep_local]
-            proto_seed_idx.append(rep_seed_idx)
+            prototype_logits.append((flat_queries.class_logits[member_query_indices] * weights.unsqueeze(1)).sum(dim=0))
+            prototype_mask_embeddings.append((flat_queries.mask_embeddings[member_query_indices] * weights.unsqueeze(1)).sum(dim=0))
+            prototype_signatures.append(flat_queries.signature_embeddings[representative_query_index])
 
-            w = flat["q_seed"][member_seed_idx]
-            w = w / (w.sum() + 1e-6)
+        return PrototypeState(
+            signature_embeddings=torch.stack(prototype_signatures, dim=0),
+            class_logits=torch.stack(prototype_logits, dim=0),
+            mask_embeddings=torch.stack(prototype_mask_embeddings, dim=0),
+            cluster_members=clustering.cluster_members,
+            prototype_seed_indices=torch.stack(prototype_seed_indices, dim=0),
+            target_indices=None,
+            source_query_indices=clustering.selection.indices,
+            source_cluster_labels=clustering.cluster_labels,
+            assignment_weights=torch.empty((flat_queries.num_queries, 0), device=device),
+            assignment_strength=torch.empty((0,), device=device),
+        )
 
-            p_cls = (flat["q_cls"][member_seed_idx] * w.unsqueeze(1)).sum(dim=0)
-            p_mask = (flat["q_mask_emb"][member_seed_idx] * w.unsqueeze(1)).sum(dim=0)
-
-            proto_sig.append(flat["q_sig"][rep_seed_idx])
-            proto_cls.append(p_cls)
-            proto_mask_emb.append(p_mask)
-
-        return {
-            "num_prototypes": len(cluster_ids),
-            "proto_sig": torch.stack(proto_sig, dim=0),
-            "proto_cls": torch.stack(proto_cls, dim=0),
-            "proto_mask_emb": torch.stack(proto_mask_emb, dim=0),
-            "cluster_members": cluster_members,
-            "proto_seed_idx": torch.stack(proto_seed_idx, dim=0),
-            "seed_idx": seed_idx,
-            "seed_cluster_labels": cluster_labels,
-        }
-
-    def _soft_refine_prototypes(self, model: CustomMask2Former, flat: Dict[str, torch.Tensor], proto_state: Dict[str, Any]):
+    def refine_prototypes(self, model: CustomMask2Former, flat_queries: FlatQueryOutputs, prototypes: PrototypeState) -> PrototypeState:
         cfg = self.cfg.assign
-        device = flat["q_sig"].device
+        device = flat_queries.signature_embeddings.device
 
-        if proto_state["num_prototypes"] == 0:
-            return proto_state
+        if prototypes.num_prototypes == 0:
+            return prototypes
 
         if cfg.use_all_queries:
-            q_idx = torch.arange(flat["q_sig"].shape[0], device=device)
+            source_query_indices = torch.arange(flat_queries.num_queries, device=device)
         else:
-            q_idx = proto_state["seed_idx"]
+            source_query_indices = prototypes.source_query_indices
 
-        q_sig = flat["q_sig"][q_idx]
-        q_cls = flat["q_cls"][q_idx]
-        q_cls_prob = flat["q_cls_prob"][q_idx]
-        q_mask_emb = flat["q_mask_emb"][q_idx]
+        query_signatures = flat_queries.signature_embeddings[source_query_indices]
+        query_logits = flat_queries.class_logits[source_query_indices]
+        query_probabilities = flat_queries.class_probabilities[source_query_indices]
+        query_mask_embeddings = flat_queries.mask_embeddings[source_query_indices]
 
-        proto_sig = proto_state["proto_sig"]
-        proto_cls = proto_state["proto_cls"]
+        prototype_signatures = prototypes.signature_embeddings
+        prototype_logits = prototypes.class_logits
 
         alpha = _alpha_value(model.alpha_focal) if cfg.use_alpha_focal else 1.0
+        final_raw_weights = None
+        final_normalized_weights = None
 
-        final_norm_w = None
-        final_raw_w = None
-
-        n_steps = max(1, cfg.refinement_steps)
-        for _ in range(n_steps):
-            sim = torch.matmul(q_sig, proto_sig.T)
-            affinity = _assignment_affinity(sim, flat["q_influence"][q_idx], cfg.similarity_floor)
-            raw_w = affinity.pow(alpha)
+        for _ in range(max(1, cfg.refinement_steps)):
+            similarity = torch.matmul(query_signatures, prototype_signatures.T)
+            affinity = _assignment_affinity(similarity, flat_queries.influence_scores[source_query_indices], cfg.similarity_floor)
+            raw_weights = affinity.pow(alpha)
 
             if cfg.use_query_quality:
-                raw_w = raw_w * flat["q_seed"][q_idx].pow(cfg.query_quality_power).unsqueeze(1)
+                raw_weights = raw_weights * flat_queries.seed_scores[source_query_indices].pow(cfg.query_quality_power).unsqueeze(1)
 
-            proto_cls_prob = None
+            prototype_probabilities = None
             if cfg.use_foreground_prob or cfg.class_compat_power > 0:
-                proto_cls_prob = F.softmax(proto_cls, dim=-1)
+                prototype_probabilities = F.softmax(prototype_logits, dim=-1)
 
             if cfg.use_foreground_prob:
-                q_fg_conf = flat["fg_conf"][q_idx]
-                q_bg_conf = flat["bg_conf"][q_idx]
-                proto_bg_conf = proto_cls_prob[:, 0]
-                proto_fg_conf = 1.0 - proto_bg_conf
-                partition_compat = (
-                    q_fg_conf[:, None] * proto_fg_conf[None, :]
-                    + q_bg_conf[:, None] * proto_bg_conf[None, :]
-                )
-                raw_w = raw_w * partition_compat.clamp_min(1e-6).pow(cfg.foreground_prob_power)
+                query_fg = flat_queries.foreground_confidence[source_query_indices]
+                query_bg = flat_queries.background_confidence[source_query_indices]
+                prototype_bg = prototype_probabilities[:, 0]
+                prototype_fg = 1.0 - prototype_bg
+                partition_compatibility = query_fg[:, None] * prototype_fg[None, :] + query_bg[:, None] * prototype_bg[None, :]
+                raw_weights = raw_weights * partition_compatibility.clamp_min(1e-6).pow(cfg.foreground_prob_power)
 
             if cfg.class_compat_power > 0:
-                class_compat = torch.matmul(q_cls_prob, proto_cls_prob.T).clamp_min(1e-6)
-                raw_w = raw_w * class_compat.pow(cfg.class_compat_power)
+                class_compatibility = torch.matmul(query_probabilities, prototype_probabilities.T).clamp_min(1e-6)
+                raw_weights = raw_weights * class_compatibility.pow(cfg.class_compat_power)
 
             if cfg.normalize_over_queries:
-                norm_w = raw_w / (raw_w.sum(dim=0, keepdim=True) + 1e-6)
+                normalized_weights = raw_weights / (raw_weights.sum(dim=0, keepdim=True) + 1e-6)
             else:
-                norm_w = raw_w / (raw_w.sum(dim=1, keepdim=True) + 1e-6)
+                normalized_weights = raw_weights / (raw_weights.sum(dim=1, keepdim=True) + 1e-6)
 
-            proto_mask_emb = torch.matmul(norm_w.T, q_mask_emb)
-            proto_cls = torch.matmul(norm_w.T, q_cls)
+            prototype_logits = torch.matmul(normalized_weights.T, query_logits)
+            prototype_mask_embeddings = torch.matmul(normalized_weights.T, query_mask_embeddings)
 
-            final_raw_w = raw_w
-            final_norm_w = norm_w
+            final_raw_weights = raw_weights
+            final_normalized_weights = normalized_weights
 
-        full_norm_w = torch.zeros(
-            flat["q_sig"].shape[0],
-            proto_sig.shape[0],
+        assignment_weights = torch.zeros(
+            (flat_queries.num_queries, prototypes.num_prototypes),
             device=device,
-            dtype=proto_sig.dtype,
+            dtype=prototype_signatures.dtype,
         )
-        full_norm_w[q_idx] = final_norm_w
+        assignment_weights[source_query_indices] = final_normalized_weights
 
-        proto_state = dict(proto_state)
-        proto_state.update({
-            "proto_sig": proto_sig,
-            "proto_cls": proto_cls,
-            "proto_mask_emb": proto_mask_emb,
-            "assignment_weights": full_norm_w,
-            "assignment_strength": final_raw_w.sum(dim=0),
-        })
-        return proto_state
+        return PrototypeState(
+            signature_embeddings=prototype_signatures,
+            class_logits=prototype_logits,
+            mask_embeddings=prototype_mask_embeddings,
+            cluster_members=prototypes.cluster_members,
+            prototype_seed_indices=prototypes.prototype_seed_indices,
+            target_indices=prototypes.target_indices,
+            source_query_indices=prototypes.source_query_indices,
+            source_cluster_labels=prototypes.source_cluster_labels,
+            assignment_weights=assignment_weights,
+            assignment_strength=final_raw_weights.sum(dim=0),
+        )
 
-    def _build_gt_proto_state(
+    def build_signature_prototypes(
+        self,
+        model: CustomMask2Former,
+        flat_queries: FlatQueryOutputs,
+        signature_embeddings: torch.Tensor,
+        *,
+        prototype_seed_indices: Optional[torch.Tensor] = None,
+        target_indices: Optional[torch.Tensor] = None,
+    ) -> PrototypeState:
+        device = flat_queries.signature_embeddings.device
+        num_prototypes = int(signature_embeddings.shape[0])
+        if num_prototypes == 0:
+            return self._empty_prototype_state(flat_queries)
+
+        alpha = _alpha_value(model.alpha_focal) if self.cfg.assign.use_alpha_focal else 1.0
+        similarity = torch.matmul(flat_queries.signature_embeddings, signature_embeddings.T)
+        affinity = _assignment_affinity(similarity, flat_queries.influence_scores, self.cfg.assign.similarity_floor)
+        raw_weights = affinity.pow(alpha)
+        normalized_weights = raw_weights / (raw_weights.sum(dim=0, keepdim=True) + 1e-6)
+
+        prototype_mask_embeddings = torch.matmul(normalized_weights.T, flat_queries.mask_embeddings)
+        prototype_logits = torch.matmul(normalized_weights.T, flat_queries.class_logits)
+
+        if prototype_seed_indices is None:
+            prototype_seed_indices = torch.full((num_prototypes,), -1, dtype=torch.long, device=device)
+            cluster_members: list[torch.Tensor] = []
+        else:
+            cluster_members = [query_index.unsqueeze(0) for query_index in prototype_seed_indices]
+
+        return PrototypeState(
+            signature_embeddings=signature_embeddings,
+            class_logits=prototype_logits,
+            mask_embeddings=prototype_mask_embeddings,
+            cluster_members=cluster_members,
+            prototype_seed_indices=prototype_seed_indices,
+            target_indices=target_indices,
+            source_query_indices=torch.arange(flat_queries.num_queries, device=device),
+            source_cluster_labels=torch.arange(num_prototypes, device=device),
+            assignment_weights=normalized_weights,
+            assignment_strength=raw_weights.sum(dim=0),
+        )
+
+    def encode_gt_signatures(
         self,
         model: CustomMask2Former,
         raw: RawOutputs,
-        flat: Dict[str, torch.Tensor],
         targets,
-        b: int,
-    ):
-        device = flat["q_sig"].device
-        labels = targets[b]["labels"].to(device)
-        masks = targets[b]["masks"].to(device).float()
+        batch_index: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        labels = targets[batch_index]["labels"].to(device)
+        masks = targets[batch_index]["masks"].to(device).float()
 
         if labels.numel() == 0:
-            return {
-                "num_prototypes": 0,
-                "proto_sig": torch.empty((0, flat["q_sig"].shape[-1]), device=device),
-                "proto_cls": torch.empty((0, flat["q_cls"].shape[-1]), device=device),
-                "proto_mask_emb": torch.empty((0, flat["q_mask_emb"].shape[-1]), device=device),
-                "cluster_members": [],
-                "proto_seed_idx": torch.empty((0,), dtype=torch.long, device=device),
-                "seed_idx": torch.empty((0,), dtype=torch.long, device=device),
-                "seed_cluster_labels": torch.empty((0,), dtype=torch.long, device=device),
-                "assignment_weights": torch.empty((flat["q_sig"].shape[0], 0), device=device),
-                "assignment_strength": torch.empty((0,), device=device),
-            }
+            return torch.empty((0, raw.sig_embs.shape[-1]), device=device)
 
         gt_masks = masks.unsqueeze(0)
         gt_labels = labels.unsqueeze(0)
         gt_pad_mask = torch.ones((1, labels.shape[0]), dtype=torch.bool, device=device)
 
-        gt_sig = model.encode_gts(
-            raw.memory[b:b + 1],
-            raw.features[b:b + 1],
+        return model.encode_gts(
+            raw.memory[batch_index:batch_index + 1],
+            raw.features[batch_index:batch_index + 1],
             gt_masks,
             gt_labels,
             gt_pad_mask,
             ttt_steps_override=self.cfg.ttt_steps,
         )[0]
 
-        q_sig = flat["q_sig"]
-        q_cls = flat["q_cls"]
-        q_mask_emb = flat["q_mask_emb"]
+    def build_gt_signature_prototypes(
+        self,
+        model: CustomMask2Former,
+        raw: RawOutputs,
+        flat_queries: FlatQueryOutputs,
+        targets,
+        batch_index: int,
+    ) -> PrototypeState:
+        device = flat_queries.signature_embeddings.device
+        labels = targets[batch_index]["labels"].to(device)
 
-        alpha = _alpha_value(model.alpha_focal) if self.cfg.assign.use_alpha_focal else 1.0
-        sim = torch.matmul(q_sig, gt_sig.T)
-        affinity = _assignment_affinity(sim, flat["q_influence"], self.cfg.assign.similarity_floor)
-        raw_w = affinity.pow(alpha)
+        if labels.numel() == 0:
+            return self._empty_prototype_state(flat_queries)
 
-        # Keep GT-oracle assignment aligned with training:
-        # training uses similarity + influence only before query-normalization.
-        norm_w = raw_w / (raw_w.sum(dim=0, keepdim=True) + 1e-6)
+        gt_signatures = self.encode_gt_signatures(model, raw, targets, batch_index, device)
 
-        proto_mask_emb = torch.matmul(norm_w.T, q_mask_emb)
-        proto_cls = torch.matmul(norm_w.T, q_cls)
+        return self.build_signature_prototypes(
+            model,
+            flat_queries,
+            gt_signatures,
+            target_indices=torch.arange(labels.shape[0], device=device, dtype=torch.long),
+        )
 
-        return {
-            "num_prototypes": labels.shape[0],
-            "proto_sig": gt_sig,
-            "proto_cls": proto_cls,
-            "proto_mask_emb": proto_mask_emb,
-            "cluster_members": [],
-            "proto_seed_idx": torch.full((labels.shape[0],), -1, dtype=torch.long, device=device),
-            "seed_idx": torch.arange(labels.shape[0], device=device),
-            "seed_cluster_labels": torch.arange(labels.shape[0], device=device),
-            "assignment_weights": norm_w,
-            "assignment_strength": raw_w.sum(dim=0),
-        }
-
-    def _decode_and_resolve(self, flat: Dict[str, torch.Tensor], proto_state: Dict[str, Any]):
+    def resolve_prediction(self, flat_queries: FlatQueryOutputs, prototypes: PrototypeState) -> ResolvedPrediction:
         cfg = self.cfg.overlap
-        features = flat["features"]
-        H_img, W_img = flat["H_img"], flat["W_img"]
+        features = flat_queries.features
+        image_height, image_width = flat_queries.image_height, flat_queries.image_width
 
-        proto_mask_emb = proto_state["proto_mask_emb"]
-        proto_cls = proto_state["proto_cls"]
-        proto_sig = proto_state["proto_sig"]
+        if prototypes.num_prototypes == 0:
+            empty_mask_grid = torch.empty((0, image_height, image_width), device=features.device)
+            return ResolvedPrediction(
+                flat_queries=flat_queries,
+                prototypes=prototypes,
+                kept_prototype_indices=torch.empty((0,), dtype=torch.long, device=features.device),
+                resolved_target_indices=None,
+                signature_embeddings=torch.empty((0, flat_queries.signature_embeddings.shape[-1]), device=features.device),
+                class_logits=torch.empty((0, flat_queries.class_logits.shape[-1]), device=features.device),
+                class_probabilities=torch.empty((0, flat_queries.class_logits.shape[-1]), device=features.device),
+                mask_embeddings=torch.empty((0, flat_queries.mask_embeddings.shape[-1]), device=features.device),
+                scores=torch.empty((0,), device=features.device),
+                raw_mask_logits=empty_mask_grid,
+                raw_mask_probabilities=empty_mask_grid,
+                resolved_masks=[],
+                resolved_labels=[],
+                resolved_scores=[],
+            )
 
-        if proto_mask_emb.shape[0] == 0:
-            return {
-                "seed_idx": proto_state["seed_idx"],
-                "seed_cluster_labels": proto_state["seed_cluster_labels"],
-                "cluster_members": proto_state["cluster_members"],
-                "proto_seed_idx": proto_state["proto_seed_idx"],
-                "assignment_weights": torch.empty((flat["q_sig"].shape[0], 0), device=flat["q_sig"].device),
-                "all_proto_sig": proto_state["proto_sig"],
-                "proto_sig": torch.empty((0, flat["q_sig"].shape[-1]), device=flat["q_sig"].device),
-                "proto_cls": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
-                "proto_cls_prob": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
-                "proto_mask_emb": torch.empty((0, flat["q_mask_emb"].shape[-1]), device=flat["q_sig"].device),
-                "proto_score": torch.empty((0,), device=flat["q_sig"].device),
-                "raw_mask_logits": torch.empty((0, H_img, W_img), device=flat["q_sig"].device),
-                "raw_mask_probs": torch.empty((0, H_img, W_img), device=flat["q_sig"].device),
-                "resolved_masks": [],
-                "resolved_labels": [],
-                "resolved_scores": [],
-            }
-
-        mask_logits = torch.einsum("pc,chw->phw", proto_mask_emb, features)
+        mask_logits = torch.einsum("pc,chw->phw", prototypes.mask_embeddings, features)
         mask_logits = F.interpolate(
             mask_logits.unsqueeze(0),
-            size=(H_img, W_img),
+            size=(image_height, image_width),
             mode="bilinear",
             align_corners=False,
         )[0]
-        mask_probs = F.softmax(mask_logits, dim=0)
+        mask_probabilities = F.softmax(mask_logits, dim=0)
 
-        cls_prob = F.softmax(proto_cls, dim=-1)
-        pred_cls = cls_prob.argmax(dim=-1)
-        cls_conf = cls_prob.max(dim=-1).values
-        fg_conf = 1.0 - cls_prob[:, 0]
+        class_probabilities = F.softmax(prototypes.class_logits, dim=-1)
+        predicted_labels = class_probabilities.argmax(dim=-1)
+        class_confidence = class_probabilities.max(dim=-1).values
+        foreground_confidence = 1.0 - class_probabilities[:, 0]
 
-        proto_score = torch.ones_like(cls_conf)
-
+        prototype_scores = torch.ones_like(class_confidence)
         if cfg.use_class_confidence:
-            proto_score = proto_score * cls_conf
+            prototype_scores = prototype_scores * class_confidence
         if cfg.use_foreground_confidence:
-            proto_score = proto_score * fg_conf
-        if cfg.use_assignment_strength:
-            assign_strength = proto_state["assignment_strength"]
-            assign_strength = assign_strength / (assign_strength.max() + 1e-6)
-            proto_score = proto_score * assign_strength.pow(cfg.assignment_strength_power)
+            prototype_scores = prototype_scores * foreground_confidence
+        if cfg.use_assignment_strength and prototypes.assignment_strength.numel() > 0:
+            normalized_strength = prototypes.assignment_strength / (prototypes.assignment_strength.max() + 1e-6)
+            prototype_scores = prototype_scores * normalized_strength.pow(cfg.assignment_strength_power)
 
-        keep = torch.ones_like(proto_score, dtype=torch.bool)
+        keep_mask = torch.ones_like(prototype_scores, dtype=torch.bool)
         if cfg.remove_background:
-            keep &= (pred_cls != 0)
-        keep &= (proto_score >= cfg.min_prototype_score)
+            keep_mask &= predicted_labels != 0
+        keep_mask &= prototype_scores >= cfg.min_prototype_score
 
-        if keep.sum() == 0:
-            return {
-                "seed_idx": proto_state["seed_idx"],
-                "seed_cluster_labels": proto_state["seed_cluster_labels"],
-                "cluster_members": proto_state["cluster_members"],
-                "proto_seed_idx": proto_state["proto_seed_idx"],
-                "assignment_weights": proto_state["assignment_weights"],
-                "all_proto_sig": proto_state["proto_sig"],
-                "proto_sig": torch.empty((0, flat["q_sig"].shape[-1]), device=flat["q_sig"].device),
-                "proto_cls": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
-                "proto_cls_prob": torch.empty((0, flat["q_cls"].shape[-1]), device=flat["q_sig"].device),
-                "proto_mask_emb": torch.empty((0, flat["q_mask_emb"].shape[-1]), device=flat["q_sig"].device),
-                "proto_score": torch.empty((0,), device=flat["q_sig"].device),
-                "raw_mask_logits": torch.empty((0, H_img, W_img), device=flat["q_sig"].device),
-                "raw_mask_probs": torch.empty((0, H_img, W_img), device=flat["q_sig"].device),
-                "resolved_masks": [],
-                "resolved_labels": [],
-                "resolved_scores": [],
-            }
+        if keep_mask.sum() == 0:
+            empty_mask_grid = torch.empty((0, image_height, image_width), device=features.device)
+            return ResolvedPrediction(
+                flat_queries=flat_queries,
+                prototypes=prototypes,
+                kept_prototype_indices=torch.empty((0,), dtype=torch.long, device=features.device),
+                resolved_target_indices=None,
+                signature_embeddings=torch.empty((0, flat_queries.signature_embeddings.shape[-1]), device=features.device),
+                class_logits=torch.empty((0, flat_queries.class_logits.shape[-1]), device=features.device),
+                class_probabilities=torch.empty((0, flat_queries.class_logits.shape[-1]), device=features.device),
+                mask_embeddings=torch.empty((0, flat_queries.mask_embeddings.shape[-1]), device=features.device),
+                scores=torch.empty((0,), device=features.device),
+                raw_mask_logits=empty_mask_grid,
+                raw_mask_probabilities=empty_mask_grid,
+                resolved_masks=[],
+                resolved_labels=[],
+                resolved_scores=[],
+            )
 
-        keep_idx = torch.where(keep)[0]
-        mask_probs_kept = mask_probs[keep]
-        mask_logits_kept = mask_logits[keep]
-        cls_prob_kept = cls_prob[keep]
-        pred_cls_kept = pred_cls[keep]
-        proto_score_kept = proto_score[keep]
-        proto_sig_kept = proto_sig[keep]
-        proto_cls_kept = proto_cls[keep]
-        proto_mask_emb_kept = proto_mask_emb[keep]
+        kept_prototype_indices = torch.where(keep_mask)[0]
+        kept_mask_probabilities = mask_probabilities[keep_mask]
+        kept_mask_logits = mask_logits[keep_mask]
+        kept_class_probabilities = class_probabilities[keep_mask]
+        kept_predicted_labels = predicted_labels[keep_mask]
+        kept_scores = prototype_scores[keep_mask]
+        kept_signatures = prototypes.signature_embeddings[keep_mask]
+        kept_logits = prototypes.class_logits[keep_mask]
+        kept_mask_embeddings = prototypes.mask_embeddings[keep_mask]
+        kept_target_indices = None if prototypes.target_indices is None else prototypes.target_indices[keep_mask]
 
-        pixel_scores = mask_probs * proto_score[:, None, None]
+        pixel_scores = mask_probabilities * prototype_scores[:, None, None]
         max_pixel_score, winners = pixel_scores.max(dim=0)
 
         resolved_masks = []
         resolved_labels = []
         resolved_scores = []
+        resolved_target_indices = []
 
-        for kept_pos, proto_idx in enumerate(keep_idx.tolist()):
-            m = (winners == proto_idx) & (max_pixel_score >= cfg.pixel_score_threshold)
-            m &= (mask_probs[proto_idx] >= cfg.mask_threshold)
-            m = self._apply_morphology(m)
+        for kept_position, prototype_index in enumerate(kept_prototype_indices.tolist()):
+            mask = (winners == prototype_index) & (max_pixel_score >= cfg.pixel_score_threshold)
+            mask &= mask_probabilities[prototype_index] >= cfg.mask_threshold
+            mask = self._apply_morphology(mask)
 
-            if m.sum().item() < cfg.min_area:
+            if mask.sum().item() < cfg.min_area:
                 continue
 
-            resolved_masks.append(m)
-            resolved_labels.append(int(pred_cls_kept[kept_pos].item()))
-            resolved_scores.append(float(proto_score_kept[kept_pos].item()))
+            resolved_masks.append(mask)
+            resolved_labels.append(int(kept_predicted_labels[kept_position].item()))
+            resolved_scores.append(float(kept_scores[kept_position].item()))
+            if kept_target_indices is not None:
+                resolved_target_indices.append(int(kept_target_indices[kept_position].item()))
 
-        return {
-            "seed_idx": proto_state["seed_idx"],
-            "seed_cluster_labels": proto_state["seed_cluster_labels"],
-            "cluster_members": proto_state["cluster_members"],
-            "proto_seed_idx": proto_state["proto_seed_idx"][keep] if proto_state["proto_seed_idx"].numel() > 0 else proto_state["proto_seed_idx"],
-            "assignment_weights": proto_state["assignment_weights"],
+        return ResolvedPrediction(
+            flat_queries=flat_queries,
+            prototypes=prototypes,
+            kept_prototype_indices=kept_prototype_indices,
+            resolved_target_indices=None if kept_target_indices is None else torch.as_tensor(
+                resolved_target_indices,
+                device=features.device,
+                dtype=torch.long,
+            ),
+            signature_embeddings=kept_signatures,
+            class_logits=kept_logits,
+            class_probabilities=kept_class_probabilities,
+            mask_embeddings=kept_mask_embeddings,
+            scores=kept_scores,
+            raw_mask_logits=kept_mask_logits,
+            raw_mask_probabilities=kept_mask_probabilities,
+            resolved_masks=resolved_masks,
+            resolved_labels=resolved_labels,
+            resolved_scores=resolved_scores,
+        )
 
-            "all_proto_sig": proto_state["proto_sig"],
-            "proto_sig": proto_sig_kept,
-            "proto_cls": proto_cls_kept,
-            "proto_cls_prob": cls_prob_kept,
-            "proto_mask_emb": proto_mask_emb_kept,
-            "proto_score": proto_score_kept,
+    def predict_clustered_single(self, model: CustomMask2Former, raw: RawOutputs, batch_index: int) -> ResolvedPrediction:
+        flat_queries = self.flatten_outputs(raw, batch_index)
+        seed_selection = self.select_seed_queries(flat_queries)
+        seed_clustering = self.cluster_seed_queries(flat_queries, seed_selection)
+        prototypes = self.initialize_clustered_prototypes(flat_queries, seed_clustering)
+        prototypes = self.refine_prototypes(model, flat_queries, prototypes)
+        return self.resolve_prediction(flat_queries, prototypes)
 
-            "raw_mask_logits": mask_logits_kept,
-            "raw_mask_probs": mask_probs_kept,
+    def predict_with_gt_signatures_single(self, model: CustomMask2Former, raw: RawOutputs, targets, batch_index: int) -> ResolvedPrediction:
+        flat_queries = self.flatten_outputs(raw, batch_index)
+        prototypes = self.build_gt_signature_prototypes(model, raw, flat_queries, targets, batch_index)
+        return self.resolve_prediction(flat_queries, prototypes)
 
-            "resolved_masks": resolved_masks,
-            "resolved_labels": resolved_labels,
-            "resolved_scores": resolved_scores,
-        }
+    def predict_with_golden_queries_single(
+        self,
+        model: CustomMask2Former,
+        raw: RawOutputs,
+        targets,
+        batch_index: int,
+    ) -> tuple[ResolvedPrediction, GoldenQueryDiagnostics]:
+        flat_queries = self.flatten_outputs(raw, batch_index)
+        gt_signatures = self.encode_gt_signatures(
+            model,
+            raw,
+            targets,
+            batch_index,
+            flat_queries.signature_embeddings.device,
+        )
 
-    def _predict_single(self, model: CustomMask2Former, raw: RawOutputs, b: int):
-        flat = self._flatten_outputs(raw, b)
-        seed_idx, seed_scores = self._select_seeds(flat)
-        cluster_labels = self._cluster_seeds(flat, seed_idx, seed_scores)
-        proto_state = self._initialize_prototypes(flat, seed_idx, cluster_labels)
-        proto_state = self._soft_refine_prototypes(model, flat, proto_state)
-        pred = self._decode_and_resolve(flat, proto_state)
-        pred["flat"] = flat
-        return pred
+        candidate_indices = torch.arange(flat_queries.num_queries, device=flat_queries.signature_embeddings.device)
+        if gt_signatures.shape[0] == 0 or candidate_indices.numel() == 0:
+            empty_prediction = self.resolve_prediction(flat_queries, self._empty_prototype_state(flat_queries))
+            return empty_prediction, GoldenQueryDiagnostics()
 
-    def _predict_single_with_gt_prototypes(self, model: CustomMask2Former, raw: RawOutputs, targets, b: int):
-        flat = self._flatten_outputs(raw, b)
-        proto_state = self._build_gt_proto_state(model, raw, flat, targets, b)
-        pred = self._decode_and_resolve(flat, proto_state)
-        pred["flat"] = flat
-        return pred
+        query_signatures = flat_queries.signature_embeddings[candidate_indices]
+        distances = _pairwise_cosine_distance(query_signatures, gt_signatures)
+
+        num_queries, num_gt = distances.shape
+        size = max(num_queries, num_gt)
+        cost = np.full((size, size), 1.0, dtype=np.float64)
+        cost[:num_queries, :num_gt] = distances.detach().cpu().numpy()
+
+        row_ind, col_ind = linear_sum_assignment(cost)
+
+        matched_local_query_indices = []
+        matched_target_indices = []
+        matched_distances = []
+        for query_index, gt_index in zip(row_ind.tolist(), col_ind.tolist()):
+            if query_index >= num_queries or gt_index >= num_gt:
+                continue
+            matched_local_query_indices.append(query_index)
+            matched_target_indices.append(gt_index)
+            matched_distances.append(float(distances[query_index, gt_index].item()))
+
+        matched_mask = torch.zeros(candidate_indices.numel(), dtype=torch.bool, device=candidate_indices.device)
+        if matched_local_query_indices:
+            matched_mask[torch.as_tensor(matched_local_query_indices, device=candidate_indices.device)] = True
+
+        matched_query_indices = candidate_indices[matched_mask]
+        matched_gt_indices = (
+            torch.as_tensor(matched_target_indices, device=candidate_indices.device, dtype=torch.long)
+            if matched_target_indices
+            else torch.empty((0,), device=candidate_indices.device, dtype=torch.long)
+        )
+        unmatched_query_distances = []
+        if (~matched_mask).any():
+            unmatched_query_distances = distances[~matched_mask].min(dim=1).values.detach().cpu().tolist()
+
+        matched_query_signatures = flat_queries.signature_embeddings[matched_query_indices]
+        prototypes = self.build_signature_prototypes(
+            model,
+            flat_queries,
+            matched_query_signatures,
+            prototype_seed_indices=matched_query_indices,
+            target_indices=matched_gt_indices,
+        )
+        prediction = self.resolve_prediction(flat_queries, prototypes)
+        diagnostics = GoldenQueryDiagnostics(
+            matched_query_distances=matched_distances,
+            unmatched_query_closest_gt_distances=unmatched_query_distances,
+        )
+        return prediction, diagnostics
+
+    def predict_evaluation_views_single(self, model: CustomMask2Former, raw: RawOutputs, targets, batch_index: int) -> EvaluationPredictionSet:
+        clustering_prediction = self.predict_clustered_single(model, raw, batch_index)
+        gt_signature_prediction = self.predict_with_gt_signatures_single(model, raw, targets, batch_index)
+        golden_query_prediction, golden_query_diagnostics = self.predict_with_golden_queries_single(model, raw, targets, batch_index)
+        return EvaluationPredictionSet(
+            clustering=clustering_prediction,
+            gt_signatures=gt_signature_prediction,
+            golden_queries=golden_query_prediction,
+            golden_query_diagnostics=golden_query_diagnostics,
+        )
 
 
 class StandardMask2FormerPredictor:
@@ -726,104 +858,119 @@ class StandardMask2FormerPredictor:
 
     @torch.no_grad()
     def predict_from_raw(self, model: Mask2FormerBase, raw: RawOutputs):
-        B = raw.features.shape[0]
-        preds = [self._predict_single(model, raw, b) for b in range(B)]
-        return preds[0] if B == 1 else preds
+        batch_predictions = [self._predict_single(model, raw, batch_index) for batch_index in range(raw.features.shape[0])]
+        return batch_predictions[0] if len(batch_predictions) == 1 else batch_predictions
 
     @torch.no_grad()
     def predict_from_raw_with_gt_prototypes(self, model: Mask2FormerBase, raw: RawOutputs, targets):
         del targets
         return self.predict_from_raw(model, raw)
 
-    def _flatten_outputs(self, raw: RawOutputs, b: int) -> Dict[str, torch.Tensor]:
-        q_mask_emb = raw.mask_embs[-1, b]
-        q_cls = raw.cls_preds[-1, b]
-        q_cls_prob = F.softmax(q_cls, dim=-1)
+    @torch.no_grad()
+    def predict_evaluation_views_from_raw(self, model: Mask2FormerBase, raw: RawOutputs, targets):
+        del targets
+        batch_predictions = [
+            EvaluationPredictionSet(
+                clustering=self._predict_single(model, raw, batch_index),
+                gt_signatures=None,
+                golden_queries=None,
+            )
+            for batch_index in range(raw.features.shape[0])
+        ]
+        return batch_predictions[0] if len(batch_predictions) == 1 else batch_predictions
 
-        return {
-            "features": raw.features[b],
-            "H_img": raw.img_shape[0],
-            "W_img": raw.img_shape[1],
-            "q_mask_emb": q_mask_emb,
-            "q_cls": q_cls,
-            "q_cls_prob": q_cls_prob,
-            "q_seed": q_cls_prob.max(dim=-1).values,
-            "q_influence": None,
-            "pred_cls": q_cls_prob.argmax(dim=-1),
-            "bg_conf": q_cls_prob[:, 0],
-            "fg_conf": 1.0 - q_cls_prob[:, 0],
-        }
+    def _flatten_outputs(self, raw: RawOutputs, batch_index: int) -> FlatQueryOutputs:
+        query_mask_embeddings = raw.mask_embs[-1, batch_index]
+        query_class_logits = raw.cls_preds[-1, batch_index]
+        query_class_probabilities = F.softmax(query_class_logits, dim=-1)
+        predicted_labels = query_class_probabilities.argmax(dim=-1)
 
-    def _predict_single(self, model: Mask2FormerBase, raw: RawOutputs, b: int):
+        return FlatQueryOutputs(
+            features=raw.features[batch_index],
+            image_height=raw.img_shape[0],
+            image_width=raw.img_shape[1],
+            num_decoder_layers=1,
+            queries_per_layer=query_mask_embeddings.shape[0],
+            mask_embeddings=query_mask_embeddings,
+            class_logits=query_class_logits,
+            class_probabilities=query_class_probabilities,
+            signature_embeddings=torch.empty((query_mask_embeddings.shape[0], 0), device=query_mask_embeddings.device),
+            seed_scores=query_class_probabilities.max(dim=-1).values,
+            influence_scores=torch.zeros((query_mask_embeddings.shape[0],), device=query_mask_embeddings.device),
+            background_confidence=query_class_probabilities[:, 0],
+            foreground_confidence=1.0 - query_class_probabilities[:, 0],
+            partition_confidence=torch.where(
+                predicted_labels == 0,
+                query_class_probabilities[:, 0],
+                1.0 - query_class_probabilities[:, 0],
+            ),
+            predicted_labels=predicted_labels,
+        )
+
+    def _predict_single(self, model: Mask2FormerBase, raw: RawOutputs, batch_index: int) -> ResolvedPrediction:
         del model
 
-        flat = self._flatten_outputs(raw, b)
+        flat_queries = self._flatten_outputs(raw, batch_index)
         cfg = self.cfg.overlap
 
-        features = flat["features"]
-        q_mask_emb = flat["q_mask_emb"]
-        q_cls = flat["q_cls"]
-        q_cls_prob = flat["q_cls_prob"]
-        pred_cls = flat["pred_cls"]
-
-        mask_logits = torch.einsum("qc,chw->qhw", q_mask_emb, features)
+        mask_logits = torch.einsum("qc,chw->qhw", flat_queries.mask_embeddings, flat_queries.features)
         mask_logits = F.interpolate(
             mask_logits.unsqueeze(0),
-            size=(flat["H_img"], flat["W_img"]),
+            size=(flat_queries.image_height, flat_queries.image_width),
             mode="bilinear",
             align_corners=False,
         )[0]
-        mask_probs = torch.sigmoid(mask_logits)
-        binary_masks = mask_probs >= cfg.mask_threshold
+        mask_probabilities = torch.sigmoid(mask_logits)
+        binary_masks = mask_probabilities >= cfg.mask_threshold
 
-        cls_conf = q_cls_prob.max(dim=-1).values
-        fg_conf = flat["fg_conf"]
-
-        scores = torch.ones_like(cls_conf)
+        scores = torch.ones_like(flat_queries.seed_scores)
         if cfg.use_class_confidence:
-            scores = scores * cls_conf
+            scores = scores * flat_queries.class_probabilities.max(dim=-1).values
         if cfg.use_foreground_confidence:
-            scores = scores * fg_conf
+            scores = scores * flat_queries.foreground_confidence
 
-        keep = torch.ones_like(scores, dtype=torch.bool)
+        keep_mask = torch.ones_like(scores, dtype=torch.bool)
         if cfg.remove_background:
-            keep &= pred_cls != 0
-        keep &= scores >= cfg.min_prototype_score
+            keep_mask &= flat_queries.predicted_labels != 0
+        keep_mask &= scores >= cfg.min_prototype_score
 
         resolved_masks = []
         resolved_labels = []
         resolved_scores = []
         kept_mask_logits = []
-        kept_mask_probs = []
-        kept_query_idx = []
+        kept_mask_probabilities = []
+        kept_query_indices = []
 
-        for idx in torch.where(keep)[0].tolist():
-            mask = binary_masks[idx]
+        for query_index in torch.where(keep_mask)[0].tolist():
+            mask = binary_masks[query_index]
             if mask.sum().item() < cfg.min_area:
                 continue
-
-            kept_query_idx.append(idx)
-            kept_mask_logits.append(mask_logits[idx])
-            kept_mask_probs.append(mask_probs[idx])
+            kept_query_indices.append(query_index)
+            kept_mask_logits.append(mask_logits[query_index])
+            kept_mask_probabilities.append(mask_probabilities[query_index])
             resolved_masks.append(mask)
-            resolved_labels.append(int(pred_cls[idx].item()))
-            resolved_scores.append(float(scores[idx].item()))
+            resolved_labels.append(int(flat_queries.predicted_labels[query_index].item()))
+            resolved_scores.append(float(scores[query_index].item()))
 
-        empty_mask_logits = torch.empty((0, flat["H_img"], flat["W_img"]), device=features.device)
-        kept_query_idx = torch.as_tensor(kept_query_idx, device=features.device, dtype=torch.long)
+        kept_query_indices = torch.as_tensor(kept_query_indices, device=flat_queries.features.device, dtype=torch.long)
+        empty_mask_grid = torch.empty((0, flat_queries.image_height, flat_queries.image_width), device=flat_queries.features.device)
 
-        return {
-            "flat": flat,
-            "proto_cls": q_cls[kept_query_idx],
-            "proto_cls_prob": q_cls_prob[kept_query_idx],
-            "proto_mask_emb": q_mask_emb[kept_query_idx],
-            "proto_score": scores[kept_query_idx],
-            "raw_mask_logits": torch.stack(kept_mask_logits, dim=0) if kept_mask_logits else empty_mask_logits,
-            "raw_mask_probs": torch.stack(kept_mask_probs, dim=0) if kept_mask_probs else empty_mask_logits,
-            "resolved_masks": resolved_masks,
-            "resolved_labels": resolved_labels,
-            "resolved_scores": resolved_scores,
-        }
+        return ResolvedPrediction(
+            flat_queries=flat_queries,
+            prototypes=None,
+            kept_prototype_indices=kept_query_indices,
+            resolved_target_indices=None,
+            signature_embeddings=torch.empty((kept_query_indices.numel(), 0), device=flat_queries.features.device),
+            class_logits=flat_queries.class_logits[kept_query_indices],
+            class_probabilities=flat_queries.class_probabilities[kept_query_indices],
+            mask_embeddings=flat_queries.mask_embeddings[kept_query_indices],
+            scores=scores[kept_query_indices],
+            raw_mask_logits=torch.stack(kept_mask_logits, dim=0) if kept_mask_logits else empty_mask_grid,
+            raw_mask_probabilities=torch.stack(kept_mask_probabilities, dim=0) if kept_mask_probabilities else empty_mask_grid,
+            resolved_masks=resolved_masks,
+            resolved_labels=resolved_labels,
+            resolved_scores=resolved_scores,
+        )
 
 
 def build_predictor(cfg: PrototypeInferenceConfig, model_variant: str):
