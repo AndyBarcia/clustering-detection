@@ -712,6 +712,7 @@ class ModularPrototypePredictor:
         pixel_scores = mask_probabilities * prototype_scores[:, None, None]
         max_pixel_score, winners = pixel_scores.max(dim=0)
 
+        resolved_kept_positions = []
         resolved_masks = []
         resolved_labels = []
         resolved_scores = []
@@ -725,11 +726,36 @@ class ModularPrototypePredictor:
             if mask.sum().item() < cfg.min_area:
                 continue
 
+            resolved_kept_positions.append(kept_position)
             resolved_masks.append(mask)
             resolved_labels.append(int(kept_predicted_labels[kept_position].item()))
             resolved_scores.append(float(kept_scores[kept_position].item()))
             if kept_target_indices is not None:
                 resolved_target_indices.append(int(kept_target_indices[kept_position].item()))
+
+        if resolved_kept_positions:
+            resolved_index_tensor = torch.as_tensor(
+                resolved_kept_positions,
+                device=features.device,
+                dtype=torch.long,
+            )
+            kept_prototype_indices = kept_prototype_indices[resolved_index_tensor]
+            kept_signatures = kept_signatures[resolved_index_tensor]
+            kept_logits = kept_logits[resolved_index_tensor]
+            kept_class_probabilities = kept_class_probabilities[resolved_index_tensor]
+            kept_mask_embeddings = kept_mask_embeddings[resolved_index_tensor]
+            kept_scores = kept_scores[resolved_index_tensor]
+            kept_mask_logits = kept_mask_logits[resolved_index_tensor]
+            kept_mask_probabilities = kept_mask_probabilities[resolved_index_tensor]
+        else:
+            kept_prototype_indices = kept_prototype_indices[:0]
+            kept_signatures = kept_signatures[:0]
+            kept_logits = kept_logits[:0]
+            kept_class_probabilities = kept_class_probabilities[:0]
+            kept_mask_embeddings = kept_mask_embeddings[:0]
+            kept_scores = kept_scores[:0]
+            kept_mask_logits = kept_mask_logits[:0]
+            kept_mask_probabilities = kept_mask_probabilities[:0]
 
         return ResolvedPrediction(
             flat_queries=flat_queries,

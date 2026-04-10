@@ -125,6 +125,20 @@ def _compute_signature_set_distance_metrics(
     return float(chamfer.item()), float(hausdorff.item())
 
 
+def _foreground_resolved_signature_embeddings(prediction: ResolvedPrediction) -> torch.Tensor:
+    signature_embeddings = prediction.signature_embeddings
+    if signature_embeddings.shape[0] == 0:
+        return signature_embeddings
+
+    if len(prediction.resolved_labels) != signature_embeddings.shape[0]:
+        raise ValueError(
+            "Resolved prediction signatures and labels must stay aligned after filtering."
+        )
+
+    keep = torch.as_tensor(prediction.resolved_labels, dtype=torch.long, device=signature_embeddings.device) != 0
+    return signature_embeddings[keep]
+
+
 def hungarian_match_instances(
     pred_masks: torch.Tensor,
     pred_labels: torch.Tensor,
@@ -331,9 +345,8 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
         prediction_records.extend(item.prediction_records)
         matched_query_distances.extend(item.matched_query_distances)
         unmatched_query_distances.extend(item.unmatched_query_closest_gt_distances)
-        if item.signature_count_pred is not None and item.signature_count_gt is not None:
-            count_pred.append(int(item.signature_count_pred))
-            count_gt.append(int(item.signature_count_gt))
+        count_pred.append(int(item.num_pred))
+        count_gt.append(int(item.num_gt))
         if item.signature_chamfer_distance is not None:
             chamfer_values.append(float(item.signature_chamfer_distance))
         if item.signature_hausdorff_distance is not None:
@@ -355,16 +368,15 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
     _append_value_summary(summary, "matched_query_cosine_distance", matched_query_distances)
     _append_value_summary(summary, "unmatched_query_closest_gt_cosine_distance", unmatched_query_distances)
 
-    if count_pred:
-        count_errors = [pred - gt for pred, gt in zip(count_pred, count_gt)]
-        abs_count_errors = [abs(error) for error in count_errors]
-        summary.update({
-            "mean_count_error": float(sum(count_errors) / len(count_errors)),
-            "mean_abs_count_error": float(sum(abs_count_errors) / len(abs_count_errors)),
-            "exact_count_accuracy": float(sum(error == 0 for error in count_errors) / len(count_errors)),
-            "overpredict_rate": float(sum(error > 0 for error in count_errors) / len(count_errors)),
-            "underpredict_rate": float(sum(error < 0 for error in count_errors) / len(count_errors)),
-        })
+    count_errors = [pred - gt for pred, gt in zip(count_pred, count_gt)]
+    abs_count_errors = [abs(error) for error in count_errors]
+    summary.update({
+        "mean_count_error": float(sum(count_errors) / len(count_errors)),
+        "mean_abs_count_error": float(sum(abs_count_errors) / len(abs_count_errors)),
+        "exact_count_accuracy": float(sum(error == 0 for error in count_errors) / len(count_errors)),
+        "overpredict_rate": float(sum(error > 0 for error in count_errors) / len(count_errors)),
+        "underpredict_rate": float(sum(error < 0 for error in count_errors) / len(count_errors)),
+    })
 
     if chamfer_values:
         summary["signature_chamfer_distance_mean"] = float(sum(chamfer_values) / len(chamfer_values))
@@ -413,10 +425,10 @@ def _evaluate_prediction_set(
         ap_iou_threshold=ap_iou_threshold,
     )
     if gt_signatures is not None:
-        pred_signatures = prediction_set.clustering.signature_embeddings
+        pred_signatures = _foreground_resolved_signature_embeddings(prediction_set.clustering)
         chamfer, hausdorff = _compute_signature_set_distance_metrics(pred_signatures, gt_signatures)
-        clustering_evaluation.signature_count_pred = int(pred_signatures.shape[0])
-        clustering_evaluation.signature_count_gt = int(gt_signatures.shape[0])
+        clustering_evaluation.signature_count_pred = int(clustering_evaluation.num_pred)
+        clustering_evaluation.signature_count_gt = int(clustering_evaluation.num_gt)
         clustering_evaluation.signature_chamfer_distance = chamfer
         clustering_evaluation.signature_hausdorff_distance = hausdorff
 
@@ -702,12 +714,12 @@ def format_metrics_table(
             "gt_signatures",
             "GT signatures by object count",
             [
-                "objects",
-                "images",
+                "obj.",
+                "img.",
                 "gt",
                 "pred",
-                "mIoU_mask",
-                "mIoU_box",
+                "IoU_m",
+                "Iou_b",
                 f"AP@{ap_threshold:.2f}",
             ],
             [
@@ -723,12 +735,12 @@ def format_metrics_table(
             "golden_queries",
             "Golden queries by object count",
             [
-                "objects",
-                "images",
+                "obj.",
+                "img.",
                 "gt",
                 "pred",
-                "mIoU_mask",
-                "mIoU_box",
+                "IoU_m",
+                "Iou_b",
                 f"AP@{ap_threshold:.2f}",
                 "match_d",
                 "unmatch_d",
@@ -748,12 +760,12 @@ def format_metrics_table(
             "clustering",
             "Clustering by object count",
             [
-                "objects",
-                "images",
+                "obj.",
+                "img.",
                 "gt",
                 "pred",
-                "mIoU_mask",
-                "mIoU_box",
+                "IoU_m",
+                "IoU_b",
                 f"AP@{ap_threshold:.2f}",
                 "count_MAE",
                 "count_acc",
