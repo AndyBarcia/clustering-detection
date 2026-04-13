@@ -111,8 +111,7 @@ def build_dataloader(args, device):
 def format_epoch_metrics(epoch_metrics):
     ordered_keys = [
         "loss_total",
-        "loss_seed_sig",
-        "loss_seed",
+        "loss_query_sig",
         "loss_cls",
         "loss_mask_ce",
         "loss_mask_iou",

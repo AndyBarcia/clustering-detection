@@ -318,7 +318,7 @@ class Mask2FormerBase(nn.Module):
     def _run_heads(self, q):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
-        return mask_embs, cls_preds, None, None, None, None, None, None
+        return mask_embs, cls_preds, None, None, None, None
 
     def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
@@ -330,8 +330,6 @@ class Mask2FormerBase(nn.Module):
             mask_embs,
             cls_preds,
             sig_embs,
-            seed_logits,
-            seed_scores,
             influence_preds,
             distance_preds,
             distance_vars,
@@ -346,8 +344,6 @@ class Mask2FormerBase(nn.Module):
             cls_preds=cls_preds,
             img_shape=(H_img, W_img),
             sig_embs=sig_embs,
-            seed_logits=seed_logits,
-            seed_scores=seed_scores,
             influence_preds=influence_preds,
             distance_preds=distance_preds,
             distance_vars=distance_vars,
@@ -370,11 +366,6 @@ class CustomMask2Former(Mask2FormerBase):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, sig_dim),
-        )
-        self.seed_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
         )
         self.influence_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -436,8 +427,6 @@ class CustomMask2Former(Mask2FormerBase):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
         sig_embs = F.normalize(self.sig_head(q), p=2, dim=-1)
-        seed_logits = self.seed_head(q).squeeze(-1)
-        seed_scores = torch.sigmoid(seed_logits)
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
         distance_stats = self.distance_head(q)
         distance_preds = F.softplus(distance_stats[..., 0])
@@ -446,8 +435,6 @@ class CustomMask2Former(Mask2FormerBase):
             mask_embs,
             cls_preds,
             sig_embs,
-            seed_logits,
-            seed_scores,
             influence_preds,
             distance_preds,
             distance_vars,

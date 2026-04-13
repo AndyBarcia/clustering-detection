@@ -153,7 +153,6 @@ class ClusterPanopticCriterion(nn.Module):
         mask_embs = raw.mask_embs
         cls_preds = raw.cls_preds
         sig_embs = raw.sig_embs
-        seed_logits = raw.seed_logits
         influence_preds = raw.influence_preds
         distance_preds = raw.distance_preds
         distance_vars = raw.distance_vars
@@ -161,12 +160,11 @@ class ClusterPanopticCriterion(nn.Module):
 
         if (
             sig_embs is None
-            or seed_logits is None
             or influence_preds is None
             or distance_preds is None
             or distance_vars is None
         ):
-            raise ValueError("Clustered criterion requires signature, seed, influence, and distance predictions.")
+            raise ValueError("Clustered criterion requires signature, influence, and distance predictions.")
 
         B = features.shape[0]
 
@@ -182,8 +180,7 @@ class ClusterPanopticCriterion(nn.Module):
             zero = features.sum() * 0.0
             return zero, {
                 "loss_total": zero,
-                "loss_seed_sig": zero,
-                "loss_seed": zero,
+                "loss_query_sig": zero,
                 "loss_cls": zero,
                 "loss_mask_ce": zero,
                 "loss_mask_iou": zero,
@@ -211,7 +208,6 @@ class ClusterPanopticCriterion(nn.Module):
         q_sig = sig_embs[:, valid_b]
         q_mask_emb = mask_embs[:, valid_b]
         q_cls = cls_preds[:, valid_b]
-        q_seed_logits = seed_logits[:, valid_b]
         q_influence = influence_preds[:, valid_b]
 
         L, _, N_q, S = q_sig.shape
@@ -219,7 +215,6 @@ class ClusterPanopticCriterion(nn.Module):
         q_sig_flat = q_sig.transpose(0, 1).reshape(B_val, L * N_q, S)
         q_mask_emb_flat = q_mask_emb.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, L * N_q, -1)
-        q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
         q_distance_preds_flat = distance_preds[:, valid_b].transpose(0, 1).reshape(B_val, L * N_q)
         q_distance_vars_flat = distance_vars[:, valid_b].transpose(0, 1).reshape(B_val, L * N_q)
@@ -265,8 +260,6 @@ class ClusterPanopticCriterion(nn.Module):
         loss_mask_ce = F.cross_entropy(mask_logits_masked, gt_mask_target)
         loss_mask_iou = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
 
-        seed_targets = matched_query_mask.float()
-        loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
         loss_distance_nll = F.gaussian_nll_loss(
             q_distance_preds_flat,
             closest_gt_distance.detach(),
@@ -275,30 +268,28 @@ class ClusterPanopticCriterion(nn.Module):
             reduction="mean",
         )
 
-        loss_seed_sig = features.sum() * 0.0
+        loss_query_sig = features.sum() * 0.0
         matched_pos = matched_query_mask.nonzero(as_tuple=False)
         if matched_pos.numel() > 0:
             matched_gt = matched_gt_indices[matched_query_mask]
             matched_q_sig = q_sig_flat[matched_query_mask]
             matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt]
-            cos_sim_seed = (matched_q_sig * matched_gt_sig).sum(dim=-1)
-            loss_seed_sig = (1.0 - cos_sim_seed).mean()
+            cos_sim_query = (matched_q_sig * matched_gt_sig).sum(dim=-1)
+            loss_query_sig = (1.0 - cos_sim_query).mean()
 
         total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
 
         final_loss = (
-            loss_seed_sig
+            loss_query_sig
             + loss_cls
             + total_loss_mask
-            + self.cfg.w_seed * loss_seed
             + self.cfg.w_distance_nll * loss_distance_nll
             + self.cfg.w_inter * loss_inter
         )
 
         components = {
             "loss_total": final_loss,
-            "loss_seed_sig": loss_seed_sig,
-            "loss_seed": loss_seed,
+            "loss_query_sig": loss_query_sig,
             "loss_cls": loss_cls,
             "loss_mask_ce": loss_mask_ce,
             "loss_mask_iou": loss_mask_iou,
@@ -398,8 +389,7 @@ class StandardMask2FormerCriterion(nn.Module):
 
         components = {
             "loss_total": final_loss,
-            "loss_seed_sig": zero,
-            "loss_seed": zero,
+            "loss_query_sig": zero,
             "loss_cls": loss_cls,
             "loss_mask_bce": loss_mask_bce,
             "loss_mask_dice": loss_mask_dice,

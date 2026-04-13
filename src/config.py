@@ -20,7 +20,7 @@ class DecoderLayerConfig:
     ttt_steps: int = 10
     ttt_lr: float = 0.1
     ttt_momentum: float = 0.8
-    ttt_objective: str = "variance"  # ["distance", "variance", "both"]
+    ttt_objective: str = "distance"  # ["distance", "variance", "both"]
 
 
 @dataclass
@@ -54,7 +54,6 @@ class ModelConfig:
 class LossConfig:
     w_mask_ce: float = 2.0
     w_mask_iou: float = 5.0
-    w_seed: float = 2.0
     w_distance_nll: float = 1.0
     w_inter: float = 10.0
     inter_margin: float = 0.0
@@ -115,7 +114,7 @@ class SoftAssignmentConfig:
     use_alpha_focal: bool = False
     similarity_floor: float = 0.005
 
-    # Backward-compatible name: this now uses predicted seedness as the per-query weighting signal.
+    # Uses the inference-time per-query quality signal as the weighting signal.
     use_query_quality: bool = False
     query_quality_power: float = 1.2
 

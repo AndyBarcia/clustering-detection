@@ -350,7 +350,7 @@ def _single_query_preview(
     features = flat.features
     q_mask_emb = flat.mask_embeddings[query_index]
     q_cls_prob = flat.class_probabilities[query_index]
-    q_seed = flat.seed_scores
+    q_score = flat.query_scores
 
     mask_logits = torch.einsum("c,chw->hw", q_mask_emb, features)
     mask_logits = F.interpolate(
@@ -370,7 +370,7 @@ def _single_query_preview(
         mask = mask.view_as(mask_logits)
 
     label = int(q_cls_prob.argmax().item())
-    score = float(q_seed[query_index].item()) if q_seed.numel() > 0 else float(q_cls_prob.max().item())
+    score = float(q_score[query_index].item()) if q_score.numel() > 0 else float(q_cls_prob.max().item())
 
     return [mask.detach().cpu().numpy()], [label], [score], f"Query {query_index} by itself"
 
@@ -509,7 +509,7 @@ def _draw_signature_umap(
 ):
     flat: Optional[FlatQueryOutputs] = prediction.flat_queries
     q_sig = None if flat is None else flat.signature_embeddings
-    q_seed = None if flat is None else flat.seed_scores
+    q_score = None if flat is None else flat.query_scores
     q_influence = None if flat is None else flat.influence_scores
     q_distance = None if flat is None else flat.distance_predictions
     q_variance = None if flat is None else flat.distance_variances
@@ -575,9 +575,9 @@ def _draw_signature_umap(
                     zorder=1,
                 )
     
-    if q_seed is not None:
-        q_seed_np = q_seed.detach().cpu().numpy()
-        query_sizes = min_query_marker_size + (max_query_marker_size - min_query_marker_size) * np.clip(q_seed_np, 0.0, 1.0)
+    if q_score is not None:
+        q_score_np = q_score.detach().cpu().numpy()
+        query_sizes = min_query_marker_size + (max_query_marker_size - min_query_marker_size) * np.clip(q_score_np, 0.0, 1.0)
     elif q_influence is not None:
         q_influence_np = q_influence.detach().cpu().numpy()
         influence_min = float(np.min(q_influence_np))

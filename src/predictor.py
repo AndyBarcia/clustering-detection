@@ -199,7 +199,6 @@ class ModularPrototypePredictor:
         query_mask_embeddings = raw.mask_embs[:, batch_index]
         query_class_logits = raw.cls_preds[:, batch_index]
         query_signature_embeddings = raw.sig_embs[:, batch_index]
-        query_seed_scores = raw.seed_scores[:, batch_index]
         query_influence_scores = raw.influence_preds[:, batch_index]
         query_distance_predictions = raw.distance_preds[:, batch_index]
         query_distance_variances = raw.distance_vars[:, batch_index]
@@ -210,7 +209,6 @@ class ModularPrototypePredictor:
         query_mask_embeddings = query_mask_embeddings.reshape(num_layers * queries_per_layer, -1)
         query_class_logits = query_class_logits.reshape(num_layers * queries_per_layer, num_classes)
         query_signature_embeddings = query_signature_embeddings.reshape(num_layers * queries_per_layer, signature_dim)
-        query_seed_scores = query_seed_scores.reshape(num_layers * queries_per_layer)
         query_influence_scores = query_influence_scores.reshape(num_layers * queries_per_layer)
         query_distance_predictions = query_distance_predictions.reshape(num_layers * queries_per_layer)
         query_distance_variances = query_distance_variances.reshape(num_layers * queries_per_layer)
@@ -220,6 +218,10 @@ class ModularPrototypePredictor:
         background_confidence = query_class_probabilities[:, 0]
         foreground_confidence = 1.0 - query_class_probabilities[:, 0]
         partition_confidence = torch.where(predicted_labels == 0, background_confidence, foreground_confidence)
+        query_scores = 1.0 / (1.0 + self._distance_upper_confidence_bound_from_stats(
+            query_distance_predictions,
+            query_distance_variances,
+        ))
 
         return FlatQueryOutputs(
             features=features,
@@ -231,7 +233,7 @@ class ModularPrototypePredictor:
             class_logits=query_class_logits,
             class_probabilities=query_class_probabilities,
             signature_embeddings=query_signature_embeddings,
-            seed_scores=query_seed_scores,
+            query_scores=query_scores,
             influence_scores=query_influence_scores,
             distance_predictions=query_distance_predictions,
             distance_variances=query_distance_variances,
@@ -241,11 +243,25 @@ class ModularPrototypePredictor:
             predicted_labels=predicted_labels,
         )
 
+    def _distance_upper_confidence_bound_from_stats(
+        self,
+        distance_predictions: torch.Tensor,
+        distance_variances: torch.Tensor,
+    ) -> torch.Tensor:
+        cfg = self.cfg.seed
+        confidence_interval = float(cfg.distance_confidence_interval)
+        confidence_interval = min(max(confidence_interval, 1e-6), 1.0 - 1e-6)
+        z_value = Normal(
+            loc=torch.tensor(0.0, device=distance_predictions.device),
+            scale=torch.tensor(1.0, device=distance_predictions.device),
+        ).icdf(torch.tensor(confidence_interval, device=distance_predictions.device))
+        std = distance_variances.clamp_min(1e-6).sqrt()
+        return distance_predictions + z_value * std
+
     def select_seed_queries(self, flat_queries: FlatQueryOutputs) -> SeedSelection:
         cfg = self.cfg.seed
         distance_upper_bound = self._distance_upper_confidence_bound(flat_queries)
-        ranking_scores = 1.0 / (1.0 + distance_upper_bound)
-        effective_scores = ranking_scores.clone()
+        effective_scores = flat_queries.query_scores.clone()
 
         if cfg.use_foreground_in_score:
             effective_scores = effective_scores * flat_queries.partition_confidence.pow(cfg.foreground_score_power)
@@ -283,7 +299,7 @@ class ModularPrototypePredictor:
             eligible_mask=eligible_mask,
         )
 
-    def _cluster_local(self, seed_sigs_np: np.ndarray, seed_scores_np: np.ndarray) -> np.ndarray:
+    def _cluster_local(self, seed_sigs_np: np.ndarray, query_scores_np: np.ndarray) -> np.ndarray:
         cfg = self.cfg.cluster
         method = cfg.method.lower()
 
@@ -302,7 +318,7 @@ class ModularPrototypePredictor:
                 metric="cosine",
             )
             if cfg.dbscan_use_sample_weight:
-                clusterer.fit(seed_sigs_np, sample_weight=seed_scores_np)
+                clusterer.fit(seed_sigs_np, sample_weight=query_scores_np)
             else:
                 clusterer.fit(seed_sigs_np)
             return clusterer.labels_.astype(np.int64)
@@ -387,10 +403,10 @@ class ModularPrototypePredictor:
 
         for position_group in groups:
             local_seed_indices = selection.indices[position_group]
-            local_seed_scores = selection.scores[position_group]
+            local_query_scores = selection.scores[position_group]
 
             local_signatures_np = flat_queries.signature_embeddings[local_seed_indices].detach().cpu().numpy()
-            local_scores_np = local_seed_scores.detach().cpu().numpy()
+            local_scores_np = local_query_scores.detach().cpu().numpy()
 
             local_labels_np = self._cluster_local(local_signatures_np, local_scores_np)
             local_labels = torch.as_tensor(local_labels_np, device=device)
@@ -456,7 +472,7 @@ class ModularPrototypePredictor:
             representative_query_index = member_query_indices[representative_local]
             prototype_seed_indices.append(representative_query_index)
 
-            weights = flat_queries.seed_scores[member_query_indices]
+            weights = flat_queries.query_scores[member_query_indices]
             weights = weights / (weights.sum() + 1e-6)
 
             prototype_logits.append((flat_queries.class_logits[member_query_indices] * weights.unsqueeze(1)).sum(dim=0))
@@ -506,7 +522,7 @@ class ModularPrototypePredictor:
             raw_weights = affinity.pow(alpha)
 
             if cfg.use_query_quality:
-                raw_weights = raw_weights * flat_queries.seed_scores[source_query_indices].pow(cfg.query_quality_power).unsqueeze(1)
+                raw_weights = raw_weights * flat_queries.query_scores[source_query_indices].pow(cfg.query_quality_power).unsqueeze(1)
 
             prototype_probabilities = None
             if cfg.use_foreground_prob or cfg.class_compat_power > 0:
@@ -941,7 +957,7 @@ class StandardMask2FormerPredictor:
             class_logits=query_class_logits,
             class_probabilities=query_class_probabilities,
             signature_embeddings=torch.empty((query_mask_embeddings.shape[0], 0), device=query_mask_embeddings.device),
-            seed_scores=query_class_probabilities.max(dim=-1).values,
+            query_scores=query_class_probabilities.max(dim=-1).values,
             influence_scores=torch.zeros((query_mask_embeddings.shape[0],), device=query_mask_embeddings.device),
             distance_predictions=torch.zeros((query_mask_embeddings.shape[0],), device=query_mask_embeddings.device),
             distance_variances=torch.zeros((query_mask_embeddings.shape[0],), device=query_mask_embeddings.device),
@@ -971,7 +987,7 @@ class StandardMask2FormerPredictor:
         mask_probabilities = torch.sigmoid(mask_logits)
         binary_masks = mask_probabilities >= cfg.mask_threshold
 
-        scores = torch.ones_like(flat_queries.seed_scores)
+        scores = torch.ones_like(flat_queries.query_scores)
         if cfg.use_class_confidence:
             scores = scores * flat_queries.class_probabilities.max(dim=-1).values
         if cfg.use_foreground_confidence:
