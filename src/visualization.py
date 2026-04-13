@@ -624,6 +624,103 @@ def _draw_signature_umap(
         spine.set_alpha(0.3)
 
 
+def _draw_signature_distribution(
+    ax,
+    image_np: np.ndarray,
+    target: dict,
+    prediction: ResolvedPrediction,
+    *,
+    class_names: Optional[Sequence[str]] = None,
+    title: str,
+):
+    signatures = prediction.all_signature_embeddings
+    if signatures is None or signatures.numel() == 0:
+        ax.set_title(title)
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No signatures", ha="center", va="center", fontsize=11, transform=ax.transAxes)
+        return
+
+    sig_np = signatures.detach().cpu().numpy()
+    gt_masks_all = [mask.detach().cpu().numpy() for mask in target["masks"]]
+    gt_labels_all = [int(label) for label in target["labels"].detach().cpu().tolist()]
+    row_count = sig_np.shape[0]
+
+    image = ax.imshow(sig_np, aspect="auto", interpolation="nearest", cmap="viridis", vmin=0.0, vmax=1.0)
+    ax.set_title(title)
+    ax.set_xlabel("Signature Bin")
+    ax.set_ylabel("Object")
+    ax.set_yticks(np.arange(row_count))
+
+    row_labels = []
+    row_colors = []
+    row_markers = []
+    for idx in range(row_count):
+        if idx < len(gt_labels_all):
+            label = gt_labels_all[idx]
+            mask = gt_masks_all[idx]
+            color = _instance_color(image_np, mask)
+        else:
+            label = idx
+            color = np.array([0.7, 0.7, 0.7], dtype=np.float32)
+
+        if class_names is not None and 0 <= label < len(class_names):
+            class_name = class_names[label]
+        else:
+            class_name = str(label)
+
+        if label == 0:
+            marker = "o"
+            color = np.array([0.2, 0.2, 0.2], dtype=np.float32)
+        else:
+            marker = _gt_marker(label)
+
+        row_labels.append(f" {class_name}")
+        row_colors.append(color)
+        row_markers.append(marker)
+
+    ax.set_yticklabels(row_labels)
+    for tick in ax.get_yticklabels():
+        tick.set_horizontalalignment("left")
+    ax.tick_params(axis="y", pad=28)
+
+    num_bins = sig_np.shape[1]
+    if num_bins <= 16:
+        ax.set_xticks(np.arange(num_bins))
+    else:
+        tick_count = min(8, num_bins)
+        ax.set_xticks(np.linspace(0, num_bins - 1, num=tick_count, dtype=int))
+
+    marker_x = np.full((row_count,), -0.9, dtype=np.float32)
+    ax.scatter(
+        marker_x,
+        np.arange(row_count),
+        s=90.0,
+        c=np.asarray(row_colors, dtype=np.float32),
+        marker="o",
+        edgecolors="black",
+        linewidths=0.8,
+        clip_on=False,
+        zorder=3,
+    )
+    for idx, marker in enumerate(row_markers):
+        ax.scatter(
+            -1.25,
+            idx,
+            s=70.0,
+            c=[row_colors[idx]],
+            marker=marker,
+            edgecolors="black",
+            linewidths=0.8,
+            clip_on=False,
+            zorder=4,
+        )
+
+    ax.set_xlim(-1.6, num_bins - 0.5)
+
+    colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    colorbar.set_label("Probability", rotation=90)
+
+
 def _draw_instances(
     ax,
     image_np: np.ndarray,
@@ -777,7 +874,8 @@ def render_prediction_grid(
 ):
     num_samples = len(images)
     add_signature_column = any("GT Prototype" in title for title, _ in prediction_columns)
-    num_cols = 2 + len(prediction_columns) + int(add_signature_column)
+    extra_signature_cols = 2 if add_signature_column else 0
+    num_cols = 2 + len(prediction_columns) + extra_signature_cols
     fig, axes = plt.subplots(num_samples, num_cols, figsize=(5 * num_cols, 5 * max(num_samples, 1)), squeeze=False)
     row_states: List[_RowInteractionState] = []
 
@@ -842,6 +940,17 @@ def render_prediction_grid(
                     title=column_title,
                 )
             next_col_idx += 1
+
+            if add_signature_column and "GT Prototype" in column_title:
+                _draw_signature_distribution(
+                    axes[row_idx, next_col_idx],
+                    image_np,
+                    target,
+                    prediction,
+                    class_names=class_names,
+                    title="GT Signature Distributions",
+                )
+                next_col_idx += 1
 
             if add_signature_column and "GT Prototype" in column_title:
                 _draw_signature_umap(

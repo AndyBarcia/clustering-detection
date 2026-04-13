@@ -8,6 +8,7 @@ from typing import Optional
 
 from .config import ModelConfig
 from .outputs import RawOutputs
+from .signature_similarity import signatures_to_probabilities
 
 
 class SimpleBackbone(nn.Module):
@@ -380,12 +381,12 @@ class CustomMask2Former(Mask2FormerBase):
         q_gt = q_gt_all[-1]
 
         sig = self.sig_head(q_gt)
-        return F.normalize(sig, p=2, dim=-1)
+        return signatures_to_probabilities(sig, dim=-1)
 
     def _run_heads(self, q):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
-        sig_embs = F.normalize(self.sig_head(q), p=2, dim=-1)
+        sig_embs = signatures_to_probabilities(self.sig_head(q), dim=-1)
         seed_logits = self.seed_head(q).squeeze(-1)
         seed_scores = torch.sigmoid(seed_logits)
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))

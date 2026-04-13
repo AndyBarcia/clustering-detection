@@ -6,6 +6,7 @@ from scipy.optimize import linear_sum_assignment
 from .config import LossConfig
 from .model import CustomMask2Former, Mask2FormerBase
 from .outputs import RawOutputs
+from .signature_similarity import pairwise_jsd, pairwise_similarity_from_jsd
 
 
 def assignment_weights_with_influence(
@@ -43,7 +44,7 @@ def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
 
 def hungarian_seed_assignment(
     q_sig_flat: torch.Tensor,
-    gt_sigs_norm: torch.Tensor,
+    gt_sigs_prob: torch.Tensor,
     gt_pad_mask: torch.Tensor,
 ):
     B, num_queries, _ = q_sig_flat.shape
@@ -55,8 +56,8 @@ def hungarian_seed_assignment(
         if valid_gt_idx.numel() == 0 or num_queries == 0:
             continue
 
-        sim = torch.matmul(q_sig_flat[b], gt_sigs_norm[b, valid_gt_idx].T)
-        cost = (1.0 - sim).detach().cpu().numpy()
+        jsd = pairwise_jsd(q_sig_flat[b], gt_sigs_prob[b, valid_gt_idx])
+        cost = jsd.detach().cpu().numpy()
         row_ind, col_ind = linear_sum_assignment(cost)
         if len(row_ind) == 0:
             continue
@@ -213,10 +214,14 @@ class ClusterPanopticCriterion(nn.Module):
         q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
 
-        gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
-        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_norm, gt_pad_mask)
+        gt_sigs_prob = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
+        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_prob, gt_pad_mask)
 
-        sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
+        sim = pairwise_similarity_from_jsd(
+            q_sig_flat.reshape(B_val * L * N_q, S),
+            gt_sigs_prob.reshape(B_val * M_max, S),
+        ).reshape(B_val, L * N_q, B_val, M_max)
+        sim = sim[torch.arange(B_val, device=features.device), :, torch.arange(B_val, device=features.device)]
         weights_flat = assignment_weights_with_influence(
             similarity=sim,
             influence=q_influence_flat,
@@ -226,13 +231,17 @@ class ClusterPanopticCriterion(nn.Module):
 
         loss_inter = features.sum() * 0.0
         if M_max > 1:
-            gt_sim = torch.bmm(gt_sigs_norm, gt_sigs_norm.transpose(1, 2))
+            gt_jsd = pairwise_jsd(
+                gt_sigs_prob.reshape(B_val * M_max, S),
+                gt_sigs_prob.reshape(B_val * M_max, S),
+            ).reshape(B_val, M_max, B_val, M_max)
+            gt_jsd = gt_jsd[torch.arange(B_val, device=features.device), :, torch.arange(B_val, device=features.device)]
             eye = torch.eye(M_max, dtype=torch.bool, device=features.device).unsqueeze(0)
             valid_pair_mask = gt_pad_mask.unsqueeze(2) & gt_pad_mask.unsqueeze(1)
             off_diag_mask = valid_pair_mask & ~eye
 
             if off_diag_mask.any():
-                loss_inter = F.relu(gt_sim[off_diag_mask] - self.cfg.inter_margin).pow(2).mean()
+                loss_inter = F.relu(self.cfg.inter_margin - gt_jsd[off_diag_mask]).pow(2).mean()
 
         norm_w = weights_flat / (weights_flat.sum(dim=1, keepdim=True) + 1e-6)
 
@@ -260,9 +269,8 @@ class ClusterPanopticCriterion(nn.Module):
         if matched_pos.numel() > 0:
             matched_gt = matched_gt_indices[matched_query_mask]
             matched_q_sig = q_sig_flat[matched_query_mask]
-            matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt]
-            cos_sim_seed = (matched_q_sig * matched_gt_sig).sum(dim=-1)
-            loss_seed_sig = (1.0 - cos_sim_seed).mean()
+            matched_gt_sig = gt_sigs_prob[matched_pos[:, 0], matched_gt]
+            loss_seed_sig = pairwise_jsd(matched_q_sig, matched_gt_sig).diag().mean()
 
         total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
 

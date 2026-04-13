@@ -12,6 +12,7 @@ from scipy.optimize import linear_sum_assignment
 
 from .dataset import SyntheticPanopticBatchGenerator, BatchedSyntheticIterableDataset
 from .outputs import EvaluationPredictionSet, ResolvedPrediction
+from .signature_similarity import pairwise_jsd
 
 
 @dataclass
@@ -98,13 +99,6 @@ def _pairwise_box_iou(pred_masks: torch.Tensor, gt_masks: torch.Tensor) -> torch
     return intersection / union.clamp_min(1e-6)
 
 
-def _pairwise_cosine_distance(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-    if lhs.shape[0] == 0 or rhs.shape[0] == 0:
-        return torch.zeros((lhs.shape[0], rhs.shape[0]), dtype=torch.float32, device=lhs.device)
-    similarity = torch.matmul(lhs, rhs.T).clamp(-1.0, 1.0)
-    return 1.0 - similarity
-
-
 def _compute_signature_set_distance_metrics(
     pred_sig: torch.Tensor,
     gt_sig: torch.Tensor,
@@ -116,7 +110,7 @@ def _compute_signature_set_distance_metrics(
     if pred_sig.shape[0] == 0 or gt_sig.shape[0] == 0:
         return empty_distance, empty_distance
 
-    distances = _pairwise_cosine_distance(pred_sig, gt_sig)
+    distances = pairwise_jsd(pred_sig, gt_sig)
     pred_to_gt = distances.min(dim=1).values
     gt_to_pred = distances.min(dim=0).values
 
@@ -378,8 +372,8 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
     _append_value_summary(summary, "mean_iou_box", per_image_mean_iou_box)
     _append_value_summary(summary, "ap", per_image_ap)
 
-    _append_value_summary(summary, "matched_query_cosine_distance", matched_query_distances)
-    _append_value_summary(summary, "unmatched_query_closest_gt_cosine_distance", unmatched_query_distances)
+    _append_value_summary(summary, "matched_query_jsd", matched_query_distances)
+    _append_value_summary(summary, "unmatched_query_closest_gt_jsd", unmatched_query_distances)
 
     count_errors = [pred - gt for pred, gt in zip(count_pred, count_gt)]
     abs_count_errors = [abs(error) for error in count_errors]
@@ -801,8 +795,8 @@ def format_metrics_table(
                 ("metric", "mean_iou"),
                 ("metric", "mean_iou_box"),
                 ("metric", "ap"),
-                ("metric", "matched_query_cosine_distance_mean"),
-                ("metric", "unmatched_query_closest_gt_cosine_distance_mean"),
+                ("metric", "matched_query_jsd_mean"),
+                ("metric", "unmatched_query_closest_gt_jsd_mean"),
             ],
         ),
         (

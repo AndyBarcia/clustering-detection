@@ -43,10 +43,7 @@ from .outputs import (
     SeedClustering,
     SeedSelection,
 )
-
-
-def _safe_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    return x / x.norm(dim=dim, keepdim=True).clamp_min(eps)
+from .signature_similarity import pairwise_affinity_from_jsd_np, pairwise_jsd, pairwise_jsd_np, pairwise_similarity_from_jsd
 
 
 def _alpha_value(alpha_obj) -> float:
@@ -60,22 +57,6 @@ def _assignment_affinity(similarity: torch.Tensor, influence: torch.Tensor, simi
     if similarity_floor > 0.0:
         affinity = affinity.clamp_min(similarity_floor)
     return affinity
-
-
-def _cosine_affinity_np(x: np.ndarray) -> np.ndarray:
-    return np.clip(x @ x.T, 0.0, 1.0)
-
-
-def _cosine_distance_np(x: np.ndarray) -> np.ndarray:
-    dist = 1.0 - np.clip(x @ x.T, -1.0, 1.0)
-    return np.ascontiguousarray(dist, dtype=np.float64)
-
-
-def _pairwise_cosine_distance(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-    if lhs.shape[0] == 0 or rhs.shape[0] == 0:
-        return torch.zeros((lhs.shape[0], rhs.shape[0]), dtype=torch.float32, device=lhs.device)
-    similarity = torch.matmul(lhs, rhs.T).clamp(-1.0, 1.0)
-    return 1.0 - similarity
 
 
 def _connected_components_labels(affinity: np.ndarray, threshold: float) -> np.ndarray:
@@ -279,18 +260,19 @@ class ModularPrototypePredictor:
             clusterer = DBSCAN(
                 eps=cfg.dbscan_eps,
                 min_samples=cfg.dbscan_min_samples,
-                metric="cosine",
+                metric="precomputed",
             )
+            dist = pairwise_jsd_np(seed_sigs_np)
             if cfg.dbscan_use_sample_weight:
-                clusterer.fit(seed_sigs_np, sample_weight=seed_scores_np)
+                clusterer.fit(dist, sample_weight=seed_scores_np)
             else:
-                clusterer.fit(seed_sigs_np)
+                clusterer.fit(dist)
             return clusterer.labels_.astype(np.int64)
 
         if method == "hdbscan":
             if _hdbscan is None:
                 raise ImportError("hdbscan is not installed. pip install hdbscan")
-            dist = _cosine_distance_np(seed_sigs_np)
+            dist = pairwise_jsd_np(seed_sigs_np)
             clusterer = _hdbscan.HDBSCAN(
                 metric="precomputed",
                 min_cluster_size=cfg.hdbscan_min_cluster_size,
@@ -299,7 +281,7 @@ class ModularPrototypePredictor:
             )
             return clusterer.fit_predict(dist).astype(np.int64)
 
-        affinity = _cosine_affinity_np(seed_sigs_np)
+        affinity = pairwise_affinity_from_jsd_np(seed_sigs_np)
 
         if method == "cc":
             return _connected_components_labels(affinity, cfg.graph_affinity_threshold)
@@ -481,7 +463,7 @@ class ModularPrototypePredictor:
         final_normalized_weights = None
 
         for _ in range(max(1, cfg.refinement_steps)):
-            similarity = torch.matmul(query_signatures, prototype_signatures.T)
+            similarity = pairwise_similarity_from_jsd(query_signatures, prototype_signatures)
             affinity = _assignment_affinity(similarity, flat_queries.influence_scores[source_query_indices], cfg.similarity_floor)
             raw_weights = affinity.pow(alpha)
 
@@ -550,7 +532,7 @@ class ModularPrototypePredictor:
             return self._empty_prototype_state(flat_queries)
 
         alpha = _alpha_value(model.alpha_focal) if self.cfg.assign.use_alpha_focal else 1.0
-        similarity = torch.matmul(flat_queries.signature_embeddings, signature_embeddings.T)
+        similarity = pairwise_similarity_from_jsd(flat_queries.signature_embeddings, signature_embeddings)
         affinity = _assignment_affinity(similarity, flat_queries.influence_scores, self.cfg.assign.similarity_floor)
         raw_weights = affinity.pow(alpha)
         normalized_weights = raw_weights / (raw_weights.sum(dim=0, keepdim=True) + 1e-6)
@@ -813,7 +795,7 @@ class ModularPrototypePredictor:
             return empty_prediction, GoldenQueryDiagnostics()
 
         query_signatures = flat_queries.signature_embeddings[candidate_indices]
-        distances = _pairwise_cosine_distance(query_signatures, gt_signatures)
+        distances = pairwise_jsd(query_signatures, gt_signatures)
 
         num_queries, num_gt = distances.shape
         size = max(num_queries, num_gt)

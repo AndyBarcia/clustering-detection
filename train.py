@@ -112,6 +112,7 @@ def format_epoch_metrics(epoch_metrics):
     ordered_keys = [
         "loss_total",
         "loss_seed_sig",
+        "loss_sig_entropy",
         "loss_seed",
         "loss_cls",
         "loss_mask_ce",
