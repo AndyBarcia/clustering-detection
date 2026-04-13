@@ -186,16 +186,18 @@ class ModularPrototypePredictor:
 
         query_mask_embeddings = raw.mask_embs[:, batch_index]
         query_class_logits = raw.cls_preds[:, batch_index]
-        query_signature_embeddings = raw.sig_embs[:, batch_index]
+        query_sender_embeddings = raw.sender_embs[:, batch_index]
+        query_receiver_embeddings = raw.receiver_embs[:, batch_index]
         query_seed_scores = raw.seed_scores[:, batch_index]
         query_influence_scores = raw.influence_preds[:, batch_index]
 
-        num_layers, queries_per_layer, signature_dim = query_signature_embeddings.shape
+        num_layers, queries_per_layer, signature_dim = query_receiver_embeddings.shape
         num_classes = query_class_logits.shape[-1]
 
         query_mask_embeddings = query_mask_embeddings.reshape(num_layers * queries_per_layer, -1)
         query_class_logits = query_class_logits.reshape(num_layers * queries_per_layer, num_classes)
-        query_signature_embeddings = query_signature_embeddings.reshape(num_layers * queries_per_layer, signature_dim)
+        query_sender_embeddings = query_sender_embeddings.reshape(num_layers * queries_per_layer, signature_dim)
+        query_receiver_embeddings = query_receiver_embeddings.reshape(num_layers * queries_per_layer, signature_dim)
         query_seed_scores = query_seed_scores.reshape(num_layers * queries_per_layer)
         query_influence_scores = query_influence_scores.reshape(num_layers * queries_per_layer)
 
@@ -214,7 +216,8 @@ class ModularPrototypePredictor:
             mask_embeddings=query_mask_embeddings,
             class_logits=query_class_logits,
             class_probabilities=query_class_probabilities,
-            signature_embeddings=query_signature_embeddings,
+            sender_embeddings=query_sender_embeddings,
+            receiver_embeddings=query_receiver_embeddings,
             seed_scores=query_seed_scores,
             influence_scores=query_influence_scores,
             background_confidence=background_confidence,
@@ -369,7 +372,7 @@ class ModularPrototypePredictor:
             local_seed_indices = selection.indices[position_group]
             local_seed_scores = selection.scores[position_group]
 
-            local_signatures_np = flat_queries.signature_embeddings[local_seed_indices].detach().cpu().numpy()
+            local_signatures_np = flat_queries.receiver_embeddings[local_seed_indices].detach().cpu().numpy()
             local_scores_np = local_seed_scores.detach().cpu().numpy()
 
             local_labels_np = self._cluster_local(local_signatures_np, local_scores_np)
@@ -396,14 +399,15 @@ class ModularPrototypePredictor:
         )
 
     def _empty_prototype_state(self, flat_queries: FlatQueryOutputs, *, source_query_indices: Optional[torch.Tensor] = None, source_cluster_labels: Optional[torch.Tensor] = None) -> PrototypeState:
-        device = flat_queries.signature_embeddings.device
+        device = flat_queries.receiver_embeddings.device
         if source_query_indices is None:
             source_query_indices = torch.empty((0,), dtype=torch.long, device=device)
         if source_cluster_labels is None:
             source_cluster_labels = torch.empty((0,), dtype=torch.long, device=device)
 
         return PrototypeState(
-            signature_embeddings=torch.empty((0, flat_queries.signature_embeddings.shape[-1]), device=device),
+            sender_embeddings=torch.empty((0, flat_queries.sender_embeddings.shape[-1]), device=device),
+            receiver_embeddings=torch.empty((0, flat_queries.receiver_embeddings.shape[-1]), device=device),
             class_logits=torch.empty((0, flat_queries.class_logits.shape[-1]), device=device),
             mask_embeddings=torch.empty((0, flat_queries.mask_embeddings.shape[-1]), device=device),
             cluster_members=[],
@@ -416,7 +420,7 @@ class ModularPrototypePredictor:
         )
 
     def initialize_clustered_prototypes(self, flat_queries: FlatQueryOutputs, clustering: SeedClustering) -> PrototypeState:
-        device = flat_queries.signature_embeddings.device
+        device = flat_queries.receiver_embeddings.device
         valid = clustering.cluster_labels >= 0
 
         if valid.sum() == 0:
@@ -426,7 +430,8 @@ class ModularPrototypePredictor:
                 source_cluster_labels=clustering.cluster_labels,
             )
 
-        prototype_signatures = []
+        prototype_sender_embeddings = []
+        prototype_receiver_embeddings = []
         prototype_logits = []
         prototype_mask_embeddings = []
         prototype_seed_indices = []
@@ -441,10 +446,12 @@ class ModularPrototypePredictor:
 
             prototype_logits.append((flat_queries.class_logits[member_query_indices] * weights.unsqueeze(1)).sum(dim=0))
             prototype_mask_embeddings.append((flat_queries.mask_embeddings[member_query_indices] * weights.unsqueeze(1)).sum(dim=0))
-            prototype_signatures.append(flat_queries.signature_embeddings[representative_query_index])
+            prototype_sender_embeddings.append(flat_queries.sender_embeddings[representative_query_index])
+            prototype_receiver_embeddings.append(flat_queries.receiver_embeddings[representative_query_index])
 
         return PrototypeState(
-            signature_embeddings=torch.stack(prototype_signatures, dim=0),
+            sender_embeddings=torch.stack(prototype_sender_embeddings, dim=0),
+            receiver_embeddings=torch.stack(prototype_receiver_embeddings, dim=0),
             class_logits=torch.stack(prototype_logits, dim=0),
             mask_embeddings=torch.stack(prototype_mask_embeddings, dim=0),
             cluster_members=clustering.cluster_members,
@@ -458,7 +465,7 @@ class ModularPrototypePredictor:
 
     def refine_prototypes(self, model: CustomMask2Former, flat_queries: FlatQueryOutputs, prototypes: PrototypeState) -> PrototypeState:
         cfg = self.cfg.assign
-        device = flat_queries.signature_embeddings.device
+        device = flat_queries.receiver_embeddings.device
 
         if prototypes.num_prototypes == 0:
             return prototypes
@@ -468,12 +475,12 @@ class ModularPrototypePredictor:
         else:
             source_query_indices = prototypes.source_query_indices
 
-        query_signatures = flat_queries.signature_embeddings[source_query_indices]
+        query_sender_embeddings = flat_queries.sender_embeddings[source_query_indices]
         query_logits = flat_queries.class_logits[source_query_indices]
         query_probabilities = flat_queries.class_probabilities[source_query_indices]
         query_mask_embeddings = flat_queries.mask_embeddings[source_query_indices]
 
-        prototype_signatures = prototypes.signature_embeddings
+        prototype_sender_embeddings = prototypes.sender_embeddings
         prototype_logits = prototypes.class_logits
 
         alpha = _alpha_value(model.alpha_focal) if cfg.use_alpha_focal else 1.0
@@ -481,7 +488,7 @@ class ModularPrototypePredictor:
         final_normalized_weights = None
 
         for _ in range(max(1, cfg.refinement_steps)):
-            similarity = torch.matmul(query_signatures, prototype_signatures.T)
+            similarity = torch.matmul(query_sender_embeddings, prototype_sender_embeddings.T)
             affinity = _assignment_affinity(similarity, flat_queries.influence_scores[source_query_indices], cfg.similarity_floor)
             raw_weights = affinity.pow(alpha)
 
@@ -518,12 +525,13 @@ class ModularPrototypePredictor:
         assignment_weights = torch.zeros(
             (flat_queries.num_queries, prototypes.num_prototypes),
             device=device,
-            dtype=prototype_signatures.dtype,
+            dtype=prototype_sender_embeddings.dtype,
         )
         assignment_weights[source_query_indices] = final_normalized_weights
 
         return PrototypeState(
-            signature_embeddings=prototype_signatures,
+            sender_embeddings=prototype_sender_embeddings,
+            receiver_embeddings=prototypes.receiver_embeddings,
             class_logits=prototype_logits,
             mask_embeddings=prototype_mask_embeddings,
             cluster_members=prototypes.cluster_members,
@@ -539,18 +547,19 @@ class ModularPrototypePredictor:
         self,
         model: CustomMask2Former,
         flat_queries: FlatQueryOutputs,
-        signature_embeddings: torch.Tensor,
+        sender_embeddings: torch.Tensor,
+        receiver_embeddings: torch.Tensor,
         *,
         prototype_seed_indices: Optional[torch.Tensor] = None,
         target_indices: Optional[torch.Tensor] = None,
     ) -> PrototypeState:
-        device = flat_queries.signature_embeddings.device
-        num_prototypes = int(signature_embeddings.shape[0])
+        device = flat_queries.receiver_embeddings.device
+        num_prototypes = int(receiver_embeddings.shape[0])
         if num_prototypes == 0:
             return self._empty_prototype_state(flat_queries)
 
         alpha = _alpha_value(model.alpha_focal) if self.cfg.assign.use_alpha_focal else 1.0
-        similarity = torch.matmul(flat_queries.signature_embeddings, signature_embeddings.T)
+        similarity = torch.matmul(flat_queries.sender_embeddings, receiver_embeddings.T)
         affinity = _assignment_affinity(similarity, flat_queries.influence_scores, self.cfg.assign.similarity_floor)
         raw_weights = affinity.pow(alpha)
         normalized_weights = raw_weights / (raw_weights.sum(dim=0, keepdim=True) + 1e-6)
@@ -565,7 +574,8 @@ class ModularPrototypePredictor:
             cluster_members = [query_index.unsqueeze(0) for query_index in prototype_seed_indices]
 
         return PrototypeState(
-            signature_embeddings=signature_embeddings,
+            sender_embeddings=sender_embeddings,
+            receiver_embeddings=receiver_embeddings,
             class_logits=prototype_logits,
             mask_embeddings=prototype_mask_embeddings,
             cluster_members=cluster_members,
@@ -589,7 +599,7 @@ class ModularPrototypePredictor:
         masks = targets[batch_index]["masks"].to(device).float()
 
         if labels.numel() == 0:
-            return torch.empty((0, raw.sig_embs.shape[-1]), device=device)
+            return torch.empty((0, raw.receiver_embs.shape[-1]), device=device)
 
         gt_masks = masks.unsqueeze(0)
         gt_labels = labels.unsqueeze(0)
@@ -612,18 +622,19 @@ class ModularPrototypePredictor:
         targets,
         batch_index: int,
     ) -> PrototypeState:
-        device = flat_queries.signature_embeddings.device
+        device = flat_queries.receiver_embeddings.device
         labels = targets[batch_index]["labels"].to(device)
 
         if labels.numel() == 0:
             return self._empty_prototype_state(flat_queries)
 
-        gt_signatures = self.encode_gt_signatures(model, raw, targets, batch_index, device)
+        gt_receiver_embeddings = self.encode_gt_signatures(model, raw, targets, batch_index, device)
 
         return self.build_signature_prototypes(
             model,
             flat_queries,
-            gt_signatures,
+            sender_embeddings=gt_receiver_embeddings,
+            receiver_embeddings=gt_receiver_embeddings,
             target_indices=torch.arange(labels.shape[0], device=device, dtype=torch.long),
         )
 
@@ -639,7 +650,8 @@ class ModularPrototypePredictor:
                 prototypes=prototypes,
                 kept_prototype_indices=torch.empty((0,), dtype=torch.long, device=features.device),
                 resolved_target_indices=None,
-                signature_embeddings=torch.empty((0, flat_queries.signature_embeddings.shape[-1]), device=features.device),
+                sender_embeddings=torch.empty((0, flat_queries.sender_embeddings.shape[-1]), device=features.device),
+                receiver_embeddings=torch.empty((0, flat_queries.receiver_embeddings.shape[-1]), device=features.device),
                 class_logits=torch.empty((0, flat_queries.class_logits.shape[-1]), device=features.device),
                 class_probabilities=torch.empty((0, flat_queries.class_logits.shape[-1]), device=features.device),
                 mask_embeddings=torch.empty((0, flat_queries.mask_embeddings.shape[-1]), device=features.device),
@@ -686,7 +698,8 @@ class ModularPrototypePredictor:
                 prototypes=prototypes,
                 kept_prototype_indices=torch.empty((0,), dtype=torch.long, device=features.device),
                 resolved_target_indices=None,
-                signature_embeddings=torch.empty((0, flat_queries.signature_embeddings.shape[-1]), device=features.device),
+                sender_embeddings=torch.empty((0, flat_queries.sender_embeddings.shape[-1]), device=features.device),
+                receiver_embeddings=torch.empty((0, flat_queries.receiver_embeddings.shape[-1]), device=features.device),
                 class_logits=torch.empty((0, flat_queries.class_logits.shape[-1]), device=features.device),
                 class_probabilities=torch.empty((0, flat_queries.class_logits.shape[-1]), device=features.device),
                 mask_embeddings=torch.empty((0, flat_queries.mask_embeddings.shape[-1]), device=features.device),
@@ -704,7 +717,8 @@ class ModularPrototypePredictor:
         kept_class_probabilities = class_probabilities[keep_mask]
         kept_predicted_labels = predicted_labels[keep_mask]
         kept_scores = prototype_scores[keep_mask]
-        kept_signatures = prototypes.signature_embeddings[keep_mask]
+        kept_sender_embeddings = prototypes.sender_embeddings[keep_mask]
+        kept_receiver_embeddings = prototypes.receiver_embeddings[keep_mask]
         kept_logits = prototypes.class_logits[keep_mask]
         kept_mask_embeddings = prototypes.mask_embeddings[keep_mask]
         kept_target_indices = None if prototypes.target_indices is None else prototypes.target_indices[keep_mask]
@@ -740,7 +754,8 @@ class ModularPrototypePredictor:
                 dtype=torch.long,
             )
             kept_prototype_indices = kept_prototype_indices[resolved_index_tensor]
-            kept_signatures = kept_signatures[resolved_index_tensor]
+            kept_sender_embeddings = kept_sender_embeddings[resolved_index_tensor]
+            kept_receiver_embeddings = kept_receiver_embeddings[resolved_index_tensor]
             kept_logits = kept_logits[resolved_index_tensor]
             kept_class_probabilities = kept_class_probabilities[resolved_index_tensor]
             kept_mask_embeddings = kept_mask_embeddings[resolved_index_tensor]
@@ -749,7 +764,8 @@ class ModularPrototypePredictor:
             kept_mask_probabilities = kept_mask_probabilities[resolved_index_tensor]
         else:
             kept_prototype_indices = kept_prototype_indices[:0]
-            kept_signatures = kept_signatures[:0]
+            kept_sender_embeddings = kept_sender_embeddings[:0]
+            kept_receiver_embeddings = kept_receiver_embeddings[:0]
             kept_logits = kept_logits[:0]
             kept_class_probabilities = kept_class_probabilities[:0]
             kept_mask_embeddings = kept_mask_embeddings[:0]
@@ -766,7 +782,8 @@ class ModularPrototypePredictor:
                 device=features.device,
                 dtype=torch.long,
             ),
-            signature_embeddings=kept_signatures,
+            sender_embeddings=kept_sender_embeddings,
+            receiver_embeddings=kept_receiver_embeddings,
             class_logits=kept_logits,
             class_probabilities=kept_class_probabilities,
             mask_embeddings=kept_mask_embeddings,
@@ -799,21 +816,21 @@ class ModularPrototypePredictor:
         batch_index: int,
     ) -> tuple[ResolvedPrediction, GoldenQueryDiagnostics]:
         flat_queries = self.flatten_outputs(raw, batch_index)
-        gt_signatures = self.encode_gt_signatures(
+        gt_receiver_embeddings = self.encode_gt_signatures(
             model,
             raw,
             targets,
             batch_index,
-            flat_queries.signature_embeddings.device,
+            flat_queries.receiver_embeddings.device,
         )
 
-        candidate_indices = torch.arange(flat_queries.num_queries, device=flat_queries.signature_embeddings.device)
-        if gt_signatures.shape[0] == 0 or candidate_indices.numel() == 0:
+        candidate_indices = torch.arange(flat_queries.num_queries, device=flat_queries.receiver_embeddings.device)
+        if gt_receiver_embeddings.shape[0] == 0 or candidate_indices.numel() == 0:
             empty_prediction = self.resolve_prediction(flat_queries, self._empty_prototype_state(flat_queries))
             return empty_prediction, GoldenQueryDiagnostics()
 
-        query_signatures = flat_queries.signature_embeddings[candidate_indices]
-        distances = _pairwise_cosine_distance(query_signatures, gt_signatures)
+        query_receiver_embeddings = flat_queries.receiver_embeddings[candidate_indices]
+        distances = _pairwise_cosine_distance(query_receiver_embeddings, gt_receiver_embeddings)
 
         num_queries, num_gt = distances.shape
         size = max(num_queries, num_gt)
@@ -846,11 +863,13 @@ class ModularPrototypePredictor:
         if (~matched_mask).any():
             unmatched_query_distances = distances[~matched_mask].min(dim=1).values.detach().cpu().tolist()
 
-        matched_query_signatures = flat_queries.signature_embeddings[matched_query_indices]
+        matched_query_sender_embeddings = flat_queries.sender_embeddings[matched_query_indices]
+        matched_query_receiver_embeddings = flat_queries.receiver_embeddings[matched_query_indices]
         prototypes = self.build_signature_prototypes(
             model,
             flat_queries,
-            matched_query_signatures,
+            sender_embeddings=matched_query_sender_embeddings,
+            receiver_embeddings=matched_query_receiver_embeddings,
             prototype_seed_indices=matched_query_indices,
             target_indices=matched_gt_indices,
         )
@@ -920,7 +939,8 @@ class StandardMask2FormerPredictor:
             mask_embeddings=query_mask_embeddings,
             class_logits=query_class_logits,
             class_probabilities=query_class_probabilities,
-            signature_embeddings=torch.empty((query_mask_embeddings.shape[0], 0), device=query_mask_embeddings.device),
+            sender_embeddings=torch.empty((query_mask_embeddings.shape[0], 0), device=query_mask_embeddings.device),
+            receiver_embeddings=torch.empty((query_mask_embeddings.shape[0], 0), device=query_mask_embeddings.device),
             seed_scores=query_class_probabilities.max(dim=-1).values,
             influence_scores=torch.zeros((query_mask_embeddings.shape[0],), device=query_mask_embeddings.device),
             background_confidence=query_class_probabilities[:, 0],
@@ -986,7 +1006,8 @@ class StandardMask2FormerPredictor:
             prototypes=None,
             kept_prototype_indices=kept_query_indices,
             resolved_target_indices=None,
-            signature_embeddings=torch.empty((kept_query_indices.numel(), 0), device=flat_queries.features.device),
+            sender_embeddings=torch.empty((kept_query_indices.numel(), 0), device=flat_queries.features.device),
+            receiver_embeddings=torch.empty((kept_query_indices.numel(), 0), device=flat_queries.features.device),
             class_logits=flat_queries.class_logits[kept_query_indices],
             class_probabilities=flat_queries.class_probabilities[kept_query_indices],
             mask_embeddings=flat_queries.mask_embeddings[kept_query_indices],

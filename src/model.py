@@ -286,7 +286,7 @@ class Mask2FormerBase(nn.Module):
     def _run_heads(self, q):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
-        return mask_embs, cls_preds, None, None, None, None
+        return mask_embs, cls_preds, None, None, None, None, None
 
     def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
@@ -294,7 +294,7 @@ class Mask2FormerBase(nn.Module):
         features, memory = self._build_memory(images)
         q_dec_all, intermediate_ttt_q = self._decode_queries(memory, ttt_steps_override=ttt_steps_override)
 
-        mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds = self._run_heads(q_dec_all)
+        mask_embs, cls_preds, sender_embs, receiver_embs, seed_logits, seed_scores, influence_preds = self._run_heads(q_dec_all)
 
         return RawOutputs(
             features=features,
@@ -304,7 +304,8 @@ class Mask2FormerBase(nn.Module):
             mask_embs=mask_embs,
             cls_preds=cls_preds,
             img_shape=(H_img, W_img),
-            sig_embs=sig_embs,
+            sender_embs=sender_embs,
+            receiver_embs=receiver_embs,
             seed_logits=seed_logits,
             seed_scores=seed_scores,
             influence_preds=influence_preds,
@@ -323,7 +324,12 @@ class CustomMask2Former(Mask2FormerBase):
 
         self.sig_dim = sig_dim
 
-        self.sig_head = nn.Sequential(
+        self.sender_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, sig_dim),
+        )
+        self.receiver_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, sig_dim),
@@ -379,17 +385,18 @@ class CustomMask2Former(Mask2FormerBase):
             )
         q_gt = q_gt_all[-1]
 
-        sig = self.sig_head(q_gt)
-        return F.normalize(sig, p=2, dim=-1)
+        receiver = self.receiver_head(q_gt)
+        return F.normalize(receiver, p=2, dim=-1)
 
     def _run_heads(self, q):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
-        sig_embs = F.normalize(self.sig_head(q), p=2, dim=-1)
+        sender_embs = F.normalize(self.sender_head(q), p=2, dim=-1)
+        receiver_embs = F.normalize(self.receiver_head(q), p=2, dim=-1)
         seed_logits = self.seed_head(q).squeeze(-1)
         seed_scores = torch.sigmoid(seed_logits)
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
-        return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds
+        return mask_embs, cls_preds, sender_embs, receiver_embs, seed_logits, seed_scores, influence_preds
 
 
 class StandardMask2Former(Mask2FormerBase):

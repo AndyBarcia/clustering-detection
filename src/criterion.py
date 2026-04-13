@@ -42,27 +42,27 @@ def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
 
 
 def hungarian_seed_assignment(
-    q_sig_flat: torch.Tensor,
-    gt_sigs_norm: torch.Tensor,
+    q_receiver_flat: torch.Tensor,
+    gt_receiver_norm: torch.Tensor,
     gt_pad_mask: torch.Tensor,
 ):
-    B, num_queries, _ = q_sig_flat.shape
-    matched_query_mask = torch.zeros((B, num_queries), dtype=torch.bool, device=q_sig_flat.device)
-    matched_gt_indices = torch.full((B, num_queries), -1, dtype=torch.long, device=q_sig_flat.device)
+    B, num_queries, _ = q_receiver_flat.shape
+    matched_query_mask = torch.zeros((B, num_queries), dtype=torch.bool, device=q_receiver_flat.device)
+    matched_gt_indices = torch.full((B, num_queries), -1, dtype=torch.long, device=q_receiver_flat.device)
 
     for b in range(B):
         valid_gt_idx = torch.where(gt_pad_mask[b])[0]
         if valid_gt_idx.numel() == 0 or num_queries == 0:
             continue
 
-        sim = torch.matmul(q_sig_flat[b], gt_sigs_norm[b, valid_gt_idx].T)
+        sim = torch.matmul(q_receiver_flat[b], gt_receiver_norm[b, valid_gt_idx].T)
         cost = (1.0 - sim).detach().cpu().numpy()
         row_ind, col_ind = linear_sum_assignment(cost)
         if len(row_ind) == 0:
             continue
 
-        row_ind_t = torch.as_tensor(row_ind, device=q_sig_flat.device, dtype=torch.long)
-        col_ind_t = valid_gt_idx[torch.as_tensor(col_ind, device=q_sig_flat.device, dtype=torch.long)]
+        row_ind_t = torch.as_tensor(row_ind, device=q_receiver_flat.device, dtype=torch.long)
+        col_ind_t = valid_gt_idx[torch.as_tensor(col_ind, device=q_receiver_flat.device, dtype=torch.long)]
         matched_query_mask[b, row_ind_t] = True
         matched_gt_indices[b, row_ind_t] = col_ind_t
 
@@ -152,12 +152,13 @@ class ClusterPanopticCriterion(nn.Module):
         memory = raw.memory
         mask_embs = raw.mask_embs
         cls_preds = raw.cls_preds
-        sig_embs = raw.sig_embs
+        sender_embs = raw.sender_embs
+        receiver_embs = raw.receiver_embs
         seed_logits = raw.seed_logits
         influence_preds = raw.influence_preds
         H_img, W_img = raw.img_shape
 
-        if sig_embs is None or seed_logits is None or influence_preds is None:
+        if sender_embs is None or receiver_embs is None or seed_logits is None or influence_preds is None:
             raise ValueError("Clustered criterion requires signature, seed, and influence predictions.")
 
         B = features.shape[0]
@@ -199,24 +200,26 @@ class ClusterPanopticCriterion(nn.Module):
         features_val = features[valid_b]
         memory_val = memory[valid_b]
 
-        q_sig = sig_embs[:, valid_b]
+        q_sender = sender_embs[:, valid_b]
+        q_receiver = receiver_embs[:, valid_b]
         q_mask_emb = mask_embs[:, valid_b]
         q_cls = cls_preds[:, valid_b]
         q_seed_logits = seed_logits[:, valid_b]
         q_influence = influence_preds[:, valid_b]
 
-        L, _, N_q, S = q_sig.shape
+        L, _, N_q, S = q_receiver.shape
 
-        q_sig_flat = q_sig.transpose(0, 1).reshape(B_val, L * N_q, S)
+        q_sender_flat = q_sender.transpose(0, 1).reshape(B_val, L * N_q, S)
+        q_receiver_flat = q_receiver.transpose(0, 1).reshape(B_val, L * N_q, S)
         q_mask_emb_flat = q_mask_emb.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
 
-        gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
-        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_norm, gt_pad_mask)
+        gt_receiver_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
+        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_receiver_flat, gt_receiver_norm, gt_pad_mask)
 
-        sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
+        sim = torch.bmm(q_sender_flat, gt_receiver_norm.transpose(1, 2))
         weights_flat = assignment_weights_with_influence(
             similarity=sim,
             influence=q_influence_flat,
@@ -226,7 +229,7 @@ class ClusterPanopticCriterion(nn.Module):
 
         loss_inter = features.sum() * 0.0
         if M_max > 1:
-            gt_sim = torch.bmm(gt_sigs_norm, gt_sigs_norm.transpose(1, 2))
+            gt_sim = torch.bmm(gt_receiver_norm, gt_receiver_norm.transpose(1, 2))
             eye = torch.eye(M_max, dtype=torch.bool, device=features.device).unsqueeze(0)
             valid_pair_mask = gt_pad_mask.unsqueeze(2) & gt_pad_mask.unsqueeze(1)
             off_diag_mask = valid_pair_mask & ~eye
@@ -259,10 +262,10 @@ class ClusterPanopticCriterion(nn.Module):
         matched_pos = matched_query_mask.nonzero(as_tuple=False)
         if matched_pos.numel() > 0:
             matched_gt = matched_gt_indices[matched_query_mask]
-            matched_q_sig = q_sig_flat[matched_query_mask]
-            matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt]
-            cos_sim_seed = (matched_q_sig * matched_gt_sig).sum(dim=-1)
-            loss_seed_sig = (1.0 - cos_sim_seed).mean()
+            matched_q_receiver = q_receiver_flat[matched_query_mask]
+            matched_gt_receiver = gt_receiver_norm[matched_pos[:, 0], matched_gt]
+            cos_sim_receiver = (matched_q_receiver * matched_gt_receiver).sum(dim=-1)
+            loss_seed_sig = (1.0 - cos_sim_receiver).mean()
 
         total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
 

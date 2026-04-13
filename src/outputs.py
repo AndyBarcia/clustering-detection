@@ -15,10 +15,15 @@ class RawOutputs:
     mask_embs: torch.Tensor         # [L, B, Nq, C]
     cls_preds: torch.Tensor         # [L, B, Nq, K]
     img_shape: Tuple[int, int]
-    sig_embs: Optional[torch.Tensor] = None        # [L, B, Nq, S]
+    sender_embs: Optional[torch.Tensor] = None     # [L, B, Nq, S]
+    receiver_embs: Optional[torch.Tensor] = None   # [L, B, Nq, S]
     seed_logits: Optional[torch.Tensor] = None     # [L, B, Nq]
     seed_scores: Optional[torch.Tensor] = None     # [L, B, Nq]
     influence_preds: Optional[torch.Tensor] = None # [L, B, Nq]
+
+    @property
+    def sig_embs(self) -> Optional[torch.Tensor]:
+        return self.receiver_embs
 
 
 @dataclass
@@ -31,7 +36,8 @@ class FlatQueryOutputs:
     mask_embeddings: torch.Tensor         # [Q, C]
     class_logits: torch.Tensor            # [Q, K]
     class_probabilities: torch.Tensor     # [Q, K]
-    signature_embeddings: torch.Tensor    # [Q, S]
+    sender_embeddings: torch.Tensor       # [Q, S]
+    receiver_embeddings: torch.Tensor     # [Q, S]
     seed_scores: torch.Tensor             # [Q]
     influence_scores: torch.Tensor        # [Q]
     background_confidence: torch.Tensor   # [Q]
@@ -41,7 +47,11 @@ class FlatQueryOutputs:
 
     @property
     def num_queries(self) -> int:
-        return int(self.signature_embeddings.shape[0])
+        return int(self.receiver_embeddings.shape[0])
+
+    @property
+    def signature_embeddings(self) -> torch.Tensor:
+        return self.receiver_embeddings
 
 
 @dataclass
@@ -61,7 +71,8 @@ class SeedClustering:
 
 @dataclass
 class PrototypeState:
-    signature_embeddings: torch.Tensor    # [P, S]
+    sender_embeddings: torch.Tensor       # [P, S]
+    receiver_embeddings: torch.Tensor     # [P, S]
     class_logits: torch.Tensor            # [P, K]
     mask_embeddings: torch.Tensor         # [P, C]
     cluster_members: list[torch.Tensor]   # list[[Qc_i]]
@@ -74,7 +85,11 @@ class PrototypeState:
 
     @property
     def num_prototypes(self) -> int:
-        return int(self.signature_embeddings.shape[0])
+        return int(self.receiver_embeddings.shape[0])
+
+    @property
+    def signature_embeddings(self) -> torch.Tensor:
+        return self.receiver_embeddings
 
 
 @dataclass
@@ -83,7 +98,8 @@ class ResolvedPrediction:
     prototypes: Optional[PrototypeState]
     kept_prototype_indices: torch.Tensor  # [Pk]
     resolved_target_indices: Optional[torch.Tensor]  # [Pr]
-    signature_embeddings: torch.Tensor    # [Pk, S]
+    sender_embeddings: torch.Tensor       # [Pk, S]
+    receiver_embeddings: torch.Tensor     # [Pk, S]
     class_logits: torch.Tensor            # [Pk, K]
     class_probabilities: torch.Tensor     # [Pk, K]
     mask_embeddings: torch.Tensor         # [Pk, C]
@@ -97,8 +113,12 @@ class ResolvedPrediction:
     @property
     def all_signature_embeddings(self) -> torch.Tensor:
         if self.prototypes is None:
-            return self.signature_embeddings
-        return self.prototypes.signature_embeddings
+            return self.receiver_embeddings
+        return self.prototypes.receiver_embeddings
+
+    @property
+    def signature_embeddings(self) -> torch.Tensor:
+        return self.receiver_embeddings
 
 
 @dataclass
