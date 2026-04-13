@@ -19,6 +19,8 @@ class RawOutputs:
     seed_logits: Optional[torch.Tensor] = None     # [L, B, Nq]
     seed_scores: Optional[torch.Tensor] = None     # [L, B, Nq]
     influence_preds: Optional[torch.Tensor] = None # [L, B, Nq]
+    distance_preds: Optional[torch.Tensor] = None  # [L, B, Nq]
+    distance_vars: Optional[torch.Tensor] = None   # [L, B, Nq]
 
 
 @dataclass
@@ -34,6 +36,8 @@ class FlatQueryOutputs:
     signature_embeddings: torch.Tensor    # [Q, S]
     seed_scores: torch.Tensor             # [Q]
     influence_scores: torch.Tensor        # [Q]
+    distance_predictions: torch.Tensor    # [Q]
+    distance_variances: torch.Tensor      # [Q]
     background_confidence: torch.Tensor   # [Q]
     foreground_confidence: torch.Tensor   # [Q]
     partition_confidence: torch.Tensor    # [Q]

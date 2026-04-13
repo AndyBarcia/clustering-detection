@@ -286,7 +286,7 @@ class Mask2FormerBase(nn.Module):
     def _run_heads(self, q):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
-        return mask_embs, cls_preds, None, None, None, None
+        return mask_embs, cls_preds, None, None, None, None, None, None
 
     def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
@@ -294,7 +294,16 @@ class Mask2FormerBase(nn.Module):
         features, memory = self._build_memory(images)
         q_dec_all, intermediate_ttt_q = self._decode_queries(memory, ttt_steps_override=ttt_steps_override)
 
-        mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds = self._run_heads(q_dec_all)
+        (
+            mask_embs,
+            cls_preds,
+            sig_embs,
+            seed_logits,
+            seed_scores,
+            influence_preds,
+            distance_preds,
+            distance_vars,
+        ) = self._run_heads(q_dec_all)
 
         return RawOutputs(
             features=features,
@@ -308,6 +317,8 @@ class Mask2FormerBase(nn.Module):
             seed_logits=seed_logits,
             seed_scores=seed_scores,
             influence_preds=influence_preds,
+            distance_preds=distance_preds,
+            distance_vars=distance_vars,
         )
 
 
@@ -337,6 +348,11 @@ class CustomMask2Former(Mask2FormerBase):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
+        )
+        self.distance_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 2),
         )
 
         self.gt_cls_embed = nn.Embedding(num_classes, hidden_dim)
@@ -389,7 +405,19 @@ class CustomMask2Former(Mask2FormerBase):
         seed_logits = self.seed_head(q).squeeze(-1)
         seed_scores = torch.sigmoid(seed_logits)
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
-        return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds
+        distance_stats = self.distance_head(q)
+        distance_preds = F.softplus(distance_stats[..., 0])
+        distance_vars = F.softplus(distance_stats[..., 1]) + 1e-6
+        return (
+            mask_embs,
+            cls_preds,
+            sig_embs,
+            seed_logits,
+            seed_scores,
+            influence_preds,
+            distance_preds,
+            distance_vars,
+        )
 
 
 class StandardMask2Former(Mask2FormerBase):

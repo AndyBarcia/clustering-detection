@@ -189,6 +189,8 @@ class ModularPrototypePredictor:
         query_signature_embeddings = raw.sig_embs[:, batch_index]
         query_seed_scores = raw.seed_scores[:, batch_index]
         query_influence_scores = raw.influence_preds[:, batch_index]
+        query_distance_predictions = raw.distance_preds[:, batch_index]
+        query_distance_variances = raw.distance_vars[:, batch_index]
 
         num_layers, queries_per_layer, signature_dim = query_signature_embeddings.shape
         num_classes = query_class_logits.shape[-1]
@@ -198,6 +200,8 @@ class ModularPrototypePredictor:
         query_signature_embeddings = query_signature_embeddings.reshape(num_layers * queries_per_layer, signature_dim)
         query_seed_scores = query_seed_scores.reshape(num_layers * queries_per_layer)
         query_influence_scores = query_influence_scores.reshape(num_layers * queries_per_layer)
+        query_distance_predictions = query_distance_predictions.reshape(num_layers * queries_per_layer)
+        query_distance_variances = query_distance_variances.reshape(num_layers * queries_per_layer)
 
         query_class_probabilities = F.softmax(query_class_logits, dim=-1)
         predicted_labels = query_class_probabilities.argmax(dim=-1)
@@ -217,6 +221,8 @@ class ModularPrototypePredictor:
             signature_embeddings=query_signature_embeddings,
             seed_scores=query_seed_scores,
             influence_scores=query_influence_scores,
+            distance_predictions=query_distance_predictions,
+            distance_variances=query_distance_variances,
             background_confidence=background_confidence,
             foreground_confidence=foreground_confidence,
             partition_confidence=partition_confidence,
@@ -923,6 +929,8 @@ class StandardMask2FormerPredictor:
             signature_embeddings=torch.empty((query_mask_embeddings.shape[0], 0), device=query_mask_embeddings.device),
             seed_scores=query_class_probabilities.max(dim=-1).values,
             influence_scores=torch.zeros((query_mask_embeddings.shape[0],), device=query_mask_embeddings.device),
+            distance_predictions=torch.zeros((query_mask_embeddings.shape[0],), device=query_mask_embeddings.device),
+            distance_variances=torch.zeros((query_mask_embeddings.shape[0],), device=query_mask_embeddings.device),
             background_confidence=query_class_probabilities[:, 0],
             foreground_confidence=1.0 - query_class_probabilities[:, 0],
             partition_confidence=torch.where(

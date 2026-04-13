@@ -50,6 +50,7 @@ class _UmapArtistGroup:
     scatter: object
     text: Optional[object]
     base_size: Optional[float] = None
+    rings: List[object] = field(default_factory=list)
 
 
 @dataclass
@@ -291,6 +292,35 @@ def _set_umap_query_highlight(artist_group: _UmapArtistGroup, highlighted: bool)
     artist_group.scatter.set_alpha(1.0 if highlighted else 0.15)
     artist_group.scatter.set_sizes([base_size * 1.8 if highlighted else base_size])
     artist_group.scatter.set_linewidths(2.2 if highlighted else 0.8)
+    ring_alpha = 0.65 if highlighted else 0.18
+    ring_linewidth = 1.8 if highlighted else 0.9
+    for ring in artist_group.rings:
+        ring.set_alpha(ring_alpha)
+        ring.set_linewidth(ring_linewidth)
+
+
+def _estimate_umap_distance_scale(
+    q_sig_np: np.ndarray,
+    q_pts: np.ndarray,
+    gt_sig_np: np.ndarray,
+    gt_pts: np.ndarray,
+) -> float:
+    if q_sig_np.shape[0] == 0 or gt_sig_np.shape[0] == 0 or gt_pts.shape[0] == 0:
+        return 1.0
+
+    q_sig_norm = q_sig_np / np.clip(np.linalg.norm(q_sig_np, axis=1, keepdims=True), 1e-6, None)
+    gt_sig_norm = gt_sig_np / np.clip(np.linalg.norm(gt_sig_np, axis=1, keepdims=True), 1e-6, None)
+    cosine_dist = 1.0 - np.clip(q_sig_norm @ gt_sig_norm.T, -1.0, 1.0)
+    closest_gt_idx = np.argmin(cosine_dist, axis=1)
+    closest_cosine_dist = cosine_dist[np.arange(cosine_dist.shape[0]), closest_gt_idx]
+    closest_umap_dist = np.linalg.norm(q_pts - gt_pts[closest_gt_idx], axis=1)
+
+    valid = closest_cosine_dist > 1e-6
+    if np.any(valid):
+        return float(np.median(closest_umap_dist[valid] / closest_cosine_dist[valid]))
+    if np.any(closest_umap_dist > 0.0):
+        return float(np.median(closest_umap_dist[closest_umap_dist > 0.0]))
+    return 1.0
 
 
 def _hit_test_umap_queries(row_state: _RowInteractionState, x: float, y: float) -> Optional[int]:
@@ -481,6 +511,8 @@ def _draw_signature_umap(
     q_sig = None if flat is None else flat.signature_embeddings
     q_seed = None if flat is None else flat.seed_scores
     q_influence = None if flat is None else flat.influence_scores
+    q_distance = None if flat is None else flat.distance_predictions
+    q_variance = None if flat is None else flat.distance_variances
     gt_sig = prediction.all_signature_embeddings
 
     if q_sig is None or gt_sig is None:
@@ -560,6 +592,9 @@ def _draw_signature_umap(
 
     query_colors = np.full((q_pts.shape[0], 3), 0.7, dtype=np.float32)
     query_alpha = np.full((q_pts.shape[0],), 0.72, dtype=np.float32)
+    q_distance_np = None if q_distance is None else q_distance.detach().cpu().numpy()
+    q_variance_np = None if q_variance is None else q_variance.detach().cpu().numpy()
+    umap_distance_scale = _estimate_umap_distance_scale(q_sig_np, q_pts, gt_sig_np, gt_pts)
 
     if row_state is not None:
         row_state.umap_query_points = q_pts
@@ -572,6 +607,29 @@ def _draw_signature_umap(
         row_state.umap_query_artists = []
 
     for idx in range(q_pts.shape[0]):
+        rings = []
+        if q_distance_np is not None and q_variance_np is not None and gt_pts.shape[0] > 0:
+            std = float(np.sqrt(max(q_variance_np[idx], 0.0)))
+            lower_radius = max(float(q_distance_np[idx]) - std, 0.0) * umap_distance_scale
+            upper_radius = (float(q_distance_np[idx]) + std) * umap_distance_scale
+            for radius, linestyle, alpha in (
+                (upper_radius, "-", 0.28),
+                (lower_radius, "--", 0.45),
+            ):
+                if radius <= 0.0:
+                    continue
+                ring = patches.Circle(
+                    (float(q_pts[idx, 0]), float(q_pts[idx, 1])),
+                    radius=radius,
+                    fill=False,
+                    edgecolor=query_colors[idx],
+                    linewidth=0.9,
+                    linestyle=linestyle,
+                    alpha=alpha,
+                    zorder=1.5,
+                )
+                ax.add_patch(ring)
+                rings.append(ring)
         scatter = ax.scatter(
             q_pts[idx, 0],
             q_pts[idx, 1],
@@ -584,7 +642,7 @@ def _draw_signature_umap(
         )
         if row_state is not None:
             row_state.umap_query_artists.append(
-                _UmapArtistGroup(scatter=scatter, text=None, base_size=float(query_sizes[idx]))
+                _UmapArtistGroup(scatter=scatter, text=None, base_size=float(query_sizes[idx]), rings=rings)
             )
 
     for idx, pt in enumerate(gt_pts):

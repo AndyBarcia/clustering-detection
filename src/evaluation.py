@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
+from scipy.stats import norm
 
 from .dataset import SyntheticPanopticBatchGenerator, BatchedSyntheticIterableDataset
 from .outputs import EvaluationPredictionSet, ResolvedPrediction
@@ -28,6 +29,16 @@ class ImageEvaluation:
     signature_count_gt: int | None = None
     signature_chamfer_distance: float | None = None
     signature_hausdorff_distance: float | None = None
+    closest_gt_distance_gaussian_ks: List[float] = field(default_factory=list)
+    closest_gt_distance_gaussian_wasserstein: List[float] = field(default_factory=list)
+    closest_gt_distance_gaussian_skew_abs: List[float] = field(default_factory=list)
+    closest_gt_distance_gaussian_excess_kurtosis_abs: List[float] = field(default_factory=list)
+    distance_head_target_mse: List[float] = field(default_factory=list)
+    distance_head_target_mae: List[float] = field(default_factory=list)
+    distance_head_nll: List[float] = field(default_factory=list)
+    distance_head_abs_zscore: List[float] = field(default_factory=list)
+    distance_head_coverage_1sigma: List[float] = field(default_factory=list)
+    distance_head_coverage_2sigma: List[float] = field(default_factory=list)
 
 
 def _stack_masks(masks: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -123,6 +134,90 @@ def _compute_signature_set_distance_metrics(
     chamfer = 0.5 * (pred_to_gt.mean() + gt_to_pred.mean())
     hausdorff = torch.maximum(pred_to_gt.max(), gt_to_pred.max())
     return float(chamfer.item()), float(hausdorff.item())
+
+
+def _compute_closest_gt_distance_gaussian_metrics(
+    query_sig: torch.Tensor,
+    gt_sig: torch.Tensor,
+) -> Dict[str, List[float]]:
+    metrics = {
+        "closest_gt_distance_gaussian_ks": [],
+        "closest_gt_distance_gaussian_wasserstein": [],
+        "closest_gt_distance_gaussian_skew_abs": [],
+        "closest_gt_distance_gaussian_excess_kurtosis_abs": [],
+    }
+    if query_sig.shape[0] < 2 or gt_sig.shape[0] == 0:
+        return metrics
+
+    distance_matrix = _pairwise_cosine_distance(query_sig, gt_sig)
+    closest_distances = distance_matrix.min(dim=1).values.detach().cpu().numpy()
+    eps = 1e-6
+
+    samples = np.sort(np.asarray(closest_distances, dtype=np.float64))
+    n = samples.shape[0]
+    if n < 2:
+        return metrics
+
+    mean = float(samples.mean())
+    std = float(samples.std(ddof=0))
+    if std < eps:
+        return metrics
+
+    empirical_cdf = (np.arange(1, n + 1, dtype=np.float64) - 0.5) / n
+    standardized = (samples - mean) / std
+    cdf = norm.cdf(standardized)
+    ks = float(np.max(np.abs(empirical_cdf - cdf)))
+
+    gaussian_quantiles = mean + std * norm.ppf(empirical_cdf)
+    wasserstein = float(np.mean(np.abs(samples - gaussian_quantiles)))
+
+    centered = samples - mean
+    moment3 = float(np.mean(centered ** 3))
+    moment4 = float(np.mean(centered ** 4))
+    skew_abs = abs(moment3 / max(std ** 3, eps))
+    excess_kurtosis_abs = abs(moment4 / max(std ** 4, eps) - 3.0)
+
+    metrics["closest_gt_distance_gaussian_ks"].append(ks)
+    metrics["closest_gt_distance_gaussian_wasserstein"].append(wasserstein)
+    metrics["closest_gt_distance_gaussian_skew_abs"].append(float(skew_abs))
+    metrics["closest_gt_distance_gaussian_excess_kurtosis_abs"].append(float(excess_kurtosis_abs))
+
+    return metrics
+
+
+def _compute_distance_head_calibration_metrics(
+    query_sig: torch.Tensor,
+    gt_sig: torch.Tensor,
+    predicted_mean: torch.Tensor,
+    predicted_variance: torch.Tensor,
+) -> Dict[str, List[float]]:
+    metrics = {
+        "distance_head_target_mse": [],
+        "distance_head_target_mae": [],
+        "distance_head_nll": [],
+        "distance_head_abs_zscore": [],
+        "distance_head_coverage_1sigma": [],
+        "distance_head_coverage_2sigma": [],
+    }
+    if query_sig.shape[0] == 0 or gt_sig.shape[0] == 0:
+        return metrics
+
+    target = _pairwise_cosine_distance(query_sig, gt_sig).min(dim=1).values
+    mean = predicted_mean.to(dtype=target.dtype, device=target.device)
+    var = predicted_variance.to(dtype=target.dtype, device=target.device).clamp_min(1e-6)
+    std = torch.sqrt(var)
+    residual = target - mean
+
+    metrics["distance_head_target_mse"].extend((residual.pow(2)).detach().cpu().tolist())
+    metrics["distance_head_target_mae"].extend(residual.abs().detach().cpu().tolist())
+    nll = 0.5 * (torch.log(var) + residual.pow(2) / var)
+    metrics["distance_head_nll"].extend(nll.detach().cpu().tolist())
+
+    abs_zscore = (residual.abs() / std).detach().cpu()
+    metrics["distance_head_abs_zscore"].extend(abs_zscore.tolist())
+    metrics["distance_head_coverage_1sigma"].extend((abs_zscore <= 1.0).to(dtype=torch.float32).tolist())
+    metrics["distance_head_coverage_2sigma"].extend((abs_zscore <= 2.0).to(dtype=torch.float32).tolist())
+    return metrics
 
 
 def _foreground_resolved_signature_embeddings(prediction: ResolvedPrediction) -> torch.Tensor:
@@ -344,6 +439,16 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
     count_gt: List[int] = []
     chamfer_values: List[float] = []
     hausdorff_values: List[float] = []
+    gaussian_ks_values: List[float] = []
+    gaussian_wasserstein_values: List[float] = []
+    gaussian_skew_abs_values: List[float] = []
+    gaussian_excess_kurtosis_abs_values: List[float] = []
+    distance_head_target_mse_values: List[float] = []
+    distance_head_target_mae_values: List[float] = []
+    distance_head_nll_values: List[float] = []
+    distance_head_abs_zscore_values: List[float] = []
+    distance_head_coverage_1sigma_values: List[float] = []
+    distance_head_coverage_2sigma_values: List[float] = []
     per_image_mean_iou: List[float] = []
     per_image_mean_iou_box: List[float] = []
     per_image_ap: List[float] = []
@@ -361,6 +466,16 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
             chamfer_values.append(float(item.signature_chamfer_distance))
         if item.signature_hausdorff_distance is not None:
             hausdorff_values.append(float(item.signature_hausdorff_distance))
+        gaussian_ks_values.extend(item.closest_gt_distance_gaussian_ks)
+        gaussian_wasserstein_values.extend(item.closest_gt_distance_gaussian_wasserstein)
+        gaussian_skew_abs_values.extend(item.closest_gt_distance_gaussian_skew_abs)
+        gaussian_excess_kurtosis_abs_values.extend(item.closest_gt_distance_gaussian_excess_kurtosis_abs)
+        distance_head_target_mse_values.extend(item.distance_head_target_mse)
+        distance_head_target_mae_values.extend(item.distance_head_target_mae)
+        distance_head_nll_values.extend(item.distance_head_nll)
+        distance_head_abs_zscore_values.extend(item.distance_head_abs_zscore)
+        distance_head_coverage_1sigma_values.extend(item.distance_head_coverage_1sigma)
+        distance_head_coverage_2sigma_values.extend(item.distance_head_coverage_2sigma)
 
     mean_iou = total_matched_iou / total_gt if total_gt > 0 else 0.0
     mean_iou_box = total_matched_box_iou / total_gt if total_gt > 0 else 0.0
@@ -380,6 +495,20 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
 
     _append_value_summary(summary, "matched_query_cosine_distance", matched_query_distances)
     _append_value_summary(summary, "unmatched_query_closest_gt_cosine_distance", unmatched_query_distances)
+    _append_value_summary(summary, "closest_gt_distance_gaussian_ks", gaussian_ks_values)
+    _append_value_summary(summary, "closest_gt_distance_gaussian_wasserstein", gaussian_wasserstein_values)
+    _append_value_summary(summary, "closest_gt_distance_gaussian_skew_abs", gaussian_skew_abs_values)
+    _append_value_summary(
+        summary,
+        "closest_gt_distance_gaussian_excess_kurtosis_abs",
+        gaussian_excess_kurtosis_abs_values,
+    )
+    _append_value_summary(summary, "distance_head_target_mse", distance_head_target_mse_values)
+    _append_value_summary(summary, "distance_head_target_mae", distance_head_target_mae_values)
+    _append_value_summary(summary, "distance_head_nll", distance_head_nll_values)
+    _append_value_summary(summary, "distance_head_abs_zscore", distance_head_abs_zscore_values)
+    _append_value_summary(summary, "distance_head_coverage_1sigma", distance_head_coverage_1sigma_values)
+    _append_value_summary(summary, "distance_head_coverage_2sigma", distance_head_coverage_2sigma_values)
 
     count_errors = [pred - gt for pred, gt in zip(count_pred, count_gt)]
     abs_count_errors = [abs(error) for error in count_errors]
@@ -459,10 +588,50 @@ def _evaluate_prediction_set(
     if gt_signatures is not None:
         pred_signatures = _foreground_resolved_signature_embeddings(prediction_set.clustering)
         chamfer, hausdorff = _compute_signature_set_distance_metrics(pred_signatures, gt_signatures)
+        gaussianity = _compute_closest_gt_distance_gaussian_metrics(
+            prediction_set.clustering.flat_queries.signature_embeddings,
+            gt_signatures,
+        ) if prediction_set.clustering.flat_queries is not None else {}
+        distance_head_metrics = _compute_distance_head_calibration_metrics(
+            prediction_set.clustering.flat_queries.signature_embeddings,
+            gt_signatures,
+            prediction_set.clustering.flat_queries.distance_predictions,
+            prediction_set.clustering.flat_queries.distance_variances,
+        ) if prediction_set.clustering.flat_queries is not None else {}
         clustering_evaluation.signature_count_pred = int(clustering_evaluation.num_pred)
         clustering_evaluation.signature_count_gt = int(clustering_evaluation.num_gt)
         clustering_evaluation.signature_chamfer_distance = chamfer
         clustering_evaluation.signature_hausdorff_distance = hausdorff
+        clustering_evaluation.closest_gt_distance_gaussian_ks.extend(
+            float(value) for value in gaussianity.get("closest_gt_distance_gaussian_ks", [])
+        )
+        clustering_evaluation.closest_gt_distance_gaussian_wasserstein.extend(
+            float(value) for value in gaussianity.get("closest_gt_distance_gaussian_wasserstein", [])
+        )
+        clustering_evaluation.closest_gt_distance_gaussian_skew_abs.extend(
+            float(value) for value in gaussianity.get("closest_gt_distance_gaussian_skew_abs", [])
+        )
+        clustering_evaluation.closest_gt_distance_gaussian_excess_kurtosis_abs.extend(
+            float(value) for value in gaussianity.get("closest_gt_distance_gaussian_excess_kurtosis_abs", [])
+        )
+        clustering_evaluation.distance_head_target_mse.extend(
+            float(value) for value in distance_head_metrics.get("distance_head_target_mse", [])
+        )
+        clustering_evaluation.distance_head_target_mae.extend(
+            float(value) for value in distance_head_metrics.get("distance_head_target_mae", [])
+        )
+        clustering_evaluation.distance_head_nll.extend(
+            float(value) for value in distance_head_metrics.get("distance_head_nll", [])
+        )
+        clustering_evaluation.distance_head_abs_zscore.extend(
+            float(value) for value in distance_head_metrics.get("distance_head_abs_zscore", [])
+        )
+        clustering_evaluation.distance_head_coverage_1sigma.extend(
+            float(value) for value in distance_head_metrics.get("distance_head_coverage_1sigma", [])
+        )
+        clustering_evaluation.distance_head_coverage_2sigma.extend(
+            float(value) for value in distance_head_metrics.get("distance_head_coverage_2sigma", [])
+        )
 
     if gt_prediction is not None:
         gt_signature_evaluation = evaluate_image(
@@ -750,6 +919,24 @@ def _append_overall_row(
     rows.append(row)
 
 
+def _append_reference_row(
+    rows: List[List[str]],
+    *,
+    value_columns: Sequence[tuple[str, str | None]],
+    reference_values: Dict[str, str] | None = None,
+):
+    reference_values = {} if reference_values is None else reference_values
+    row = ["ref"]
+    for column_type, metric_key in value_columns:
+        if column_type in {"images", "gt", "pred"}:
+            row.append("-")
+        elif column_type == "metric":
+            row.append(reference_values.get(metric_key or "", "-"))
+        else:
+            raise ValueError(f"Unsupported reference row column type: {column_type}")
+    rows.append(row)
+
+
 def format_metrics_table(
     overall: Dict[str, Any],
     by_count: Dict[int, Dict[str, Any]],
@@ -779,6 +966,7 @@ def format_metrics_table(
                 ("metric", "mean_iou_box"),
                 ("metric", "ap"),
             ],
+            {},
         ),
         (
             "golden_queries",
@@ -804,6 +992,7 @@ def format_metrics_table(
                 ("metric", "matched_query_cosine_distance_mean"),
                 ("metric", "unmatched_query_closest_gt_cosine_distance_mean"),
             ],
+            {},
         ),
         (
             "clustering",
@@ -833,10 +1022,54 @@ def format_metrics_table(
                 ("metric", "signature_chamfer_distance_mean"),
                 ("metric", "signature_hausdorff_distance_mean"),
             ],
+            {},
+        ),
+        (
+            "clustering",
+            "Distance Head Diagnostics by object count",
+            [
+                "obj.",
+                "img.",
+                "q_MAE",
+                "q_MSE",
+                "NLL",
+                "|z|",
+                "cov1",
+                "cov2",
+                "gauss_ks",
+                "gauss_w1",
+                "|skew|",
+                "|kurt|",
+            ],
+            [
+                ("images", None),
+                ("metric", "distance_head_target_mae_mean"),
+                ("metric", "distance_head_target_mse_mean"),
+                ("metric", "distance_head_nll_mean"),
+                ("metric", "distance_head_abs_zscore_mean"),
+                ("metric", "distance_head_coverage_1sigma_mean"),
+                ("metric", "distance_head_coverage_2sigma_mean"),
+                ("metric", "closest_gt_distance_gaussian_ks_mean"),
+                ("metric", "closest_gt_distance_gaussian_wasserstein_mean"),
+                ("metric", "closest_gt_distance_gaussian_skew_abs_mean"),
+                ("metric", "closest_gt_distance_gaussian_excess_kurtosis_abs_mean"),
+            ],
+            {
+                "distance_head_target_mae_mean": "0.00",
+                "distance_head_target_mse_mean": "0.00",
+                "distance_head_nll_mean": "min",
+                "distance_head_abs_zscore_mean": "0.80",
+                "distance_head_coverage_1sigma_mean": "0.68",
+                "distance_head_coverage_2sigma_mean": "0.95",
+                "closest_gt_distance_gaussian_ks_mean": "0.00",
+                "closest_gt_distance_gaussian_wasserstein_mean": "0.00",
+                "closest_gt_distance_gaussian_skew_abs_mean": "0.00",
+                "closest_gt_distance_gaussian_excess_kurtosis_abs_mean": "0.00",
+            },
         ),
     ]
 
-    for key, title, headers, value_columns in table_specs:
+    for key, title, headers, value_columns, reference_values in table_specs:
         overall_metrics = overall.get(key)
         if overall_metrics is None:
             continue
@@ -862,6 +1095,7 @@ def format_metrics_table(
             rows.append(row)
 
         _append_overall_row(rows, overall_metrics, value_columns=value_columns)
+        _append_reference_row(rows, value_columns=value_columns, reference_values=reference_values)
         sections.append(title + "\n" + _format_table(headers, rows))
 
     return "\n\n".join(sections)

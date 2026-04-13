@@ -155,10 +155,18 @@ class ClusterPanopticCriterion(nn.Module):
         sig_embs = raw.sig_embs
         seed_logits = raw.seed_logits
         influence_preds = raw.influence_preds
+        distance_preds = raw.distance_preds
+        distance_vars = raw.distance_vars
         H_img, W_img = raw.img_shape
 
-        if sig_embs is None or seed_logits is None or influence_preds is None:
-            raise ValueError("Clustered criterion requires signature, seed, and influence predictions.")
+        if (
+            sig_embs is None
+            or seed_logits is None
+            or influence_preds is None
+            or distance_preds is None
+            or distance_vars is None
+        ):
+            raise ValueError("Clustered criterion requires signature, seed, influence, and distance predictions.")
 
         B = features.shape[0]
 
@@ -180,6 +188,7 @@ class ClusterPanopticCriterion(nn.Module):
                 "loss_mask_ce": zero,
                 "loss_mask_iou": zero,
                 "loss_mask_total": zero,
+                "loss_distance_nll": zero,
                 "loss_inter": zero,
             }
 
@@ -212,11 +221,15 @@ class ClusterPanopticCriterion(nn.Module):
         q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
+        q_distance_preds_flat = distance_preds[:, valid_b].transpose(0, 1).reshape(B_val, L * N_q)
+        q_distance_vars_flat = distance_vars[:, valid_b].transpose(0, 1).reshape(B_val, L * N_q)
 
         gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
         matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_norm, gt_pad_mask)
 
         sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
+        distance_to_gt = 1.0 - sim
+        closest_gt_distance = distance_to_gt.masked_fill(~gt_pad_mask.unsqueeze(1), float("inf")).min(dim=-1).values
         weights_flat = assignment_weights_with_influence(
             similarity=sim,
             influence=q_influence_flat,
@@ -254,6 +267,13 @@ class ClusterPanopticCriterion(nn.Module):
 
         seed_targets = matched_query_mask.float()
         loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
+        loss_distance_nll = F.gaussian_nll_loss(
+            q_distance_preds_flat,
+            closest_gt_distance.detach(),
+            q_distance_vars_flat,
+            eps=1e-6,
+            reduction="mean",
+        )
 
         loss_seed_sig = features.sum() * 0.0
         matched_pos = matched_query_mask.nonzero(as_tuple=False)
@@ -271,6 +291,7 @@ class ClusterPanopticCriterion(nn.Module):
             + loss_cls
             + total_loss_mask
             + self.cfg.w_seed * loss_seed
+            + self.cfg.w_distance_nll * loss_distance_nll
             + self.cfg.w_inter * loss_inter
         )
 
@@ -282,6 +303,7 @@ class ClusterPanopticCriterion(nn.Module):
             "loss_mask_ce": loss_mask_ce,
             "loss_mask_iou": loss_mask_iou,
             "loss_mask_total": total_loss_mask,
+            "loss_distance_nll": loss_distance_nll,
             "loss_inter": loss_inter,
         }
 
@@ -382,6 +404,7 @@ class StandardMask2FormerCriterion(nn.Module):
             "loss_mask_bce": loss_mask_bce,
             "loss_mask_dice": loss_mask_dice,
             "loss_mask_total": total_loss_mask,
+            "loss_distance_nll": zero,
             "loss_inter": zero,
         }
         return final_loss, components
