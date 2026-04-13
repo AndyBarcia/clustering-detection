@@ -55,8 +55,8 @@ class LossConfig:
     w_mask_iou: float = 5.0
     w_seed: float = 2.0
     w_distance_nll: float = 1.0
-    w_inter: float = 10.0
-    inter_margin: float = 0.0
+    w_inter: float = 100.0
+    inter_margin: float = 0.2
 
     matcher_cost_class: float = 2.0
     matcher_cost_mask_bce: float = 5.0

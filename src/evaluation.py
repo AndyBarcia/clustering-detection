@@ -39,6 +39,9 @@ class ImageEvaluation:
     distance_head_abs_zscore: List[float] = field(default_factory=list)
     distance_head_coverage_1sigma: List[float] = field(default_factory=list)
     distance_head_coverage_2sigma: List[float] = field(default_factory=list)
+    gt_pairwise_signature_similarities: List[float] = field(default_factory=list)
+    gt_max_signature_similarities: List[float] = field(default_factory=list)
+    gt_margin_violations: List[float] = field(default_factory=list)
 
 
 def _stack_masks(masks: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -134,6 +137,36 @@ def _compute_signature_set_distance_metrics(
     chamfer = 0.5 * (pred_to_gt.mean() + gt_to_pred.mean())
     hausdorff = torch.maximum(pred_to_gt.max(), gt_to_pred.max())
     return float(chamfer.item()), float(hausdorff.item())
+
+
+def _compute_gt_signature_separation_metrics(
+    gt_sig: torch.Tensor,
+    *,
+    separation_margin: float,
+) -> Dict[str, List[float]]:
+    metrics = {
+        "gt_pairwise_signature_similarities": [],
+        "gt_max_signature_similarities": [],
+        "gt_margin_violations": [],
+    }
+    num_gt = int(gt_sig.shape[0])
+    if num_gt == 0:
+        return metrics
+    if num_gt == 1:
+        metrics["gt_margin_violations"].append(0.0)
+        return metrics
+
+    similarities = torch.matmul(gt_sig, gt_sig.T).clamp(-1.0, 1.0)
+    upper_tri = torch.triu_indices(num_gt, num_gt, offset=1, device=gt_sig.device)
+    pairwise = similarities[upper_tri[0], upper_tri[1]]
+    metrics["gt_pairwise_signature_similarities"].extend(pairwise.detach().cpu().tolist())
+
+    similarities = similarities.clone()
+    similarities.fill_diagonal_(float("-inf"))
+    max_similarity = similarities.max(dim=1).values
+    metrics["gt_max_signature_similarities"].extend(max_similarity.detach().cpu().tolist())
+    metrics["gt_margin_violations"].extend((max_similarity > separation_margin).to(dtype=torch.float32).cpu().tolist())
+    return metrics
 
 
 def _compute_closest_gt_distance_gaussian_metrics(
@@ -449,6 +482,9 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
     distance_head_abs_zscore_values: List[float] = []
     distance_head_coverage_1sigma_values: List[float] = []
     distance_head_coverage_2sigma_values: List[float] = []
+    gt_pairwise_signature_similarity_values: List[float] = []
+    gt_max_signature_similarity_values: List[float] = []
+    gt_margin_violation_values: List[float] = []
     per_image_mean_iou: List[float] = []
     per_image_mean_iou_box: List[float] = []
     per_image_ap: List[float] = []
@@ -476,6 +512,9 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
         distance_head_abs_zscore_values.extend(item.distance_head_abs_zscore)
         distance_head_coverage_1sigma_values.extend(item.distance_head_coverage_1sigma)
         distance_head_coverage_2sigma_values.extend(item.distance_head_coverage_2sigma)
+        gt_pairwise_signature_similarity_values.extend(item.gt_pairwise_signature_similarities)
+        gt_max_signature_similarity_values.extend(item.gt_max_signature_similarities)
+        gt_margin_violation_values.extend(item.gt_margin_violations)
 
     mean_iou = total_matched_iou / total_gt if total_gt > 0 else 0.0
     mean_iou_box = total_matched_box_iou / total_gt if total_gt > 0 else 0.0
@@ -509,6 +548,9 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
     _append_value_summary(summary, "distance_head_abs_zscore", distance_head_abs_zscore_values)
     _append_value_summary(summary, "distance_head_coverage_1sigma", distance_head_coverage_1sigma_values)
     _append_value_summary(summary, "distance_head_coverage_2sigma", distance_head_coverage_2sigma_values)
+    _append_value_summary(summary, "gt_pairwise_signature_similarity", gt_pairwise_signature_similarity_values)
+    _append_value_summary(summary, "gt_max_signature_similarity", gt_max_signature_similarity_values)
+    _append_value_summary(summary, "gt_margin_violation_rate", gt_margin_violation_values)
 
     count_errors = [pred - gt for pred, gt in zip(count_pred, count_gt)]
     abs_count_errors = [abs(error) for error in count_errors]
@@ -573,12 +615,14 @@ def _evaluate_prediction_set(
     target: Dict[str, Any],
     *,
     ap_iou_threshold: float,
+    separation_margin: float,
 ) -> tuple[ImageEvaluation, ImageEvaluation | None, ImageEvaluation | None]:
     gt_signature_evaluation = None
     golden_query_evaluation = None
 
     gt_prediction = prediction_set.gt_signatures
     gt_signatures = None if gt_prediction is None else gt_prediction.all_signature_embeddings
+    gt_separation = None
 
     clustering_evaluation = evaluate_image(
         prediction_set.clustering,
@@ -588,6 +632,10 @@ def _evaluate_prediction_set(
     if gt_signatures is not None:
         pred_signatures = _foreground_resolved_signature_embeddings(prediction_set.clustering)
         chamfer, hausdorff = _compute_signature_set_distance_metrics(pred_signatures, gt_signatures)
+        gt_separation = _compute_gt_signature_separation_metrics(
+            gt_signatures,
+            separation_margin=separation_margin,
+        )
         gaussianity = _compute_closest_gt_distance_gaussian_metrics(
             prediction_set.clustering.flat_queries.signature_embeddings,
             gt_signatures,
@@ -632,6 +680,15 @@ def _evaluate_prediction_set(
         clustering_evaluation.distance_head_coverage_2sigma.extend(
             float(value) for value in distance_head_metrics.get("distance_head_coverage_2sigma", [])
         )
+        clustering_evaluation.gt_pairwise_signature_similarities.extend(
+            float(value) for value in gt_separation.get("gt_pairwise_signature_similarities", [])
+        )
+        clustering_evaluation.gt_max_signature_similarities.extend(
+            float(value) for value in gt_separation.get("gt_max_signature_similarities", [])
+        )
+        clustering_evaluation.gt_margin_violations.extend(
+            float(value) for value in gt_separation.get("gt_margin_violations", [])
+        )
 
     if gt_prediction is not None:
         gt_signature_evaluation = evaluate_image(
@@ -639,6 +696,16 @@ def _evaluate_prediction_set(
             target,
             ap_iou_threshold=ap_iou_threshold,
         )
+        if gt_separation is not None:
+            gt_signature_evaluation.gt_pairwise_signature_similarities.extend(
+                float(value) for value in gt_separation.get("gt_pairwise_signature_similarities", [])
+            )
+            gt_signature_evaluation.gt_max_signature_similarities.extend(
+                float(value) for value in gt_separation.get("gt_max_signature_similarities", [])
+            )
+            gt_signature_evaluation.gt_margin_violations.extend(
+                float(value) for value in gt_separation.get("gt_margin_violations", [])
+            )
 
     if prediction_set.golden_queries is not None:
         golden_query_evaluation = evaluate_image(
@@ -738,6 +805,7 @@ def evaluate_system(
                     prediction_set,
                     target,
                     ap_iou_threshold=ap_iou_threshold,
+                    separation_margin=system.cfg.loss.inter_margin,
                 )
                 clustering_evaluations.append(clustering_eval)
                 object_counts.append(int((target["labels"] != 0).sum().item()))
@@ -832,6 +900,7 @@ def evaluate_system_many_configs(
                             prediction_set,
                             target,
                             ap_iou_threshold=ap_iou_threshold,
+                            separation_margin=system.cfg.loss.inter_margin,
                         )
                         clustering_evaluations[key].append(clustering_eval)
                         if gt_signature_evaluations is not None and gt_eval is not None:
@@ -942,6 +1011,7 @@ def format_metrics_table(
     by_count: Dict[int, Dict[str, Any]],
     *,
     ap_threshold: float,
+    separation_margin: float = 0.0,
 ) -> str:
     sections: List[str] = []
 
@@ -957,6 +1027,9 @@ def format_metrics_table(
                 "IoU_m",
                 "Iou_b",
                 f"AP@{ap_threshold:.2f}",
+                "GT_sim",
+                "GT_max_sim",
+                "%>margin",
             ],
             [
                 ("images", None),
@@ -965,8 +1038,15 @@ def format_metrics_table(
                 ("metric", "mean_iou"),
                 ("metric", "mean_iou_box"),
                 ("metric", "ap"),
+                ("metric", "gt_pairwise_signature_similarity_mean"),
+                ("metric", "gt_max_signature_similarity_mean"),
+                ("metric", "gt_margin_violation_rate_mean"),
             ],
-            {},
+            {
+                "gt_pairwise_signature_similarity_mean": f"<{separation_margin:.2f}",
+                "gt_max_signature_similarity_mean": f"<{separation_margin:.2f}",
+                "gt_margin_violation_rate_mean": "0.00",
+            },
         ),
         (
             "golden_queries",

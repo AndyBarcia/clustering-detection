@@ -65,7 +65,14 @@ def main():
     print(f"Evaluation samples: {args.dataset_length}")
     print(f"AP IoU threshold: {args.ap_threshold:.2f}")
     print()
-    print(format_metrics_table(overall, by_count, ap_threshold=args.ap_threshold))
+    print(
+        format_metrics_table(
+            overall,
+            by_count,
+            ap_threshold=args.ap_threshold,
+            separation_margin=system.cfg.loss.inter_margin,
+        )
+    )
 
     if args.output_json is not None:
         output_path = Path(args.output_json)

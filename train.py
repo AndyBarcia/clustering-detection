@@ -285,7 +285,15 @@ def main():
                 "seed": args.eval_seed + epoch_idx,
             }
             print("Evaluation", flush=True)
-            print(format_metrics_table(overall_eval, per_count_eval, ap_threshold=args.eval_ap_threshold), flush=True)
+            print(
+                format_metrics_table(
+                    overall_eval,
+                    per_count_eval,
+                    ap_threshold=args.eval_ap_threshold,
+                    separation_margin=system.cfg.loss.inter_margin,
+                ),
+                flush=True,
+            )
 
         save_training_state(output_dir, system, optimizer, history, epoch_idx + 1)
         if not args.skip_epoch_vis:
