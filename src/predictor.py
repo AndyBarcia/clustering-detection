@@ -5,6 +5,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.distributions import Normal
 from scipy.optimize import linear_sum_assignment
 
 # Optional clustering backends
@@ -130,6 +131,17 @@ class ModularPrototypePredictor:
     def __init__(self, cfg: PrototypeInferenceConfig):
         self.cfg = cfg
 
+    def _distance_upper_confidence_bound(self, flat_queries: FlatQueryOutputs) -> torch.Tensor:
+        cfg = self.cfg.seed
+        confidence_interval = float(cfg.distance_confidence_interval)
+        confidence_interval = min(max(confidence_interval, 1e-6), 1.0 - 1e-6)
+        z_value = Normal(
+            loc=torch.tensor(0.0, device=flat_queries.distance_predictions.device),
+            scale=torch.tensor(1.0, device=flat_queries.distance_predictions.device),
+        ).icdf(torch.tensor(confidence_interval, device=flat_queries.distance_predictions.device))
+        std = flat_queries.distance_variances.clamp_min(1e-6).sqrt()
+        return flat_queries.distance_predictions + z_value * std
+
     def _apply_morphology(self, mask: torch.Tensor) -> torch.Tensor:
         cfg = self.cfg.overlap
         op = cfg.morphology_op.lower()
@@ -231,7 +243,9 @@ class ModularPrototypePredictor:
 
     def select_seed_queries(self, flat_queries: FlatQueryOutputs) -> SeedSelection:
         cfg = self.cfg.seed
-        effective_scores = flat_queries.seed_scores.clone()
+        distance_upper_bound = self._distance_upper_confidence_bound(flat_queries)
+        ranking_scores = 1.0 / (1.0 + distance_upper_bound)
+        effective_scores = ranking_scores.clone()
 
         if cfg.use_foreground_in_score:
             effective_scores = effective_scores * flat_queries.partition_confidence.pow(cfg.foreground_score_power)
@@ -248,7 +262,7 @@ class ModularPrototypePredictor:
             eligible_mask &= flat_queries.influence_scores <= cfg.max_influence
 
         selected_mask = eligible_mask.clone()
-        selected_mask &= flat_queries.seed_scores >= cfg.quality_threshold
+        selected_mask &= distance_upper_bound <= cfg.max_distance
         selected_indices = torch.where(selected_mask)[0]
 
         if selected_indices.numel() < cfg.min_num_seeds:
@@ -438,7 +452,7 @@ class ModularPrototypePredictor:
         prototype_seed_indices = []
 
         for member_query_indices in clustering.cluster_members:
-            representative_local = torch.argmax(flat_queries.seed_scores[member_query_indices])
+            representative_local = torch.argmin(flat_queries.distance_predictions[member_query_indices])
             representative_query_index = member_query_indices[representative_local]
             prototype_seed_indices.append(representative_query_index)
 

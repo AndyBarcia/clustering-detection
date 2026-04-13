@@ -257,14 +257,14 @@ def save_top_trials_table(trials: List[Dict], metric_name: str, output_path: Pat
             str(trial["number"]),
             f"{float(trial['value']):.4f}",
             str(params.get("cluster.method", "")),
-            f"{params.get('seed.quality_threshold', '')}",
+            f"{params.get('seed.max_distance', '')}",
             f"{params.get('overlap.pixel_score_threshold', '')}",
             f"{params.get('overlap.min_prototype_score', '')}",
         ])
 
     table = ax.table(
         cellText=rows,
-        colLabels=["trial", metric_name, "method", "seed.q", "pixel.th", "proto.score"],
+        colLabels=["trial", metric_name, "method", "seed.max_d", "pixel.th", "proto.score"],
         loc="center",
     )
     table.auto_set_font_size(False)

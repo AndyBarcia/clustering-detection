@@ -75,7 +75,8 @@ from src.panoptic import load_system_checkpoint
 
 DEFAULT_SEARCH_SPACE = {
     "ttt_steps": {"type": "int", "low": 0, "high": 20},
-    "seed.quality_threshold": {"type": "float", "low": 0.03, "high": 0.2},
+    "seed.max_distance": {"type": "float", "low": 0.05, "high": 0.5},
+    "seed.distance_confidence_interval": {"type": "float", "low": 0.68, "high": 0.99},
     "seed.topk": {"type": "categorical", "choices": [None, 10, 20, 40]},
     "seed.min_num_seeds": {"type": "int", "low": 1, "high": 4},
     "seed.exclude_background": {"type": "categorical", "choices": [True, False]},
@@ -145,10 +146,11 @@ BEST_KNOWN_PARAMS = {
     "seed.exclude_background": True,
     "seed.foreground_score_power": 1.74,
     "seed.max_influence": 0.4,
+    "seed.max_distance": 0.3,
+    "seed.distance_confidence_interval": 0.95,
     "seed.min_num_seeds": 1,
     "seed.min_foreground_prob": 0.22,
     "seed.topk": None,
-    "seed.quality_threshold": 0.07,
     "seed.use_foreground_in_score": True,
 }
 

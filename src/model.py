@@ -38,7 +38,18 @@ class TransformerDecoderLayer(nn.Module):
     between the cross-attention and the feedforward network (MLP).
     Follows norm_first=True architecture.
     """
-    def __init__(self, d_model, nhead, dim_feedforward=256, dropout=0.1, activation="gelu", ttt_steps=3, ttt_lr=0.1, ttt_momentum=0.8):
+    def __init__(
+        self,
+        d_model,
+        nhead,
+        dim_feedforward=256,
+        dropout=0.1,
+        activation="gelu",
+        ttt_steps=3,
+        ttt_lr=0.1,
+        ttt_momentum=0.8,
+        ttt_objective: str = "distance",
+    ):
         super().__init__()
         # 1. Self-Attention components
         self.norm1 = nn.LayerNorm(d_model)
@@ -52,6 +63,7 @@ class TransformerDecoderLayer(nn.Module):
 
         # 3. TTT components
         self.ttt_steps = ttt_steps
+        self.ttt_objective = ttt_objective
         raw_ttt_lr = torch.log(torch.expm1(torch.tensor(float(ttt_lr))))
         self.ttt_lr = nn.Parameter(raw_ttt_lr)
         raw_ttt_momentum = torch.logit(torch.tensor(float(ttt_momentum)))
@@ -83,8 +95,34 @@ class TransformerDecoderLayer(nn.Module):
         )
         return tgt + self.dropout2(tgt2)
 
-    def _ttt_block(self, tgt, seed_head):
-        if seed_head is None or self.ttt_steps <= 0:
+    def _ttt_inner_loss(self, q, ttt_heads):
+        if ttt_heads is None:
+            raise ValueError("TTT heads must be provided when TTT is enabled.")
+
+        objective = self.ttt_objective.lower()
+        if objective not in {"distance", "variance", "both"}:
+            raise ValueError(f"Unknown TTT objective: {self.ttt_objective}")
+
+        distance_head = ttt_heads.get("distance_head")
+        if distance_head is None:
+            raise ValueError("Distance head is required for TTT distance objectives.")
+
+        detached_states = {k: v.detach() for k, v in distance_head.named_parameters()}
+        distance_stats = functional_call(distance_head, detached_states, (q,))
+        distance_mean = F.softplus(distance_stats[..., 0])
+        distance_variance = F.softplus(distance_stats[..., 1]) + 1e-6
+
+        loss_terms = []
+        if objective in {"distance", "both"}:
+            loss_terms.append(distance_mean)
+        if objective in {"variance", "both"}:
+            loss_terms.append(distance_variance)
+
+        inner_loss = sum(loss_terms)
+        return inner_loss.view(q.shape[0], -1).mean(dim=-1).sum()
+
+    def _ttt_block(self, tgt, ttt_heads):
+        if ttt_heads is None or self.ttt_steps <= 0:
             intermediate_q = [tgt]
             intermediate_q = torch.stack(intermediate_q, dim=0) # (TTTSteps,B,Q,C)
             return tgt, intermediate_q
@@ -104,16 +142,9 @@ class TransformerDecoderLayer(nn.Module):
             #intermediate_q = [tgt.detach().requires_grad_(True)]
             intermediate_q = [tgt.requires_grad_(True)]
             v = torch.zeros_like(intermediate_q[-1])
-            
-            detached_states = {k: v.detach() for k, v in seed_head.named_parameters()}
 
             for _ in range(self.ttt_steps):
-                seed_logits = functional_call(seed_head, detached_states, (intermediate_q[-1],))
-                seed_scores = torch.sigmoid(seed_logits.squeeze(-1))
-                inner_loss = 1.0 - seed_scores
-                
-                # Propperly scale losses based on batch size.
-                inner_loss = inner_loss.view(tgt.shape[0],-1).mean(dim=-1).sum()
+                inner_loss = self._ttt_inner_loss(intermediate_q[-1], ttt_heads)
 
                 grad = torch.autograd.grad(
                     inner_loss, 
@@ -143,12 +174,12 @@ class TransformerDecoderLayer(nn.Module):
         memory_mask=None, 
         tgt_key_padding_mask=None, 
         memory_key_padding_mask=None,
-        seed_head=None
+        ttt_heads=None
     ):
         
         tgt = self._self_attention_block(tgt, tgt_mask, tgt_key_padding_mask)
         tgt = self._cross_attention_block(tgt, memory, memory_mask, memory_key_padding_mask)
-        tgt, intermediate_ttt_q = self._ttt_block(tgt, seed_head)
+        tgt, intermediate_ttt_q = self._ttt_block(tgt, ttt_heads)
         tgt = self._ff_block(tgt)
 
         return tgt, intermediate_ttt_q
@@ -224,6 +255,7 @@ class Mask2FormerBase(nn.Module):
             ttt_steps=dlcfg.ttt_steps,
             ttt_lr=dlcfg.ttt_lr,
             ttt_momentum=dlcfg.ttt_momentum,
+            ttt_objective=dlcfg.ttt_objective,
         )
         self.transformer_decoder = TTTTransformerDecoder(
             decoder_layer,
@@ -245,7 +277,7 @@ class Mask2FormerBase(nn.Module):
         spatial_tokens = cfg.spatial_hw * cfg.spatial_hw
         self.spatial_pos_embed = nn.Parameter(torch.randn(1, spatial_tokens, hidden_dim) * 0.02)
 
-    def _decoder_seed_head(self):
+    def _decoder_ttt_heads(self):
         return None
 
     @contextlib.contextmanager
@@ -279,7 +311,7 @@ class Mask2FormerBase(nn.Module):
             q_dec_all, intermediate_ttt_q = self.transformer_decoder(
                 tgt=query_embed,
                 memory=memory,
-                seed_head=self._decoder_seed_head(),
+                ttt_heads=self._decoder_ttt_heads(),
             )
         return q_dec_all, intermediate_ttt_q
 
@@ -367,8 +399,10 @@ class CustomMask2Former(Mask2FormerBase):
         else:
             self.alpha_focal = cfg.alpha_focal
 
-    def _decoder_seed_head(self):
-        return self.seed_head
+    def _decoder_ttt_heads(self):
+        return {
+            "distance_head": self.distance_head,
+        }
 
     def encode_gts(self, memory, features, masks, labels, pad_mask, ttt_steps_override: Optional[int] = None):
         B_val, M_max = masks.shape[:2]
@@ -391,7 +425,7 @@ class CustomMask2Former(Mask2FormerBase):
                 tgt=query_init,
                 memory=memory,
                 memory_mask=attn_mask_rep,
-                seed_head=self.seed_head,
+                ttt_heads=self._decoder_ttt_heads(),
             )
         q_gt = q_gt_all[-1]
 

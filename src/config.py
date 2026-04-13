@@ -20,6 +20,7 @@ class DecoderLayerConfig:
     ttt_steps: int = 10
     ttt_lr: float = 0.1
     ttt_momentum: float = 0.8
+    ttt_objective: str = "variance"  # ["distance", "variance", "both"]
 
 
 @dataclass
@@ -55,8 +56,8 @@ class LossConfig:
     w_mask_iou: float = 5.0
     w_seed: float = 2.0
     w_distance_nll: float = 1.0
-    w_inter: float = 100.0
-    inter_margin: float = 0.2
+    w_inter: float = 10.0
+    inter_margin: float = 0.0
 
     matcher_cost_class: float = 2.0
     matcher_cost_mask_bce: float = 5.0
@@ -69,8 +70,8 @@ class LossConfig:
 
 @dataclass
 class SeedFilterConfig:
-    # Threshold on predicted seedness used to decide which queries can start clusters.
-    quality_threshold: float = 0.07
+    max_distance: float = 0.30
+    distance_confidence_interval: float = 0.95
     topk: Optional[int] = None
     min_num_seeds: int = 1
     exclude_background: bool = False
