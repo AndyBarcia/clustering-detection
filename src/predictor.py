@@ -49,28 +49,13 @@ from .outputs import (
     SeedClustering,
     SeedSelection,
 )
+from .signature_ops import pairwise_distance, pairwise_distance_np, pairwise_similarity, pairwise_similarity_np
 
 
 def _alpha_value(alpha_obj) -> float:
     if isinstance(alpha_obj, torch.Tensor):
         return float(alpha_obj.detach().cpu().item())
     return float(alpha_obj)
-
-
-def _cosine_affinity_np(x: np.ndarray) -> np.ndarray:
-    return np.clip(x @ x.T, 0.0, 1.0)
-
-
-def _cosine_distance_np(x: np.ndarray) -> np.ndarray:
-    dist = 1.0 - np.clip(x @ x.T, -1.0, 1.0)
-    return np.ascontiguousarray(dist, dtype=np.float64)
-
-
-def _pairwise_cosine_distance(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-    if lhs.shape[0] == 0 or rhs.shape[0] == 0:
-        return torch.zeros((lhs.shape[0], rhs.shape[0]), dtype=torch.float32, device=lhs.device)
-    similarity = torch.matmul(lhs, rhs.T).clamp(-1.0, 1.0)
-    return 1.0 - similarity
 
 
 def _connected_components_labels(affinity: np.ndarray, threshold: float) -> np.ndarray:
@@ -258,7 +243,7 @@ class ModularPrototypePredictor:
             eligible_mask=eligible_mask,
         )
 
-    def _cluster_local(self, seed_sigs_np: np.ndarray, seed_scores_np: np.ndarray) -> np.ndarray:
+    def _cluster_local(self, model: CustomMask2Former, seed_sigs_np: np.ndarray, seed_scores_np: np.ndarray) -> np.ndarray:
         cfg = self.cfg.cluster
         method = cfg.method.lower()
 
@@ -271,21 +256,32 @@ class ModularPrototypePredictor:
         if method == "dbscan":
             if DBSCAN is None:
                 raise ImportError("scikit-learn is not installed. pip install scikit-learn")
+            dist = pairwise_distance_np(
+                seed_sigs_np,
+                metric=model.signature_similarity_metric,
+                normalize=model.signature_normalize,
+                clamp=True,
+            )
             clusterer = DBSCAN(
                 eps=cfg.dbscan_eps,
                 min_samples=cfg.dbscan_min_samples,
-                metric="cosine",
+                metric="precomputed",
             )
             if cfg.dbscan_use_sample_weight:
-                clusterer.fit(seed_sigs_np, sample_weight=seed_scores_np)
+                clusterer.fit(dist, sample_weight=seed_scores_np)
             else:
-                clusterer.fit(seed_sigs_np)
+                clusterer.fit(dist)
             return clusterer.labels_.astype(np.int64)
 
         if method == "hdbscan":
             if _hdbscan is None:
                 raise ImportError("hdbscan is not installed. pip install hdbscan")
-            dist = _cosine_distance_np(seed_sigs_np)
+            dist = pairwise_distance_np(
+                seed_sigs_np,
+                metric=model.signature_similarity_metric,
+                normalize=model.signature_normalize,
+                clamp=True,
+            )
             clusterer = _hdbscan.HDBSCAN(
                 metric="precomputed",
                 min_cluster_size=cfg.hdbscan_min_cluster_size,
@@ -294,7 +290,15 @@ class ModularPrototypePredictor:
             )
             return clusterer.fit_predict(dist).astype(np.int64)
 
-        affinity = _cosine_affinity_np(seed_sigs_np)
+        affinity = np.clip(
+            pairwise_similarity_np(
+                seed_sigs_np,
+                metric=model.signature_similarity_metric,
+                normalize=model.signature_normalize,
+            ),
+            0.0,
+            1.0,
+        )
 
         if method == "cc":
             return _connected_components_labels(affinity, cfg.graph_affinity_threshold)
@@ -343,7 +347,7 @@ class ModularPrototypePredictor:
 
         raise ValueError(f"Unknown clustering method: {cfg.method}")
 
-    def cluster_seed_queries(self, flat_queries: FlatQueryOutputs, selection: SeedSelection) -> SeedClustering:
+    def cluster_seed_queries(self, model: CustomMask2Former, flat_queries: FlatQueryOutputs, selection: SeedSelection) -> SeedClustering:
         cfg = self.cfg.cluster
         device = selection.indices.device
 
@@ -367,7 +371,7 @@ class ModularPrototypePredictor:
             local_signatures_np = flat_queries.signature_embeddings[local_seed_indices].detach().cpu().numpy()
             local_scores_np = local_seed_scores.detach().cpu().numpy()
 
-            local_labels_np = self._cluster_local(local_signatures_np, local_scores_np)
+            local_labels_np = self._cluster_local(model, local_signatures_np, local_scores_np)
             local_labels = torch.as_tensor(local_labels_np, device=device)
 
             valid_cluster_ids = [int(value) for value in np.unique(local_labels_np) if value != -1]
@@ -476,7 +480,11 @@ class ModularPrototypePredictor:
         final_normalized_weights = None
 
         for _ in range(max(1, cfg.refinement_steps)):
-            similarity = torch.matmul(query_signatures, prototype_signatures.T)
+            similarity = pairwise_similarity(
+                query_signatures,
+                prototype_signatures,
+                metric=model.signature_similarity_metric,
+            )
             raw_weights = assignment_weights_with_influence(
                 similarity=similarity,
                 influence=flat_queries.influence_scores[source_query_indices],
@@ -549,7 +557,11 @@ class ModularPrototypePredictor:
             return self._empty_prototype_state(flat_queries)
 
         alpha = _alpha_value(model.alpha_focal) if self.cfg.assign.use_alpha_focal else 1.0
-        similarity = torch.matmul(flat_queries.signature_embeddings, signature_embeddings.T)
+        similarity = pairwise_similarity(
+            flat_queries.signature_embeddings,
+            signature_embeddings,
+            metric=model.signature_similarity_metric,
+        )
         raw_weights = assignment_weights_with_influence(
             similarity=similarity,
             influence=flat_queries.influence_scores,
@@ -785,7 +797,7 @@ class ModularPrototypePredictor:
     def predict_clustered_single(self, model: CustomMask2Former, raw: RawOutputs, batch_index: int) -> ResolvedPrediction:
         flat_queries = self.flatten_outputs(raw, batch_index)
         seed_selection = self.select_seed_queries(flat_queries)
-        seed_clustering = self.cluster_seed_queries(flat_queries, seed_selection)
+        seed_clustering = self.cluster_seed_queries(model, flat_queries, seed_selection)
         prototypes = self.initialize_clustered_prototypes(flat_queries, seed_clustering)
         prototypes = self.refine_prototypes(model, flat_queries, prototypes)
         return self.resolve_prediction(flat_queries, prototypes)
@@ -817,7 +829,12 @@ class ModularPrototypePredictor:
             return empty_prediction, GoldenQueryDiagnostics()
 
         query_signatures = flat_queries.signature_embeddings[candidate_indices]
-        distances = _pairwise_cosine_distance(query_signatures, gt_signatures)
+        distances = pairwise_distance(
+            query_signatures,
+            gt_signatures,
+            metric=model.signature_similarity_metric,
+            clamp=True,
+        )
 
         num_queries, num_gt = distances.shape
         size = max(num_queries, num_gt)

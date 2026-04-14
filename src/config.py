@@ -34,6 +34,8 @@ class HeadConfig:
     num_classes: int = 3
     hidden_dim: int = 1024
     sig_dim: int = 64
+    normalize_signatures: bool = True
+    similarity_metric: str = "dot"
 
 
 @dataclass

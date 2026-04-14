@@ -24,6 +24,7 @@ from .dataset import SyntheticPanopticBatchGenerator
 from .mask_aggregation import project_mask_embeddings
 from .outputs import FlatQueryOutputs, ResolvedPrediction
 from .panoptic import PanopticSystem
+from .signature_ops import pairwise_distance_np
 
 
 DEFAULT_CLASS_NAMES = ["Background", "Square", "Triangle"]
@@ -162,14 +163,15 @@ def _project_signatures_2d(signatures: np.ndarray) -> np.ndarray:
 
     if umap is not None:
         n_neighbors = max(2, min(15, signatures.shape[0] - 1))
+        distances = pairwise_distance_np(signatures, clamp=True)
         reducer = umap.UMAP(
             n_components=2,
             n_neighbors=n_neighbors,
             min_dist=0.15,
-            metric="cosine",
+            metric="precomputed",
             random_state=0,
         )
-        return reducer.fit_transform(signatures).astype(np.float32, copy=False)
+        return reducer.fit_transform(distances).astype(np.float32, copy=False)
 
     centered = signatures - signatures.mean(axis=0, keepdims=True)
     _, _, vh = np.linalg.svd(centered, full_matrices=False)
@@ -512,10 +514,9 @@ def _draw_signature_umap(
     ax.grid(True, alpha=0.15, linewidth=0.5)
 
     if q_sig_np.shape[0] > 1:
-        q_sig_norm = q_sig_np / np.clip(np.linalg.norm(q_sig_np, axis=1, keepdims=True), 1e-6, None)
-        cosine_dist = 1.0 - np.clip(q_sig_norm @ q_sig_norm.T, -1.0, 1.0)
-        np.fill_diagonal(cosine_dist, np.inf)
-        neighbor_order = np.argsort(cosine_dist, axis=1)
+        pairwise_distances = pairwise_distance_np(q_sig_np, clamp=True)
+        np.fill_diagonal(pairwise_distances, np.inf)
+        neighbor_order = np.argsort(pairwise_distances, axis=1)
         arrow_specs = [
             (0, "red", 0.22, 0.45),
             (1, "orange", 0.14, 0.35),

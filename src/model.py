@@ -8,6 +8,7 @@ from typing import Optional
 
 from .config import ModelConfig
 from .outputs import RawOutputs
+from .signature_ops import pairwise_distance, pairwise_similarity
 
 
 class SimpleBackbone(nn.Module):
@@ -322,6 +323,8 @@ class CustomMask2Former(Mask2FormerBase):
         sig_dim = cfg.heads.sig_dim
 
         self.sig_dim = sig_dim
+        self.signature_normalize = cfg.heads.normalize_signatures
+        self.signature_similarity_metric = cfg.heads.similarity_metric
 
         self.sig_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -354,6 +357,41 @@ class CustomMask2Former(Mask2FormerBase):
     def _decoder_seed_head(self):
         return self.seed_head
 
+    def prepare_signature_embeddings(self, signatures: torch.Tensor) -> torch.Tensor:
+        if not self.signature_normalize or signatures.shape[-1] == 0:
+            return signatures
+        return F.normalize(signatures, p=2, dim=-1)
+
+    def signature_similarity(
+        self,
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+        *,
+        clamp: bool = False,
+    ) -> torch.Tensor:
+        return pairwise_similarity(
+            lhs,
+            rhs,
+            metric=self.signature_similarity_metric,
+            normalize=False,
+            clamp=clamp,
+        )
+
+    def signature_distance(
+        self,
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+        *,
+        clamp: bool = False,
+    ) -> torch.Tensor:
+        return pairwise_distance(
+            lhs,
+            rhs,
+            metric=self.signature_similarity_metric,
+            normalize=False,
+            clamp=clamp,
+        )
+
     def encode_gts(self, memory, features, masks, labels, pad_mask, ttt_steps_override: Optional[int] = None):
         B_val, M_max = masks.shape[:2]
         _, C, Hf, Wf = features.shape
@@ -380,12 +418,12 @@ class CustomMask2Former(Mask2FormerBase):
         q_gt = q_gt_all[-1]
 
         sig = self.sig_head(q_gt)
-        return F.normalize(sig, p=2, dim=-1)
+        return self.prepare_signature_embeddings(sig)
 
     def _run_heads(self, q):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
-        sig_embs = F.normalize(self.sig_head(q), p=2, dim=-1)
+        sig_embs = self.prepare_signature_embeddings(self.sig_head(q))
         seed_logits = self.seed_head(q).squeeze(-1)
         seed_scores = torch.sigmoid(seed_logits)
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))

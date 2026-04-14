@@ -12,6 +12,7 @@ from .mask_aggregation import (
 )
 from .model import CustomMask2Former, Mask2FormerBase
 from .outputs import RawOutputs
+from .signature_ops import pairwise_similarity
 
 def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
     """Computes a soft IoU loss over a per-pixel instance partition."""
@@ -39,6 +40,8 @@ def hungarian_seed_assignment(
     q_sig_flat: torch.Tensor, # [B,Q,S]
     gt_sigs_norm: torch.Tensor, # [B,GT,S]
     gt_pad_mask: torch.Tensor, # [B,GT]
+    *,
+    similarity_metric: str = "dot",
 ):
     B, num_queries, _ = q_sig_flat.shape
     matched_query_mask = torch.zeros((B, num_queries), dtype=torch.bool, device=q_sig_flat.device)
@@ -49,7 +52,11 @@ def hungarian_seed_assignment(
         if valid_gt_idx.numel() == 0 or num_queries == 0:
             continue
 
-        sim = torch.matmul(q_sig_flat[b], gt_sigs_norm[b, valid_gt_idx].T)
+        sim = pairwise_similarity(
+            q_sig_flat[b],
+            gt_sigs_norm[b, valid_gt_idx],
+            metric=similarity_metric,
+        )
         cost = (1.0 - sim).detach().cpu().numpy()
         row_ind, col_ind = linear_sum_assignment(cost)
         if len(row_ind) == 0:
@@ -149,6 +156,7 @@ class ClusterPanopticCriterion(nn.Module):
         gt_sigs_norm: torch.Tensor, # [B,GT,S]
         gt_pad_mask: torch.Tensor, # [B,GT]
         features: torch.Tensor, # [B,C,Hf,Wf]
+        similarity_metric: str,
     ):
         num_gt = gt_pad_mask.shape[1]
         loss_inter = features.sum() * 0.0
@@ -156,7 +164,11 @@ class ClusterPanopticCriterion(nn.Module):
         if num_gt <= 1:
             return loss_inter
 
-        gt_sim = torch.bmm(gt_sigs_norm, gt_sigs_norm.transpose(1, 2))
+        gt_sim = pairwise_similarity(
+            gt_sigs_norm,
+            gt_sigs_norm,
+            metric=similarity_metric,
+        )
         eye = torch.eye(num_gt, dtype=torch.bool, device=features.device).unsqueeze(0)
         valid_pair_mask = gt_pad_mask.unsqueeze(2) & gt_pad_mask.unsqueeze(1)
         off_diag_mask = valid_pair_mask & ~eye
@@ -175,8 +187,13 @@ class ClusterPanopticCriterion(nn.Module):
         q_mask_emb_flat: torch.Tensor, # [B,Q,Cm]
         q_cls_flat: torch.Tensor, # [B,Q,K]
         alpha,
+        similarity_metric: str,
     ):
-        sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
+        sim = pairwise_similarity(
+            q_sig_flat,
+            gt_sigs_norm,
+            metric=similarity_metric,
+        )
         weights_flat = assignment_weights_with_influence(
             similarity=sim,
             influence=q_influence_flat,
@@ -241,6 +258,7 @@ class ClusterPanopticCriterion(nn.Module):
         features_val: torch.Tensor, # [B,C,Hf,Wf]
         img_shape: tuple[int, int],
         alpha,
+        similarity_metric: str,
     ):
         proto_mask_emb, proto_cls = self._compute_assignment_aggregation(
             q_sig_flat=q_sig_flat,
@@ -250,6 +268,7 @@ class ClusterPanopticCriterion(nn.Module):
             q_mask_emb_flat=q_mask_emb_flat,
             q_cls_flat=q_cls_flat,
             alpha=alpha,
+            similarity_metric=similarity_metric,
         )
         loss_cls = self._compute_aggregated_cls_loss(
             proto_cls, 
@@ -272,9 +291,15 @@ class ClusterPanopticCriterion(nn.Module):
         gt_pad_mask: torch.Tensor, # [B,GT]
         q_seed_logits_flat: torch.Tensor, # [B,Q]
         features: torch.Tensor, # [B,C,Hf,Wf]
+        similarity_metric: str,
     ):
         # q_seed_logits_flat: [B,Q], matched_query_mask: [B,Q]
-        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_norm, gt_pad_mask)
+        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(
+            q_sig_flat,
+            gt_sigs_norm,
+            gt_pad_mask,
+            similarity_metric=similarity_metric,
+        )
 
         seed_targets = matched_query_mask.float()
         loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
@@ -285,8 +310,12 @@ class ClusterPanopticCriterion(nn.Module):
             matched_gt = matched_gt_indices[matched_query_mask]
             matched_q_sig = q_sig_flat[matched_query_mask]
             matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt]
-            cos_sim_seed = (matched_q_sig * matched_gt_sig).sum(dim=-1)
-            loss_seed_sig = (1.0 - cos_sim_seed).mean()
+            matched_similarity = pairwise_similarity(
+                matched_q_sig.unsqueeze(1),
+                matched_gt_sig.unsqueeze(1),
+                metric=similarity_metric,
+            ).squeeze(-1).squeeze(-1)
+            loss_seed_sig = (1.0 - matched_similarity).mean()
 
         return loss_seed, loss_seed_sig
 
@@ -367,7 +396,8 @@ class ClusterPanopticCriterion(nn.Module):
         loss_inter = self._compute_loss_inter(
             gt_sigs_norm, 
             gt_pad_mask, 
-            features
+            features,
+            similarity_metric=model.signature_similarity_metric,
         )
         
         loss_cls, loss_mask_ce, loss_mask_iou = self._compute_mask_cls_losses(
@@ -382,6 +412,7 @@ class ClusterPanopticCriterion(nn.Module):
             features_val=features_val,
             img_shape=(H_img, W_img),
             alpha=model.alpha_focal,
+            similarity_metric=model.signature_similarity_metric,
         )
         
         loss_seed, loss_seed_sig = self._compute_seed_losses(
@@ -390,6 +421,7 @@ class ClusterPanopticCriterion(nn.Module):
             gt_pad_mask=gt_pad_mask,
             q_seed_logits_flat=q_seed_logits_flat,
             features=features,
+            similarity_metric=model.signature_similarity_metric,
         )
 
         total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
