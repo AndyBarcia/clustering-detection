@@ -24,7 +24,7 @@ from .dataset import SyntheticPanopticBatchGenerator
 from .mask_aggregation import project_mask_embeddings
 from .outputs import FlatQueryOutputs, ResolvedPrediction
 from .panoptic import PanopticSystem
-from .signature_ops import pairwise_distance_np
+from .signature_ops import pairwise_distance
 
 
 DEFAULT_CLASS_NAMES = ["Background", "Square", "Triangle"]
@@ -163,7 +163,8 @@ def _project_signatures_2d(signatures: np.ndarray) -> np.ndarray:
 
     if umap is not None:
         n_neighbors = max(2, min(15, signatures.shape[0] - 1))
-        distances = pairwise_distance_np(signatures, clamp=True)
+        signatures_t = torch.from_numpy(signatures)
+        distances = pairwise_distance(signatures_t, signatures_t, clamp=True).detach().cpu().numpy()
         reducer = umap.UMAP(
             n_components=2,
             n_neighbors=n_neighbors,
@@ -514,7 +515,8 @@ def _draw_signature_umap(
     ax.grid(True, alpha=0.15, linewidth=0.5)
 
     if q_sig_np.shape[0] > 1:
-        pairwise_distances = pairwise_distance_np(q_sig_np, clamp=True)
+        q_sig_t = torch.from_numpy(q_sig_np)
+        pairwise_distances = pairwise_distance(q_sig_t, q_sig_t, clamp=True).detach().cpu().numpy()
         np.fill_diagonal(pairwise_distances, np.inf)
         neighbor_order = np.argsort(pairwise_distances, axis=1)
         arrow_specs = [

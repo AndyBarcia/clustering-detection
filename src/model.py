@@ -373,7 +373,6 @@ class CustomMask2Former(Mask2FormerBase):
             lhs,
             rhs,
             metric=self.signature_similarity_metric,
-            normalize=False,
             clamp=clamp,
         )
 
@@ -388,7 +387,6 @@ class CustomMask2Former(Mask2FormerBase):
             lhs,
             rhs,
             metric=self.signature_similarity_metric,
-            normalize=False,
             clamp=clamp,
         )
 

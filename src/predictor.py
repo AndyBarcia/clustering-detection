@@ -49,7 +49,7 @@ from .outputs import (
     SeedClustering,
     SeedSelection,
 )
-from .signature_ops import pairwise_distance, pairwise_distance_np, pairwise_similarity, pairwise_similarity_np
+from .signature_ops import pairwise_distance, pairwise_similarity
 
 
 def _alpha_value(alpha_obj) -> float:
@@ -243,32 +243,37 @@ class ModularPrototypePredictor:
             eligible_mask=eligible_mask,
         )
 
-    def _cluster_local(self, model: CustomMask2Former, seed_sigs_np: np.ndarray, seed_scores_np: np.ndarray) -> np.ndarray:
+    def _cluster_local(
+        self,
+        model: CustomMask2Former,
+        seed_sigs: torch.Tensor,
+        seed_scores: torch.Tensor,
+    ) -> np.ndarray:
         cfg = self.cfg.cluster
         method = cfg.method.lower()
 
-        if len(seed_sigs_np) == 0:
+        if seed_sigs.shape[0] == 0:
             return np.empty((0,), dtype=np.int64)
 
-        if len(seed_sigs_np) == 1:
+        if seed_sigs.shape[0] == 1:
             return np.array([0], dtype=np.int64)
 
         if method == "dbscan":
             if DBSCAN is None:
                 raise ImportError("scikit-learn is not installed. pip install scikit-learn")
-            dist = pairwise_distance_np(
-                seed_sigs_np,
+            dist = pairwise_distance(
+                seed_sigs,
+                seed_sigs,
                 metric=model.signature_similarity_metric,
-                normalize=model.signature_normalize,
                 clamp=True,
-            )
+            ).detach().cpu().numpy()
             clusterer = DBSCAN(
                 eps=cfg.dbscan_eps,
                 min_samples=cfg.dbscan_min_samples,
                 metric="precomputed",
             )
             if cfg.dbscan_use_sample_weight:
-                clusterer.fit(dist, sample_weight=seed_scores_np)
+                clusterer.fit(dist, sample_weight=seed_scores.detach().cpu().numpy())
             else:
                 clusterer.fit(dist)
             return clusterer.labels_.astype(np.int64)
@@ -276,12 +281,12 @@ class ModularPrototypePredictor:
         if method == "hdbscan":
             if _hdbscan is None:
                 raise ImportError("hdbscan is not installed. pip install hdbscan")
-            dist = pairwise_distance_np(
-                seed_sigs_np,
+            dist = pairwise_distance(
+                seed_sigs,
+                seed_sigs,
                 metric=model.signature_similarity_metric,
-                normalize=model.signature_normalize,
                 clamp=True,
-            )
+            ).detach().cpu().numpy()
             clusterer = _hdbscan.HDBSCAN(
                 metric="precomputed",
                 min_cluster_size=cfg.hdbscan_min_cluster_size,
@@ -290,15 +295,11 @@ class ModularPrototypePredictor:
             )
             return clusterer.fit_predict(dist).astype(np.int64)
 
-        affinity = np.clip(
-            pairwise_similarity_np(
-                seed_sigs_np,
-                metric=model.signature_similarity_metric,
-                normalize=model.signature_normalize,
-            ),
-            0.0,
-            1.0,
-        )
+        affinity = pairwise_similarity(
+            seed_sigs,
+            seed_sigs,
+            metric=model.signature_similarity_metric,
+        ).clamp(0.0, 1.0).detach().cpu().numpy()
 
         if method == "cc":
             return _connected_components_labels(affinity, cfg.graph_affinity_threshold)
@@ -309,7 +310,7 @@ class ModularPrototypePredictor:
             if not hasattr(nx.algorithms.community, "louvain_communities"):
                 raise ImportError("This version of networkx does not expose louvain_communities")
             graph = nx.Graph()
-            num_nodes = len(seed_sigs_np)
+            num_nodes = seed_sigs.shape[0]
             graph.add_nodes_from(range(num_nodes))
             edges, weights = _build_weighted_graph_edges(affinity, cfg.graph_min_edge_weight)
             for (node_u, node_v), weight in zip(edges, weights):
@@ -331,7 +332,7 @@ class ModularPrototypePredictor:
         if method == "leiden":
             if ig is None or leidenalg is None:
                 raise ImportError("igraph + leidenalg are required for Leiden clustering")
-            num_nodes = len(seed_sigs_np)
+            num_nodes = seed_sigs.shape[0]
             edges, weights = _build_weighted_graph_edges(affinity, cfg.graph_min_edge_weight)
             if len(edges) == 0:
                 return np.arange(num_nodes, dtype=np.int64)
@@ -368,10 +369,8 @@ class ModularPrototypePredictor:
             local_seed_indices = selection.indices[position_group]
             local_seed_scores = selection.scores[position_group]
 
-            local_signatures_np = flat_queries.signature_embeddings[local_seed_indices].detach().cpu().numpy()
-            local_scores_np = local_seed_scores.detach().cpu().numpy()
-
-            local_labels_np = self._cluster_local(model, local_signatures_np, local_scores_np)
+            local_signatures = flat_queries.signature_embeddings[local_seed_indices]
+            local_labels_np = self._cluster_local(model, local_signatures, local_seed_scores)
             local_labels = torch.as_tensor(local_labels_np, device=device)
 
             valid_cluster_ids = [int(value) for value in np.unique(local_labels_np) if value != -1]
