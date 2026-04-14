@@ -13,7 +13,6 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 import torch
-import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 try:
@@ -22,6 +21,7 @@ except ImportError:
     umap = None
 
 from .dataset import SyntheticPanopticBatchGenerator
+from .mask_aggregation import project_mask_embeddings
 from .outputs import FlatQueryOutputs, ResolvedPrediction
 from .panoptic import PanopticSystem
 
@@ -322,12 +322,10 @@ def _single_query_preview(
     q_cls_prob = flat.class_probabilities[query_index]
     q_seed = flat.seed_scores
 
-    mask_logits = torch.einsum("c,chw->hw", q_mask_emb, features)
-    mask_logits = F.interpolate(
-        mask_logits.unsqueeze(0).unsqueeze(0),
-        size=(flat.image_height, flat.image_width),
-        mode="bilinear",
-        align_corners=False,
+    mask_logits = project_mask_embeddings(
+        q_mask_emb.view(1, 1, -1),
+        features.unsqueeze(0),
+        (flat.image_height, flat.image_width),
     )[0, 0]
 
     mask = mask_logits > 0.0

@@ -32,6 +32,12 @@ except ImportError:
 
 
 from .config import PrototypeInferenceConfig
+from .mask_aggregation import (
+    assignment_weights_with_influence,
+    aggregate_with_weights,
+    normalize_assignment_weights,
+    project_mask_embeddings,
+)
 from .model import CustomMask2Former, Mask2FormerBase
 from .outputs import (
     EvaluationPredictionSet,
@@ -45,21 +51,10 @@ from .outputs import (
 )
 
 
-def _safe_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    return x / x.norm(dim=dim, keepdim=True).clamp_min(eps)
-
-
 def _alpha_value(alpha_obj) -> float:
     if isinstance(alpha_obj, torch.Tensor):
         return float(alpha_obj.detach().cpu().item())
     return float(alpha_obj)
-
-
-def _assignment_affinity(similarity: torch.Tensor, influence: torch.Tensor, similarity_floor: float = 0.0):
-    affinity = (similarity + influence.unsqueeze(1)).clamp(0.0, 1.0)
-    if similarity_floor > 0.0:
-        affinity = affinity.clamp_min(similarity_floor)
-    return affinity
 
 
 def _cosine_affinity_np(x: np.ndarray) -> np.ndarray:
@@ -482,8 +477,12 @@ class ModularPrototypePredictor:
 
         for _ in range(max(1, cfg.refinement_steps)):
             similarity = torch.matmul(query_signatures, prototype_signatures.T)
-            affinity = _assignment_affinity(similarity, flat_queries.influence_scores[source_query_indices], cfg.similarity_floor)
-            raw_weights = affinity.pow(alpha)
+            raw_weights = assignment_weights_with_influence(
+                similarity=similarity,
+                influence=flat_queries.influence_scores[source_query_indices],
+                alpha=alpha,
+                similarity_floor=cfg.similarity_floor,
+            )
 
             if cfg.use_query_quality:
                 raw_weights = raw_weights * flat_queries.seed_scores[source_query_indices].pow(cfg.query_quality_power).unsqueeze(1)
@@ -504,13 +503,13 @@ class ModularPrototypePredictor:
                 class_compatibility = torch.matmul(query_probabilities, prototype_probabilities.T).clamp_min(1e-6)
                 raw_weights = raw_weights * class_compatibility.pow(cfg.class_compat_power)
 
-            if cfg.normalize_over_queries:
-                normalized_weights = raw_weights / (raw_weights.sum(dim=0, keepdim=True) + 1e-6)
-            else:
-                normalized_weights = raw_weights / (raw_weights.sum(dim=1, keepdim=True) + 1e-6)
+            normalized_weights = normalize_assignment_weights(
+                raw_weights,
+                normalize_over_queries=cfg.normalize_over_queries,
+            )
 
-            prototype_logits = torch.matmul(normalized_weights.T, query_logits)
-            prototype_mask_embeddings = torch.matmul(normalized_weights.T, query_mask_embeddings)
+            prototype_logits = aggregate_with_weights(normalized_weights, query_logits)
+            prototype_mask_embeddings = aggregate_with_weights(normalized_weights, query_mask_embeddings)
 
             final_raw_weights = raw_weights
             final_normalized_weights = normalized_weights
@@ -551,12 +550,19 @@ class ModularPrototypePredictor:
 
         alpha = _alpha_value(model.alpha_focal) if self.cfg.assign.use_alpha_focal else 1.0
         similarity = torch.matmul(flat_queries.signature_embeddings, signature_embeddings.T)
-        affinity = _assignment_affinity(similarity, flat_queries.influence_scores, self.cfg.assign.similarity_floor)
-        raw_weights = affinity.pow(alpha)
-        normalized_weights = raw_weights / (raw_weights.sum(dim=0, keepdim=True) + 1e-6)
+        raw_weights = assignment_weights_with_influence(
+            similarity=similarity,
+            influence=flat_queries.influence_scores,
+            alpha=alpha,
+            similarity_floor=self.cfg.assign.similarity_floor,
+        )
+        normalized_weights = normalize_assignment_weights(
+            raw_weights,
+            normalize_over_queries=True,
+        )
 
-        prototype_mask_embeddings = torch.matmul(normalized_weights.T, flat_queries.mask_embeddings)
-        prototype_logits = torch.matmul(normalized_weights.T, flat_queries.class_logits)
+        prototype_mask_embeddings = aggregate_with_weights(normalized_weights, flat_queries.mask_embeddings)
+        prototype_logits = aggregate_with_weights(normalized_weights, flat_queries.class_logits)
 
         if prototype_seed_indices is None:
             prototype_seed_indices = torch.full((num_prototypes,), -1, dtype=torch.long, device=device)
@@ -651,12 +657,10 @@ class ModularPrototypePredictor:
                 resolved_scores=[],
             )
 
-        mask_logits = torch.einsum("pc,chw->phw", prototypes.mask_embeddings, features)
-        mask_logits = F.interpolate(
-            mask_logits.unsqueeze(0),
-            size=(image_height, image_width),
-            mode="bilinear",
-            align_corners=False,
+        mask_logits = project_mask_embeddings(
+            prototypes.mask_embeddings.unsqueeze(0),
+            features.unsqueeze(0),
+            (image_height, image_width),
         )[0]
         mask_probabilities = F.softmax(mask_logits, dim=0)
 
@@ -939,12 +943,10 @@ class StandardMask2FormerPredictor:
         flat_queries = self._flatten_outputs(raw, batch_index)
         cfg = self.cfg.overlap
 
-        mask_logits = torch.einsum("qc,chw->qhw", flat_queries.mask_embeddings, flat_queries.features)
-        mask_logits = F.interpolate(
-            mask_logits.unsqueeze(0),
-            size=(flat_queries.image_height, flat_queries.image_width),
-            mode="bilinear",
-            align_corners=False,
+        mask_logits = project_mask_embeddings(
+            flat_queries.mask_embeddings.unsqueeze(0),
+            flat_queries.features.unsqueeze(0),
+            (flat_queries.image_height, flat_queries.image_width),
         )[0]
         mask_probabilities = torch.sigmoid(mask_logits)
         binary_masks = mask_probabilities >= cfg.mask_threshold

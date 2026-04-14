@@ -4,21 +4,14 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 from .config import LossConfig
+from .mask_aggregation import (
+    assignment_weights_with_influence,
+    aggregate_with_weights,
+    normalize_assignment_weights,
+    project_mask_embeddings,
+)
 from .model import CustomMask2Former, Mask2FormerBase
 from .outputs import RawOutputs
-
-
-def assignment_weights_with_influence(
-    similarity: torch.Tensor, # [B,Q,GT]
-    influence: torch.Tensor, # [B,Q]
-    alpha,
-    valid_mask: torch.Tensor | None = None, # [B,GT]
-):
-    affinity = (similarity + influence.unsqueeze(-1)).clamp(0.0, 1.0)
-    if valid_mask is not None:
-        affinity = affinity.masked_fill(~valid_mask.unsqueeze(1), 0.0)
-    return affinity.pow(alpha)
-
 
 def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
     """Computes a soft IoU loss over a per-pixel instance partition."""
@@ -191,11 +184,11 @@ class ClusterPanopticCriterion(nn.Module):
             valid_mask=gt_pad_mask,
         )
         # norm_w: [B,Q,GT] normalized across queries so each GT builds a soft prototype.
-        norm_w = weights_flat / (weights_flat.sum(dim=1, keepdim=True) + 1e-6)
+        norm_w = normalize_assignment_weights(weights_flat, normalize_over_queries=True)
 
         # proto_mask_emb: [B,GT,Cm], proto_cls: [B,GT,K]
-        proto_mask_emb = torch.bmm(norm_w.transpose(1, 2), q_mask_emb_flat)
-        proto_cls = torch.bmm(norm_w.transpose(1, 2), q_cls_flat)
+        proto_mask_emb = aggregate_with_weights(norm_w, q_mask_emb_flat)
+        proto_cls = aggregate_with_weights(norm_w, q_cls_flat)
 
         return proto_mask_emb, proto_cls
 
@@ -220,8 +213,11 @@ class ClusterPanopticCriterion(nn.Module):
     ):
         H_img, W_img = img_shape
         # proto_mask_emb: [B,GT,C], features_val: [B,C,Hf,Wf] -> mask_logits: [B,GT,Hf,Wf]
-        mask_logits = torch.einsum("bmc,bchw->bmhw", proto_mask_emb, features_val)
-        mask_logits = F.interpolate(mask_logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+        mask_logits = project_mask_embeddings(
+            proto_mask_emb,
+            features_val,
+            (H_img, W_img),
+        )
 
         neg_inf = torch.finfo(mask_logits.dtype).min
         mask_logits_masked = mask_logits.masked_fill(~gt_pad_mask[:, :, None, None], neg_inf)
@@ -438,8 +434,11 @@ class StandardMask2FormerCriterion(nn.Module):
     ):
         H_img, W_img = img_shape
         # q_mask_emb: [B,Q,C], features: [B,C,Hf,Wf] -> mask_logits: [B,Q,Hf,Wf]
-        mask_logits = torch.einsum("bqc,bchw->bqhw", q_mask_emb, features)
-        mask_logits = F.interpolate(mask_logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+        mask_logits = project_mask_embeddings(
+            q_mask_emb,
+            features,
+            (H_img, W_img),
+        )
 
         num_classes = q_cls.shape[-1]
         class_weights = torch.ones(num_classes, device=features.device, dtype=features.dtype)
