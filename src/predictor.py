@@ -264,7 +264,7 @@ class ModularPrototypePredictor:
             dist = pairwise_distance(
                 seed_sigs,
                 seed_sigs,
-                metric=model.signature_similarity_metric,
+                metric=model.identity_similarity_metric,
                 clamp=True,
             ).detach().cpu().numpy()
             clusterer = DBSCAN(
@@ -284,7 +284,7 @@ class ModularPrototypePredictor:
             dist = pairwise_distance(
                 seed_sigs,
                 seed_sigs,
-                metric=model.signature_similarity_metric,
+                metric=model.identity_similarity_metric,
                 clamp=True,
             ).detach().cpu().numpy()
             clusterer = _hdbscan.HDBSCAN(
@@ -298,7 +298,7 @@ class ModularPrototypePredictor:
         affinity = pairwise_similarity(
             seed_sigs,
             seed_sigs,
-            metric=model.signature_similarity_metric,
+            metric=model.identity_similarity_metric,
         ).clamp(0.0, 1.0).detach().cpu().numpy()
 
         if method == "cc":
@@ -482,7 +482,7 @@ class ModularPrototypePredictor:
             similarity = pairwise_similarity(
                 query_signatures,
                 prototype_signatures,
-                metric=model.signature_similarity_metric,
+                metric=model.aggregation_similarity_metric,
             )
             raw_weights = assignment_weights_with_influence(
                 similarity=similarity,
@@ -559,7 +559,7 @@ class ModularPrototypePredictor:
         similarity = pairwise_similarity(
             flat_queries.signature_embeddings,
             signature_embeddings,
-            metric=model.signature_similarity_metric,
+            metric=model.aggregation_similarity_metric,
         )
         raw_weights = assignment_weights_with_influence(
             similarity=similarity,
@@ -831,7 +831,7 @@ class ModularPrototypePredictor:
         distances = pairwise_distance(
             query_signatures,
             gt_signatures,
-            metric=model.signature_similarity_metric,
+            metric=model.identity_similarity_metric,
             clamp=True,
         )
 

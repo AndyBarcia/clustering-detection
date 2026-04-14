@@ -574,7 +574,7 @@ def evaluate_system(
                     prediction_set,
                     target,
                     ap_iou_threshold=ap_iou_threshold,
-                    signature_metric=getattr(system.model, "signature_similarity_metric", "dot"),
+                    signature_metric=getattr(system.model, "identity_similarity_metric", "dot"),
                 )
                 clustering_evaluations.append(clustering_eval)
                 object_counts.append(int((target["labels"] != 0).sum().item()))
@@ -669,7 +669,7 @@ def evaluate_system_many_configs(
                             prediction_set,
                             target,
                             ap_iou_threshold=ap_iou_threshold,
-                            signature_metric=getattr(system.model, "signature_similarity_metric", "dot"),
+                            signature_metric=getattr(system.model, "identity_similarity_metric", "dot"),
                         )
                         clustering_evaluations[key].append(clustering_eval)
                         if gt_signature_evaluations is not None and gt_eval is not None:

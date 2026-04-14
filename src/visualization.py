@@ -152,7 +152,7 @@ def _mask_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     return xmin, ymin, xmax, ymax
 
 
-def _project_signatures_2d(signatures: np.ndarray) -> np.ndarray:
+def _project_signatures_2d(signatures: np.ndarray, *, metric: str = "cosine") -> np.ndarray:
     if signatures.shape[0] == 0:
         return np.empty((0, 2), dtype=np.float32)
 
@@ -164,7 +164,12 @@ def _project_signatures_2d(signatures: np.ndarray) -> np.ndarray:
     if umap is not None:
         n_neighbors = max(2, min(15, signatures.shape[0] - 1))
         signatures_t = torch.from_numpy(signatures)
-        distances = pairwise_distance(signatures_t, signatures_t, clamp=True).detach().cpu().numpy()
+        distances = pairwise_distance(
+            signatures_t,
+            signatures_t,
+            metric=metric,
+            clamp=True,
+        ).detach().cpu().numpy()
         reducer = umap.UMAP(
             n_components=2,
             n_neighbors=n_neighbors,
@@ -474,6 +479,7 @@ def _draw_signature_umap(
     target: dict,
     prediction: ResolvedPrediction,
     *,
+    identity_similarity_metric: str = "cosine",
     class_names: Optional[Sequence[str]] = None,
     title: str,
     row_state: Optional[_RowInteractionState] = None,
@@ -502,7 +508,7 @@ def _draw_signature_umap(
         gt_sig_np = gt_sig_np[fg_indices]
 
     all_sig = np.concatenate([q_sig_np, gt_sig_np], axis=0) if gt_sig_np.shape[0] > 0 else q_sig_np
-    embedding = _project_signatures_2d(all_sig)
+    embedding = _project_signatures_2d(all_sig, metric=identity_similarity_metric)
     q_pts = embedding[: q_sig_np.shape[0]]
     gt_pts = embedding[q_sig_np.shape[0] :]
 
@@ -516,7 +522,12 @@ def _draw_signature_umap(
 
     if q_sig_np.shape[0] > 1:
         q_sig_t = torch.from_numpy(q_sig_np)
-        pairwise_distances = pairwise_distance(q_sig_t, q_sig_t, clamp=True).detach().cpu().numpy()
+        pairwise_distances = pairwise_distance(
+            q_sig_t,
+            q_sig_t,
+            metric=identity_similarity_metric,
+            clamp=True,
+        ).detach().cpu().numpy()
         np.fill_diagonal(pairwise_distances, np.inf)
         neighbor_order = np.argsort(pairwise_distances, axis=1)
         arrow_specs = [
@@ -772,6 +783,7 @@ def render_prediction_grid(
     targets: Sequence[dict],
     prediction_columns: Sequence[Tuple[str, Sequence[dict]]],
     *,
+    identity_similarity_metric: str = "cosine",
     class_names: Optional[Sequence[str]] = None,
     figure_title: Optional[str] = None,
     interactive: bool = False,
@@ -850,6 +862,7 @@ def render_prediction_grid(
                     image_np,
                     target,
                     prediction,
+                    identity_similarity_metric=identity_similarity_metric,
                     class_names=class_names,
                     title="GT Signature UMAP",
                     row_state=row_state,

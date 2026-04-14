@@ -156,7 +156,7 @@ class ClusterPanopticCriterion(nn.Module):
         gt_sigs_norm: torch.Tensor, # [B,GT,S]
         gt_pad_mask: torch.Tensor, # [B,GT]
         features: torch.Tensor, # [B,C,Hf,Wf]
-        similarity_metric: str,
+        identity_similarity_metric: str,
     ):
         num_gt = gt_pad_mask.shape[1]
         loss_inter = features.sum() * 0.0
@@ -167,7 +167,7 @@ class ClusterPanopticCriterion(nn.Module):
         gt_sim = pairwise_similarity(
             gt_sigs_norm,
             gt_sigs_norm,
-            metric=similarity_metric,
+            metric=identity_similarity_metric,
         )
         eye = torch.eye(num_gt, dtype=torch.bool, device=features.device).unsqueeze(0)
         valid_pair_mask = gt_pad_mask.unsqueeze(2) & gt_pad_mask.unsqueeze(1)
@@ -187,12 +187,12 @@ class ClusterPanopticCriterion(nn.Module):
         q_mask_emb_flat: torch.Tensor, # [B,Q,Cm]
         q_cls_flat: torch.Tensor, # [B,Q,K]
         alpha,
-        similarity_metric: str,
+        aggregation_similarity_metric: str,
     ):
         sim = pairwise_similarity(
             q_sig_flat,
             gt_sigs_norm,
-            metric=similarity_metric,
+            metric=aggregation_similarity_metric,
         )
         weights_flat = assignment_weights_with_influence(
             similarity=sim,
@@ -258,7 +258,7 @@ class ClusterPanopticCriterion(nn.Module):
         features_val: torch.Tensor, # [B,C,Hf,Wf]
         img_shape: tuple[int, int],
         alpha,
-        similarity_metric: str,
+        aggregation_similarity_metric: str,
     ):
         proto_mask_emb, proto_cls = self._compute_assignment_aggregation(
             q_sig_flat=q_sig_flat,
@@ -268,7 +268,7 @@ class ClusterPanopticCriterion(nn.Module):
             q_mask_emb_flat=q_mask_emb_flat,
             q_cls_flat=q_cls_flat,
             alpha=alpha,
-            similarity_metric=similarity_metric,
+            aggregation_similarity_metric=aggregation_similarity_metric,
         )
         loss_cls = self._compute_aggregated_cls_loss(
             proto_cls, 
@@ -291,14 +291,14 @@ class ClusterPanopticCriterion(nn.Module):
         gt_pad_mask: torch.Tensor, # [B,GT]
         q_seed_logits_flat: torch.Tensor, # [B,Q]
         features: torch.Tensor, # [B,C,Hf,Wf]
-        similarity_metric: str,
+        identity_similarity_metric: str,
     ):
         # q_seed_logits_flat: [B,Q], matched_query_mask: [B,Q]
         matched_query_mask, matched_gt_indices = hungarian_seed_assignment(
             q_sig_flat,
             gt_sigs_norm,
             gt_pad_mask,
-            similarity_metric=similarity_metric,
+            similarity_metric=identity_similarity_metric,
         )
 
         seed_targets = matched_query_mask.float()
@@ -313,7 +313,7 @@ class ClusterPanopticCriterion(nn.Module):
             matched_similarity = pairwise_similarity(
                 matched_q_sig.unsqueeze(1),
                 matched_gt_sig.unsqueeze(1),
-                metric=similarity_metric,
+                metric=identity_similarity_metric,
             ).squeeze(-1).squeeze(-1)
             loss_seed_sig = (1.0 - matched_similarity).mean()
 
@@ -397,7 +397,7 @@ class ClusterPanopticCriterion(nn.Module):
             gt_sigs_norm, 
             gt_pad_mask, 
             features,
-            similarity_metric=model.signature_similarity_metric,
+            identity_similarity_metric=model.identity_similarity_metric,
         )
         
         loss_cls, loss_mask_ce, loss_mask_iou = self._compute_mask_cls_losses(
@@ -412,7 +412,7 @@ class ClusterPanopticCriterion(nn.Module):
             features_val=features_val,
             img_shape=(H_img, W_img),
             alpha=model.alpha_focal,
-            similarity_metric=model.signature_similarity_metric,
+            aggregation_similarity_metric=model.aggregation_similarity_metric,
         )
         
         loss_seed, loss_seed_sig = self._compute_seed_losses(
@@ -421,7 +421,7 @@ class ClusterPanopticCriterion(nn.Module):
             gt_pad_mask=gt_pad_mask,
             q_seed_logits_flat=q_seed_logits_flat,
             features=features,
-            similarity_metric=model.signature_similarity_metric,
+            identity_similarity_metric=model.identity_similarity_metric,
         )
 
         total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou

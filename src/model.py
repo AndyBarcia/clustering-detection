@@ -324,7 +324,8 @@ class CustomMask2Former(Mask2FormerBase):
 
         self.sig_dim = sig_dim
         self.signature_normalize = cfg.heads.normalize_signatures
-        self.signature_similarity_metric = cfg.heads.similarity_metric
+        self.aggregation_similarity_metric = cfg.heads.aggregation_similarity_metric
+        self.identity_similarity_metric = cfg.heads.identity_similarity_metric
 
         self.sig_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -362,7 +363,7 @@ class CustomMask2Former(Mask2FormerBase):
             return signatures
         return F.normalize(signatures, p=2, dim=-1)
 
-    def signature_similarity(
+    def aggregation_similarity(
         self,
         lhs: torch.Tensor,
         rhs: torch.Tensor,
@@ -372,11 +373,11 @@ class CustomMask2Former(Mask2FormerBase):
         return pairwise_similarity(
             lhs,
             rhs,
-            metric=self.signature_similarity_metric,
+            metric=self.aggregation_similarity_metric,
             clamp=clamp,
         )
 
-    def signature_distance(
+    def aggregation_distance(
         self,
         lhs: torch.Tensor,
         rhs: torch.Tensor,
@@ -386,7 +387,35 @@ class CustomMask2Former(Mask2FormerBase):
         return pairwise_distance(
             lhs,
             rhs,
-            metric=self.signature_similarity_metric,
+            metric=self.aggregation_similarity_metric,
+            clamp=clamp,
+        )
+
+    def identity_similarity(
+        self,
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+        *,
+        clamp: bool = False,
+    ) -> torch.Tensor:
+        return pairwise_similarity(
+            lhs,
+            rhs,
+            metric=self.identity_similarity_metric,
+            clamp=clamp,
+        )
+
+    def identity_distance(
+        self,
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+        *,
+        clamp: bool = False,
+    ) -> torch.Tensor:
+        return pairwise_distance(
+            lhs,
+            rhs,
+            metric=self.identity_similarity_metric,
             clamp=clamp,
         )
 
