@@ -4,6 +4,17 @@ import torch
 import torch.nn.functional as F
 
 
+def _distance_to_similarity(
+    distance: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    d_max = distance.max()
+    if d_max <= eps:
+        return torch.ones_like(distance)
+    return 1.0 - (distance / d_max)
+
+
 def _sigmoid_pairwise_intersection_stats(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -93,6 +104,26 @@ def _softmax_pairwise_jsd(
     return 1.0 - jsd
 
 
+def _pairwise_l2_similarity(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    distance = torch.linalg.vector_norm(lhs.unsqueeze(-2) - rhs.unsqueeze(-3), ord=2, dim=-1)
+    return _distance_to_similarity(distance, eps=eps)
+
+
+def _pairwise_mse_similarity(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    distance = (lhs.unsqueeze(-2) - rhs.unsqueeze(-3)).pow(2).mean(dim=-1)
+    return _distance_to_similarity(distance, eps=eps)
+
+
 def pairwise_similarity(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -145,6 +176,16 @@ def pairwise_similarity(
         if clamp:
             similarity = similarity.clamp(0.0, 1.0)
         return similarity
+    elif metric_name == "l2":
+        similarity = _pairwise_l2_similarity(lhs, rhs, eps=eps)
+        if clamp:
+            similarity = similarity.clamp(0.0, 1.0)
+        return similarity
+    elif metric_name == "mse":
+        similarity = _pairwise_mse_similarity(lhs, rhs, eps=eps)
+        if clamp:
+            similarity = similarity.clamp(0.0, 1.0)
+        return similarity
 
     if metric_name not in {
         "dot",
@@ -157,6 +198,8 @@ def pairwise_similarity(
         "overlap",
         "left-overlap",
         "right-overlap",
+        "l2",
+        "mse",
     }:
         raise ValueError(f"Unsupported signature similarity metric: {metric}")
 
