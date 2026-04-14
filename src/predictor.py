@@ -624,24 +624,18 @@ class ModularPrototypePredictor:
     def build_gt_signature_prototypes(
         self,
         model: CustomMask2Former,
-        raw: RawOutputs,
         flat_queries: FlatQueryOutputs,
-        targets,
-        batch_index: int,
+        gt_signatures: torch.Tensor,
+        target_indices: Optional[torch.Tensor] = None,
     ) -> PrototypeState:
-        device = flat_queries.signature_embeddings.device
-        labels = targets[batch_index]["labels"].to(device)
-
-        if labels.numel() == 0:
+        if gt_signatures.shape[0] == 0:
             return self._empty_prototype_state(flat_queries)
-
-        gt_signatures = self.encode_gt_signatures(model, raw, targets, batch_index, device)
 
         return self.build_signature_prototypes(
             model,
             flat_queries,
             gt_signatures,
-            target_indices=torch.arange(labels.shape[0], device=device, dtype=torch.long),
+            target_indices=target_indices,
         )
 
     def resolve_prediction(self, flat_queries: FlatQueryOutputs, prototypes: PrototypeState) -> ResolvedPrediction:
@@ -803,7 +797,15 @@ class ModularPrototypePredictor:
 
     def predict_with_gt_signatures_single(self, model: CustomMask2Former, raw: RawOutputs, targets, batch_index: int) -> ResolvedPrediction:
         flat_queries = self.flatten_outputs(raw, batch_index)
-        prototypes = self.build_gt_signature_prototypes(model, raw, flat_queries, targets, batch_index)
+        device = flat_queries.signature_embeddings.device
+        labels = targets[batch_index]["labels"].to(device)
+        gt_signatures = self.encode_gt_signatures(model, raw, targets, batch_index, device)
+        prototypes = self.build_gt_signature_prototypes(
+            model,
+            flat_queries,
+            gt_signatures,
+            target_indices=torch.arange(labels.shape[0], device=device, dtype=torch.long),
+        )
         return self.resolve_prediction(flat_queries, prototypes)
 
     def predict_with_golden_queries_single(
@@ -812,15 +814,19 @@ class ModularPrototypePredictor:
         raw: RawOutputs,
         targets,
         batch_index: int,
+        flat_queries: Optional[FlatQueryOutputs] = None,
+        gt_signatures: Optional[torch.Tensor] = None,
     ) -> tuple[ResolvedPrediction, GoldenQueryDiagnostics]:
-        flat_queries = self.flatten_outputs(raw, batch_index)
-        gt_signatures = self.encode_gt_signatures(
-            model,
-            raw,
-            targets,
-            batch_index,
-            flat_queries.signature_embeddings.device,
-        )
+        if flat_queries is None:
+            flat_queries = self.flatten_outputs(raw, batch_index)
+        if gt_signatures is None:
+            gt_signatures = self.encode_gt_signatures(
+                model,
+                raw,
+                targets,
+                batch_index,
+                flat_queries.signature_embeddings.device,
+            )
 
         candidate_indices = torch.arange(flat_queries.num_queries, device=flat_queries.signature_embeddings.device)
         if gt_signatures.shape[0] == 0 or candidate_indices.numel() == 0:
@@ -882,9 +888,33 @@ class ModularPrototypePredictor:
         return prediction, diagnostics
 
     def predict_evaluation_views_single(self, model: CustomMask2Former, raw: RawOutputs, targets, batch_index: int) -> EvaluationPredictionSet:
-        clustering_prediction = self.predict_clustered_single(model, raw, batch_index)
-        gt_signature_prediction = self.predict_with_gt_signatures_single(model, raw, targets, batch_index)
-        golden_query_prediction, golden_query_diagnostics = self.predict_with_golden_queries_single(model, raw, targets, batch_index)
+        flat_queries = self.flatten_outputs(raw, batch_index)
+        device = flat_queries.signature_embeddings.device
+        labels = targets[batch_index]["labels"].to(device)
+        gt_signatures = self.encode_gt_signatures(model, raw, targets, batch_index, device)
+        target_indices = torch.arange(labels.shape[0], device=device, dtype=torch.long)
+
+        seed_selection = self.select_seed_queries(flat_queries)
+        seed_clustering = self.cluster_seed_queries(model, flat_queries, seed_selection)
+        clustering_prototypes = self.initialize_clustered_prototypes(flat_queries, seed_clustering)
+        clustering_prototypes = self.refine_prototypes(model, flat_queries, clustering_prototypes)
+        clustering_prediction = self.resolve_prediction(flat_queries, clustering_prototypes)
+
+        gt_signature_prototypes = self.build_gt_signature_prototypes(
+            model,
+            flat_queries,
+            gt_signatures,
+            target_indices=target_indices,
+        )
+        gt_signature_prediction = self.resolve_prediction(flat_queries, gt_signature_prototypes)
+        golden_query_prediction, golden_query_diagnostics = self.predict_with_golden_queries_single(
+            model,
+            raw,
+            targets,
+            batch_index,
+            flat_queries=flat_queries,
+            gt_signatures=gt_signatures,
+        )
         return EvaluationPredictionSet(
             clustering=clustering_prediction,
             gt_signatures=gt_signature_prediction,
