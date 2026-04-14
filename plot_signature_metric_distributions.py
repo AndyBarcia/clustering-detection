@@ -13,8 +13,8 @@ import torch
 from src.signature_ops import pairwise_similarity
 
 
-METRICS = ["dot", "dot-sigmoid", "cosine", "softmax", "jsd"]
-TEMPERATURE_METRICS = {"dot-sigmoid", "softmax", "jsd"}
+METRICS = ["dot", "dot-sigmoid", "cosine", "softmax", "jsd", "jaccard"]
+TEMPERATURE_METRICS = {"dot-sigmoid", "softmax", "jsd", "jaccard"}
 
 
 def parse_args():

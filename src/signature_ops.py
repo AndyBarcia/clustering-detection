@@ -4,6 +4,25 @@ import torch
 import torch.nn.functional as F
 
 
+def _sigmoid_pairwise_jaccard(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    lhs_probs = torch.sigmoid(lhs)
+    rhs_probs = torch.sigmoid(rhs)
+
+    intersection = torch.matmul(lhs_probs, rhs_probs.transpose(-1, -2))
+    lhs_mass = lhs_probs.sum(dim=-1, keepdim=True)
+    rhs_mass = rhs_probs.sum(dim=-1).unsqueeze(-2)
+    union = (lhs_mass + rhs_mass - intersection).clamp_min(eps)
+    jaccard = intersection / union
+
+    # Scale and shift to map expected random similarity to 0.0 and perfect similarity to 1.0.
+    return 1.5 * (jaccard - (1.0 / 3.0))
+
+
 def _softmax_pairwise_jsd(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -36,7 +55,7 @@ def pairwise_similarity(
     metric: str = "dot",
     clamp: bool = True,
     eps: float = 1e-6,
-    temp: float = 0.5,
+    temp: float = 0.1,
 ) -> torch.Tensor:
     if lhs.shape[-1] != rhs.shape[-1]:
         raise ValueError(
@@ -56,8 +75,13 @@ def pairwise_similarity(
         if clamp:
             similarity = similarity.clamp(0.0, 1.0)
         return similarity
+    elif metric_name == "jaccard":
+        similarity = _sigmoid_pairwise_jaccard(lhs/temp, rhs/temp, eps=eps)
+        if clamp:
+            similarity = similarity.clamp(0.0, 1.0)
+        return similarity
 
-    if metric_name not in {"dot", "dot-sigmoid", "cosine", "softmax", "jsd"}:
+    if metric_name not in {"dot", "dot-sigmoid", "cosine", "softmax", "jsd", "jaccard"}:
         raise ValueError(f"Unsupported signature similarity metric: {metric}")
 
     similarity = torch.matmul(lhs, rhs.transpose(-1, -2))
@@ -74,6 +98,7 @@ def pairwise_distance(
     *,
     metric: str = "dot",
     clamp: bool = True,
+    temp: float = 0.5,
 ) -> torch.Tensor:
     if lhs.shape[0] == 0 or rhs.shape[0] == 0:
         return torch.zeros((lhs.shape[0], rhs.shape[0]), dtype=torch.float32, device=lhs.device)
@@ -82,4 +107,5 @@ def pairwise_distance(
         rhs,
         metric=metric,
         clamp=clamp,
+        temp=temp,
     )
