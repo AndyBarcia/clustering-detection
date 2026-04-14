@@ -34,8 +34,9 @@ def pairwise_similarity(
     rhs: torch.Tensor,
     *,
     metric: str = "dot",
-    clamp: bool = False,
+    clamp: bool = True,
     eps: float = 1e-6,
+    temp: float = 0.5,
 ) -> torch.Tensor:
     if lhs.shape[-1] != rhs.shape[-1]:
         raise ValueError(
@@ -48,12 +49,12 @@ def pairwise_similarity(
         lhs = F.normalize(lhs, p=2, dim=-1, eps=eps)
         rhs = F.normalize(rhs, p=2, dim=-1, eps=eps)
     elif metric_name == "softmax":
-        lhs = F.softmax(lhs, dim=-1)
-        rhs = F.softmax(rhs, dim=-1)
+        lhs = F.softmax(lhs/temp, dim=-1)
+        rhs = F.softmax(rhs/temp, dim=-1)
     elif metric_name == "jsd":
-        similarity = _softmax_pairwise_jsd(lhs, rhs, eps=eps)
+        similarity = _softmax_pairwise_jsd(lhs/temp, rhs/temp, eps=eps)
         if clamp:
-            similarity = similarity.clamp(-1.0, 1.0)
+            similarity = similarity.clamp(0.0, 1.0)
         return similarity
 
     if metric_name not in {"dot", "dot-sigmoid", "cosine", "softmax", "jsd"}:
@@ -61,9 +62,9 @@ def pairwise_similarity(
 
     similarity = torch.matmul(lhs, rhs.transpose(-1, -2))
     if metric_name == "dot-sigmoid":
-        similarity = torch.sigmoid(similarity)
+        similarity = torch.sigmoid(similarity/temp)
     if clamp:
-        similarity = similarity.clamp(-1.0, 1.0)
+        similarity = similarity.clamp(0.0, 1.0)
     return similarity
 
 
@@ -72,7 +73,7 @@ def pairwise_distance(
     rhs: torch.Tensor,
     *,
     metric: str = "dot",
-    clamp: bool = False,
+    clamp: bool = True,
 ) -> torch.Tensor:
     if lhs.shape[0] == 0 or rhs.shape[0] == 0:
         return torch.zeros((lhs.shape[0], rhs.shape[0]), dtype=torch.float32, device=lhs.device)
