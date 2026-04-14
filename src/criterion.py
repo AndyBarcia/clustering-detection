@@ -9,10 +9,10 @@ from .outputs import RawOutputs
 
 
 def assignment_weights_with_influence(
-    similarity: torch.Tensor,
-    influence: torch.Tensor,
+    similarity: torch.Tensor, # [B,Q,GT]
+    influence: torch.Tensor, # [B,Q]
     alpha,
-    valid_mask: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None, # [B,GT]
 ):
     affinity = (similarity + influence.unsqueeze(-1)).clamp(0.0, 1.0)
     if valid_mask is not None:
@@ -22,6 +22,7 @@ def assignment_weights_with_influence(
 
 def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
     """Computes a soft IoU loss over a per-pixel instance partition."""
+    # logits/targets: [B,GT,H,W], valid_mask: [B,GT]
     neg_inf = torch.finfo(logits.dtype).min
     masked_logits = logits.masked_fill(~valid_mask[:, :, None, None], neg_inf)
     preds = F.softmax(masked_logits, dim=1)
@@ -42,9 +43,9 @@ def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
 
 
 def hungarian_seed_assignment(
-    q_sig_flat: torch.Tensor,
-    gt_sigs_norm: torch.Tensor,
-    gt_pad_mask: torch.Tensor,
+    q_sig_flat: torch.Tensor, # [B,Q,S]
+    gt_sigs_norm: torch.Tensor, # [B,GT,S]
+    gt_pad_mask: torch.Tensor, # [B,GT]
 ):
     B, num_queries, _ = q_sig_flat.shape
     matched_query_mask = torch.zeros((B, num_queries), dtype=torch.bool, device=q_sig_flat.device)
@@ -70,6 +71,7 @@ def hungarian_seed_assignment(
 
 
 def dice_loss_from_logits(mask_logits: torch.Tensor, mask_targets: torch.Tensor, eps: float = 1e-6):
+    # mask_logits/mask_targets: [N,H,W]
     probs = torch.sigmoid(mask_logits).flatten(1)
     targets = mask_targets.flatten(1)
 
@@ -80,6 +82,7 @@ def dice_loss_from_logits(mask_logits: torch.Tensor, mask_targets: torch.Tensor,
 
 @torch.no_grad()
 def pairwise_mask_bce_cost(mask_logits: torch.Tensor, gt_masks: torch.Tensor):
+    # mask_logits: [Q,H,W], gt_masks: [GT,H,W]
     num_queries = mask_logits.shape[0]
     num_gt = gt_masks.shape[0]
     if num_queries == 0 or num_gt == 0:
@@ -93,6 +96,7 @@ def pairwise_mask_bce_cost(mask_logits: torch.Tensor, gt_masks: torch.Tensor):
 
 @torch.no_grad()
 def pairwise_mask_dice_cost(mask_logits: torch.Tensor, gt_masks: torch.Tensor, eps: float = 1e-6):
+    # mask_logits: [Q,H,W], gt_masks: [GT,H,W]
     num_queries = mask_logits.shape[0]
     num_gt = gt_masks.shape[0]
     if num_queries == 0 or num_gt == 0:
@@ -108,10 +112,10 @@ def pairwise_mask_dice_cost(mask_logits: torch.Tensor, gt_masks: torch.Tensor, e
 
 @torch.no_grad()
 def hungarian_mask2former_assignment(
-    cls_logits: torch.Tensor,
-    mask_logits: torch.Tensor,
-    gt_labels: torch.Tensor,
-    gt_masks: torch.Tensor,
+    cls_logits: torch.Tensor, # [Q,C]
+    mask_logits: torch.Tensor, # [Q,H,W]
+    gt_labels: torch.Tensor, # [GT]
+    gt_masks: torch.Tensor, # [GT,H,W]
     cfg: LossConfig,
 ):
     num_queries = cls_logits.shape[0]
@@ -147,6 +151,149 @@ class ClusterPanopticCriterion(nn.Module):
     def forward(self, model: CustomMask2Former, raw: RawOutputs, targets):
         return self.compute_loss(model, raw, targets)
 
+    def _compute_loss_inter(
+        self,
+        gt_sigs_norm: torch.Tensor, # [B,GT,S]
+        gt_pad_mask: torch.Tensor, # [B,GT]
+        features: torch.Tensor, # [B,C,Hf,Wf]
+    ):
+        num_gt = gt_pad_mask.shape[1]
+        loss_inter = features.sum() * 0.0
+
+        if num_gt <= 1:
+            return loss_inter
+
+        gt_sim = torch.bmm(gt_sigs_norm, gt_sigs_norm.transpose(1, 2))
+        eye = torch.eye(num_gt, dtype=torch.bool, device=features.device).unsqueeze(0)
+        valid_pair_mask = gt_pad_mask.unsqueeze(2) & gt_pad_mask.unsqueeze(1)
+        off_diag_mask = valid_pair_mask & ~eye
+
+        if off_diag_mask.any():
+            loss_inter = F.relu(gt_sim[off_diag_mask] - self.cfg.inter_margin).pow(2).mean()
+
+        return loss_inter
+
+    def _compute_assignment_aggregation(
+        self,
+        q_sig_flat: torch.Tensor, # [B,Q,S]
+        q_influence_flat: torch.Tensor, # [B,Q]
+        gt_sigs_norm: torch.Tensor, # [B,GT,S]
+        gt_pad_mask: torch.Tensor, # [B,GT]
+        q_mask_emb_flat: torch.Tensor, # [B,Q,Cm]
+        q_cls_flat: torch.Tensor, # [B,Q,K]
+        alpha,
+    ):
+        sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
+        weights_flat = assignment_weights_with_influence(
+            similarity=sim,
+            influence=q_influence_flat,
+            alpha=alpha,
+            valid_mask=gt_pad_mask,
+        )
+        # norm_w: [B,Q,GT] normalized across queries so each GT builds a soft prototype.
+        norm_w = weights_flat / (weights_flat.sum(dim=1, keepdim=True) + 1e-6)
+
+        # proto_mask_emb: [B,GT,Cm], proto_cls: [B,GT,K]
+        proto_mask_emb = torch.bmm(norm_w.transpose(1, 2), q_mask_emb_flat)
+        proto_cls = torch.bmm(norm_w.transpose(1, 2), q_cls_flat)
+
+        return proto_mask_emb, proto_cls
+
+    def _compute_aggregated_cls_loss(
+        self,
+        proto_cls: torch.Tensor, # [B,GT,K]
+        gt_labels_pad: torch.Tensor, # [B,GT]
+        gt_pad_mask: torch.Tensor, # [B,GT]
+    ):
+        # Keep only valid padded GT slots before classification loss.
+        proto_cls_flat = proto_cls[gt_pad_mask]
+        gt_labels_flat = gt_labels_pad[gt_pad_mask]
+        return F.cross_entropy(proto_cls_flat, gt_labels_flat)
+
+    def _compute_aggregated_mask_losses(
+        self,
+        proto_mask_emb: torch.Tensor, # [B,GT,C]
+        features_val: torch.Tensor, # [B,C,Hf,Wf]
+        gt_masks_pad: torch.Tensor, # [B,GT,H,W]
+        gt_pad_mask: torch.Tensor, # [B,GT]
+        img_shape: tuple[int, int],
+    ):
+        H_img, W_img = img_shape
+        # proto_mask_emb: [B,GT,C], features_val: [B,C,Hf,Wf] -> mask_logits: [B,GT,Hf,Wf]
+        mask_logits = torch.einsum("bmc,bchw->bmhw", proto_mask_emb, features_val)
+        mask_logits = F.interpolate(mask_logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+
+        neg_inf = torch.finfo(mask_logits.dtype).min
+        mask_logits_masked = mask_logits.masked_fill(~gt_pad_mask[:, :, None, None], neg_inf)
+        # gt_mask_target: [B,H,W] stores the winning GT index per pixel.
+        gt_mask_target = gt_masks_pad.argmax(dim=1)
+
+        loss_mask_ce = F.cross_entropy(mask_logits_masked, gt_mask_target)
+        loss_mask_iou = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
+        return loss_mask_ce, loss_mask_iou
+
+    def _compute_mask_cls_losses(
+        self,
+        q_sig_flat: torch.Tensor, # [B,Q,S]
+        q_influence_flat: torch.Tensor, # [B,Q]
+        gt_sigs_norm: torch.Tensor, # [B,GT,S]
+        gt_pad_mask: torch.Tensor, # [B,GT]
+        q_mask_emb_flat: torch.Tensor, # [B,Q,Cm]
+        q_cls_flat: torch.Tensor, # [B,Q,K]
+        gt_labels_pad: torch.Tensor, # [B,GT]
+        gt_masks_pad: torch.Tensor, # [B,GT,H,W]
+        features_val: torch.Tensor, # [B,C,Hf,Wf]
+        img_shape: tuple[int, int],
+        alpha,
+    ):
+        proto_mask_emb, proto_cls = self._compute_assignment_aggregation(
+            q_sig_flat=q_sig_flat,
+            q_influence_flat=q_influence_flat,
+            gt_sigs_norm=gt_sigs_norm,
+            gt_pad_mask=gt_pad_mask,
+            q_mask_emb_flat=q_mask_emb_flat,
+            q_cls_flat=q_cls_flat,
+            alpha=alpha,
+        )
+        loss_cls = self._compute_aggregated_cls_loss(
+            proto_cls, 
+            gt_labels_pad, 
+            gt_pad_mask
+        )
+        loss_mask_ce, loss_mask_iou = self._compute_aggregated_mask_losses(
+            proto_mask_emb=proto_mask_emb,
+            features_val=features_val,
+            gt_masks_pad=gt_masks_pad,
+            gt_pad_mask=gt_pad_mask,
+            img_shape=img_shape,
+        )
+        return loss_cls, loss_mask_ce, loss_mask_iou
+
+    def _compute_seed_losses(
+        self,
+        q_sig_flat: torch.Tensor, # [B,Q,S]
+        gt_sigs_norm: torch.Tensor, # [B,GT,S]
+        gt_pad_mask: torch.Tensor, # [B,GT]
+        q_seed_logits_flat: torch.Tensor, # [B,Q]
+        features: torch.Tensor, # [B,C,Hf,Wf]
+    ):
+        # q_seed_logits_flat: [B,Q], matched_query_mask: [B,Q]
+        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_norm, gt_pad_mask)
+
+        seed_targets = matched_query_mask.float()
+        loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
+
+        loss_seed_sig = features.sum() * 0.0
+        matched_pos = matched_query_mask.nonzero(as_tuple=False)
+        if matched_pos.numel() > 0:
+            matched_gt = matched_gt_indices[matched_query_mask]
+            matched_q_sig = q_sig_flat[matched_query_mask]
+            matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt]
+            cos_sim_seed = (matched_q_sig * matched_gt_sig).sum(dim=-1)
+            loss_seed_sig = (1.0 - cos_sim_seed).mean()
+
+        return loss_seed, loss_seed_sig
+
     def compute_loss(self, model: CustomMask2Former, raw: RawOutputs, targets):
         features = raw.features
         memory = raw.memory
@@ -160,6 +307,7 @@ class ClusterPanopticCriterion(nn.Module):
         if sig_embs is None or seed_logits is None or influence_preds is None:
             raise ValueError("Clustered criterion requires signature, seed, and influence predictions.")
 
+        # features: [B,C,Hf,Wf], memory: [B,N_mem,C]
         B = features.shape[0]
 
         valid_b, masks_list, labels_list = [], [], []
@@ -186,6 +334,7 @@ class ClusterPanopticCriterion(nn.Module):
         B_val = len(valid_b)
         M_max = max(len(l) for l in labels_list)
 
+        # Padded GT tensors: gt_masks_pad [Bv,GT,H,W], gt_labels_pad [Bv,GT], gt_pad_mask [Bv,GT]
         gt_masks_pad = torch.zeros(B_val, M_max, H_img, W_img, device=features.device)
         gt_labels_pad = torch.zeros(B_val, M_max, dtype=torch.long, device=features.device)
         gt_pad_mask = torch.zeros(B_val, M_max, dtype=torch.bool, device=features.device)
@@ -205,64 +354,47 @@ class ClusterPanopticCriterion(nn.Module):
         q_seed_logits = seed_logits[:, valid_b]
         q_influence = influence_preds[:, valid_b]
 
+        # Decoder outputs are [L,Bv,Q,...]; we flatten layers and queries into a single query axis.
         L, _, N_q, S = q_sig.shape
 
+        # q_sig_flat: [Bv,L*Q,S], q_mask_emb_flat: [Bv,L*Q,C], q_cls_flat: [Bv,L*Q,K]
         q_sig_flat = q_sig.transpose(0, 1).reshape(B_val, L * N_q, S)
         q_mask_emb_flat = q_mask_emb.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, L * N_q, -1)
+        # q_seed_logits_flat/q_influence_flat: [Bv,L*Q]
         q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
 
+        # gt_sigs_norm: [Bv,GT,S]
         gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
-        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(q_sig_flat, gt_sigs_norm, gt_pad_mask)
-
-        sim = torch.bmm(q_sig_flat, gt_sigs_norm.transpose(1, 2))
-        weights_flat = assignment_weights_with_influence(
-            similarity=sim,
-            influence=q_influence_flat,
-            alpha=model.alpha_focal,
-            valid_mask=gt_pad_mask,
+        
+        loss_inter = self._compute_loss_inter(
+            gt_sigs_norm, 
+            gt_pad_mask, 
+            features
         )
-
-        loss_inter = features.sum() * 0.0
-        if M_max > 1:
-            gt_sim = torch.bmm(gt_sigs_norm, gt_sigs_norm.transpose(1, 2))
-            eye = torch.eye(M_max, dtype=torch.bool, device=features.device).unsqueeze(0)
-            valid_pair_mask = gt_pad_mask.unsqueeze(2) & gt_pad_mask.unsqueeze(1)
-            off_diag_mask = valid_pair_mask & ~eye
-
-            if off_diag_mask.any():
-                loss_inter = F.relu(gt_sim[off_diag_mask] - self.cfg.inter_margin).pow(2).mean()
-
-        norm_w = weights_flat / (weights_flat.sum(dim=1, keepdim=True) + 1e-6)
-
-        proto_mask_emb = torch.bmm(norm_w.transpose(1, 2), q_mask_emb_flat)
-        proto_cls = torch.bmm(norm_w.transpose(1, 2), q_cls_flat)
-
-        proto_cls_flat = proto_cls[gt_pad_mask]
-        gt_labels_flat = gt_labels_pad[gt_pad_mask]
-        loss_cls = F.cross_entropy(proto_cls_flat, gt_labels_flat)
-
-        mask_logits = torch.einsum("bmc,bchw->bmhw", proto_mask_emb, features_val)
-        mask_logits = F.interpolate(mask_logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
-        neg_inf = torch.finfo(mask_logits.dtype).min
-        mask_logits_masked = mask_logits.masked_fill(~gt_pad_mask[:, :, None, None], neg_inf)
-        gt_mask_target = gt_masks_pad.argmax(dim=1)
-
-        loss_mask_ce = F.cross_entropy(mask_logits_masked, gt_mask_target)
-        loss_mask_iou = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
-
-        seed_targets = matched_query_mask.float()
-        loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
-
-        loss_seed_sig = features.sum() * 0.0
-        matched_pos = matched_query_mask.nonzero(as_tuple=False)
-        if matched_pos.numel() > 0:
-            matched_gt = matched_gt_indices[matched_query_mask]
-            matched_q_sig = q_sig_flat[matched_query_mask]
-            matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt]
-            cos_sim_seed = (matched_q_sig * matched_gt_sig).sum(dim=-1)
-            loss_seed_sig = (1.0 - cos_sim_seed).mean()
+        
+        loss_cls, loss_mask_ce, loss_mask_iou = self._compute_mask_cls_losses(
+            q_sig_flat=q_sig_flat,
+            q_influence_flat=q_influence_flat,
+            gt_sigs_norm=gt_sigs_norm,
+            gt_pad_mask=gt_pad_mask,
+            q_mask_emb_flat=q_mask_emb_flat,
+            q_cls_flat=q_cls_flat,
+            gt_labels_pad=gt_labels_pad,
+            gt_masks_pad=gt_masks_pad,
+            features_val=features_val,
+            img_shape=(H_img, W_img),
+            alpha=model.alpha_focal,
+        )
+        
+        loss_seed, loss_seed_sig = self._compute_seed_losses(
+            q_sig_flat=q_sig_flat,
+            gt_sigs_norm=gt_sigs_norm,
+            gt_pad_mask=gt_pad_mask,
+            q_seed_logits_flat=q_seed_logits_flat,
+            features=features,
+        )
 
         total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
 
@@ -305,6 +437,7 @@ class StandardMask2FormerCriterion(nn.Module):
         img_shape: tuple[int, int],
     ):
         H_img, W_img = img_shape
+        # q_mask_emb: [B,Q,C], features: [B,C,Hf,Wf] -> mask_logits: [B,Q,Hf,Wf]
         mask_logits = torch.einsum("bqc,bchw->bqhw", q_mask_emb, features)
         mask_logits = F.interpolate(mask_logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
 
@@ -326,6 +459,7 @@ class StandardMask2FormerCriterion(nn.Module):
             target_classes = torch.zeros(q_cls.shape[1], dtype=torch.long, device=features.device)
 
             if gt_labels.numel() > 0:
+                # Match the current layer queries [Q,...] against foreground GTs [M,...].
                 matched_query_idx, matched_gt_idx = hungarian_mask2former_assignment(
                     cls_logits=q_cls[b],
                     mask_logits=mask_logits[b],
@@ -361,6 +495,7 @@ class StandardMask2FormerCriterion(nn.Module):
         del model
 
         features = raw.features
+        # raw.mask_embs/raw.cls_preds are lists over decoder layers.
         layer_losses = [
             self._compute_single_layer_loss(features, q_mask_emb, q_cls, targets, raw.img_shape)
             for q_mask_emb, q_cls in zip(raw.mask_embs, raw.cls_preds)
