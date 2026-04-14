@@ -4,23 +4,68 @@ import torch
 import torch.nn.functional as F
 
 
-def _sigmoid_pairwise_jaccard(
+def _sigmoid_pairwise_intersection_stats(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
-    *,
-    eps: float,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     lhs_probs = torch.sigmoid(lhs)
     rhs_probs = torch.sigmoid(rhs)
 
     intersection = torch.matmul(lhs_probs, rhs_probs.transpose(-1, -2))
     lhs_mass = lhs_probs.sum(dim=-1, keepdim=True)
     rhs_mass = rhs_probs.sum(dim=-1).unsqueeze(-2)
+    return intersection, lhs_mass, rhs_mass
+
+
+def _sigmoid_pairwise_jaccard(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    intersection, lhs_mass, rhs_mass = _sigmoid_pairwise_intersection_stats(lhs, rhs)
     union = (lhs_mass + rhs_mass - intersection).clamp_min(eps)
     jaccard = intersection / union
 
     # Scale and shift to map expected random similarity to 0.0 and perfect similarity to 1.0.
     return 1.5 * (jaccard - (1.0 / 3.0))
+
+
+def _sigmoid_pairwise_dice(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    intersection, lhs_mass, rhs_mass = _sigmoid_pairwise_intersection_stats(lhs, rhs)
+    denom = (lhs_mass + rhs_mass).clamp_min(eps)
+    dice = (2.0 * intersection) / denom
+
+    # Scale and shift to map expected random similarity to 0.0 and perfect similarity to 1.0.
+    return 2.0 * (dice - 0.5)
+
+
+def _sigmoid_pairwise_overlap(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    eps: float,
+    mass: str = "min",
+) -> torch.Tensor:
+    intersection, lhs_mass, rhs_mass = _sigmoid_pairwise_intersection_stats(lhs, rhs)
+    if mass == "min":
+        overlap_mass = torch.minimum(lhs_mass, rhs_mass)
+    elif mass == "lhs":
+        overlap_mass = lhs_mass
+    elif mass == "rhs":
+        overlap_mass = rhs_mass
+    else:
+        raise ValueError(f"Unsupported overlap mass selector: {mass}")
+
+    overlap = intersection / overlap_mass.clamp_min(eps)
+
+    # Scale and shift to map expected random similarity to 0.0 and perfect similarity to 1.0.
+    return 2.0 * (overlap - 0.5)
 
 
 def _softmax_pairwise_jsd(
@@ -80,8 +125,39 @@ def pairwise_similarity(
         if clamp:
             similarity = similarity.clamp(0.0, 1.0)
         return similarity
+    elif metric_name == "dice":
+        similarity = _sigmoid_pairwise_dice(lhs/temp, rhs/temp, eps=eps)
+        if clamp:
+            similarity = similarity.clamp(0.0, 1.0)
+        return similarity
+    elif metric_name == "overlap":
+        similarity = _sigmoid_pairwise_overlap(lhs/temp, rhs/temp, eps=eps, mass="min")
+        if clamp:
+            similarity = similarity.clamp(0.0, 1.0)
+        return similarity
+    elif metric_name == "left-overlap":
+        similarity = _sigmoid_pairwise_overlap(lhs/temp, rhs/temp, eps=eps, mass="lhs")
+        if clamp:
+            similarity = similarity.clamp(0.0, 1.0)
+        return similarity
+    elif metric_name == "right-overlap":
+        similarity = _sigmoid_pairwise_overlap(lhs/temp, rhs/temp, eps=eps, mass="rhs")
+        if clamp:
+            similarity = similarity.clamp(0.0, 1.0)
+        return similarity
 
-    if metric_name not in {"dot", "dot-sigmoid", "cosine", "softmax", "jsd", "jaccard"}:
+    if metric_name not in {
+        "dot",
+        "dot-sigmoid",
+        "cosine",
+        "softmax",
+        "jsd",
+        "jaccard",
+        "dice",
+        "overlap",
+        "left-overlap",
+        "right-overlap",
+    }:
         raise ValueError(f"Unsupported signature similarity metric: {metric}")
 
     similarity = torch.matmul(lhs, rhs.transpose(-1, -2))
@@ -98,7 +174,7 @@ def pairwise_distance(
     *,
     metric: str = "dot",
     clamp: bool = True,
-    temp: float = 0.5,
+    temp: float = 0.1,
 ) -> torch.Tensor:
     if lhs.shape[0] == 0 or rhs.shape[0] == 0:
         return torch.zeros((lhs.shape[0], rhs.shape[0]), dtype=torch.float32, device=lhs.device)

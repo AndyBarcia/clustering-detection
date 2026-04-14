@@ -13,8 +13,8 @@ import torch
 from src.signature_ops import pairwise_similarity
 
 
-METRICS = ["dot", "dot-sigmoid", "cosine", "softmax", "jsd", "jaccard"]
-TEMPERATURE_METRICS = {"dot-sigmoid", "softmax", "jsd", "jaccard"}
+METRICS = ["dot", "dot-sigmoid", "cosine", "softmax", "jsd", "jaccard", "dice", "overlap"]
+TEMPERATURE_METRICS = {"dot-sigmoid", "softmax", "jsd", "jaccard", "dice", "overlap"}
 
 
 def parse_args():
@@ -135,8 +135,7 @@ def plot_metric_distribution(
             label=label,
         )
 
-    title = f"{metric} similarity distribution at random initialization"
-    ax.set_title(title)
+    ax.set_title(metric)
     ax.set_xlabel("Similarity")
     ax.set_ylabel("Density")
     ax.set_xlim(0.0, 1.0)
@@ -172,7 +171,7 @@ def save_combined_metric_figure(
     show: bool,
 ):
     num_metrics = len(distributions)
-    cols = 2
+    cols = 3
     rows = math.ceil(num_metrics / cols)
     fig, axes = plt.subplots(rows, cols, figsize=(14, 4.8 * rows))
     axes = axes.reshape(rows, cols) if hasattr(axes, "reshape") else [[axes]]
