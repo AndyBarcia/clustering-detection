@@ -35,7 +35,7 @@ class HeadConfig:
     hidden_dim: int = 1024
     sig_dim: int = 64
     normalize_signatures: bool = True
-    aggregation_similarity_metric: str = "left-overlap"
+    aggregation_similarity_metric: str = "cosine"
     identity_similarity_metric: str = "cosine"
 
 

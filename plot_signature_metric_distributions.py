@@ -13,7 +13,7 @@ import torch
 from src.signature_ops import pairwise_similarity
 
 
-METRICS = ["dot", "dot-sigmoid", "cosine", "softmax", "jsd", "jaccard", "dice", "overlap"]
+METRICS = ["dot", "dot-sigmoid", "cosine", "centered-cosine", "softmax", "jsd", "jaccard", "dice", "overlap"]
 TEMPERATURE_METRICS = {"dot-sigmoid", "softmax", "jsd", "jaccard", "dice", "overlap"}
 
 

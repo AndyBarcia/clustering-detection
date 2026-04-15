@@ -4,6 +4,10 @@ import torch
 import torch.nn.functional as F
 
 
+def _center_last_dim(values: torch.Tensor) -> torch.Tensor:
+    return values - values.mean(dim=-1, keepdim=True)
+
+
 def _distance_to_similarity(
     distance: torch.Tensor,
     *,
@@ -140,7 +144,12 @@ def pairwise_similarity(
         )
 
     metric_name = metric.lower()
-    if metric_name == "cosine" and lhs.shape[-1] > 0:
+    if metric_name == "centered-cosine" and lhs.shape[-1] > 0:
+        lhs = _center_last_dim(lhs)
+        rhs = _center_last_dim(rhs)
+        lhs = F.normalize(lhs, p=2, dim=-1, eps=eps)
+        rhs = F.normalize(rhs, p=2, dim=-1, eps=eps)
+    elif metric_name == "cosine" and lhs.shape[-1] > 0:
         lhs = F.normalize(lhs, p=2, dim=-1, eps=eps)
         rhs = F.normalize(rhs, p=2, dim=-1, eps=eps)
     elif metric_name == "softmax":
@@ -191,6 +200,7 @@ def pairwise_similarity(
         "dot",
         "dot-sigmoid",
         "cosine",
+        "centered-cosine",
         "softmax",
         "jsd",
         "jaccard",
