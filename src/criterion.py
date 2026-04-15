@@ -42,6 +42,7 @@ def hungarian_seed_assignment(
     gt_pad_mask: torch.Tensor, # [B,GT]
     *,
     similarity_metric: str = "dot",
+    match_bce_weight: float = 1.0,
 ):
     B, num_queries, _ = q_patterns.shape
     matched_query_mask = torch.zeros((B, num_queries), dtype=torch.bool, device=q_patterns.device)
@@ -57,7 +58,17 @@ def hungarian_seed_assignment(
             gt_patterns[b, valid_gt_idx],
             metric=similarity_metric,
         )
-        cost = (1.0 - sim).detach().cpu().numpy()
+        cost = 1.0 - sim
+        if match_bce_weight > 0.0:
+            matched_query_scores = gt_patterns[b, valid_gt_idx].transpose(0, 1).clamp(1e-6, 1.0 - 1e-6)
+            match_bce_cost = F.binary_cross_entropy(
+                matched_query_scores,
+                torch.ones_like(matched_query_scores),
+                reduction="none",
+            )
+            cost = cost + match_bce_weight * match_bce_cost
+
+        cost = cost.detach().cpu().numpy()
         row_ind, col_ind = linear_sum_assignment(cost)
         if len(row_ind) == 0:
             continue
@@ -288,12 +299,14 @@ class ClusterPanopticCriterion(nn.Module):
             gt_patterns,
             gt_pad_mask,
             similarity_metric=identity_similarity_metric,
+            match_bce_weight=self.cfg.w_seed_match_bce,
         )
 
         seed_targets = matched_query_mask.float()
         loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
 
         loss_seed_sig = features.sum() * 0.0
+        loss_seed_match_bce = features.sum() * 0.0
         matched_pos = matched_query_mask.nonzero(as_tuple=False)
         if matched_pos.numel() > 0:
             matched_gt = matched_gt_indices[matched_query_mask]
@@ -306,7 +319,13 @@ class ClusterPanopticCriterion(nn.Module):
             ).squeeze(-1).squeeze(-1)
             loss_seed_sig = (1.0 - matched_similarity).mean()
 
-        return loss_seed, loss_seed_sig
+            matched_gt_query_scores = matched_gt_pattern[torch.arange(matched_gt_pattern.shape[0], device=matched_gt_pattern.device), matched_pos[:, 1]]
+            loss_seed_match_bce = F.binary_cross_entropy(
+                matched_gt_query_scores,
+                torch.ones_like(matched_gt_query_scores),
+            )
+
+        return loss_seed, loss_seed_sig, loss_seed_match_bce
 
     def compute_loss(self, model: CustomMask2Former, raw: RawOutputs, targets):
         features = raw.features
@@ -338,6 +357,7 @@ class ClusterPanopticCriterion(nn.Module):
                 "loss_total": zero,
                 "loss_seed_sig": zero,
                 "loss_seed": zero,
+                "loss_seed_match_bce": zero,
                 "loss_cls": zero,
                 "loss_mask_ce": zero,
                 "loss_mask_iou": zero,
@@ -412,7 +432,7 @@ class ClusterPanopticCriterion(nn.Module):
             alpha=model.alpha_focal,
         )
         
-        loss_seed, loss_seed_sig = self._compute_seed_losses(
+        loss_seed, loss_seed_sig, loss_seed_match_bce = self._compute_seed_losses(
             q_patterns=q_patterns,
             gt_patterns=gt_patterns,
             gt_pad_mask=gt_pad_mask,
@@ -428,6 +448,7 @@ class ClusterPanopticCriterion(nn.Module):
             + loss_cls
             + total_loss_mask
             + self.cfg.w_seed * loss_seed
+            + self.cfg.w_seed_match_bce * loss_seed_match_bce
             + self.cfg.w_inter * loss_inter
         )
 
@@ -435,6 +456,7 @@ class ClusterPanopticCriterion(nn.Module):
             "loss_total": final_loss,
             "loss_seed_sig": loss_seed_sig,
             "loss_seed": loss_seed,
+            "loss_seed_match_bce": loss_seed_match_bce,
             "loss_cls": loss_cls,
             "loss_mask_ce": loss_mask_ce,
             "loss_mask_iou": loss_mask_iou,
@@ -541,6 +563,7 @@ class StandardMask2FormerCriterion(nn.Module):
             "loss_total": final_loss,
             "loss_seed_sig": zero,
             "loss_seed": zero,
+            "loss_seed_match_bce": zero,
             "loss_cls": loss_cls,
             "loss_mask_bce": loss_mask_bce,
             "loss_mask_dice": loss_mask_dice,
