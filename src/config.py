@@ -63,6 +63,7 @@ class LossConfig:
     matcher_cost_class: float = 2.0
     matcher_cost_mask_bce: float = 5.0
     matcher_cost_mask_dice: float = 5.0
+    matcher_cost_seed: float = 1.0
 
     w_mask_bce: float = 5.0
     w_mask_dice: float = 5.0

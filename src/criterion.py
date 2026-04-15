@@ -40,8 +40,10 @@ def hungarian_seed_assignment(
     q_sig_flat: torch.Tensor, # [B,Q,S]
     gt_sigs_norm: torch.Tensor, # [B,GT,S]
     gt_pad_mask: torch.Tensor, # [B,GT]
+    q_seed_logits_flat: torch.Tensor | None = None, # [B,Q]
     *,
     similarity_metric: str = "dot",
+    seed_cost_weight: float = 1.0,
 ):
     B, num_queries, _ = q_sig_flat.shape
     matched_query_mask = torch.zeros((B, num_queries), dtype=torch.bool, device=q_sig_flat.device)
@@ -57,7 +59,11 @@ def hungarian_seed_assignment(
             gt_sigs_norm[b, valid_gt_idx],
             metric=similarity_metric,
         )
-        cost = (1.0 - sim).detach().cpu().numpy()
+        cost = 1.0 - sim
+        if q_seed_logits_flat is not None and seed_cost_weight != 0.0:
+            seed_cost = 1.0 - torch.sigmoid(q_seed_logits_flat[b])
+            cost = cost + seed_cost_weight * seed_cost.unsqueeze(-1)
+        cost = cost.detach().cpu().numpy()
         row_ind, col_ind = linear_sum_assignment(cost)
         if len(row_ind) == 0:
             continue
@@ -298,7 +304,9 @@ class ClusterPanopticCriterion(nn.Module):
             q_sig_flat,
             gt_sigs_norm,
             gt_pad_mask,
+            q_seed_logits_flat=q_seed_logits_flat,
             similarity_metric=identity_similarity_metric,
+            seed_cost_weight=self.cfg.matcher_cost_seed,
         )
 
         seed_targets = matched_query_mask.float()
