@@ -159,10 +159,15 @@ def _project_signatures_2d(signatures: np.ndarray, *, metric: str = "cosine") ->
     if signatures.shape[0] == 1:
         return np.zeros((1, 2), dtype=np.float32)
 
+    if signatures.shape[0] <= 3:
+        umap_available = False
+    else:
+        umap_available = umap is not None
+
     signatures = signatures.astype(np.float32, copy=False)
 
-    if umap is not None:
-        n_neighbors = max(2, min(15, signatures.shape[0] - 1))
+    if umap_available:
+        n_neighbors = min(15, signatures.shape[0] - 1)
         signatures_t = torch.from_numpy(signatures)
         distances = pairwise_distance(
             signatures_t,
@@ -482,18 +487,25 @@ def _draw_signature_umap(
     identity_similarity_metric: str = "cosine",
     class_names: Optional[Sequence[str]] = None,
     title: str,
+    use_aggregation_patterns: bool = False,
     row_state: Optional[_RowInteractionState] = None,
 ):
     flat: Optional[FlatQueryOutputs] = prediction.flat_queries
-    q_sig = None if flat is None else flat.aggregation_patterns
+    if flat is None:
+        q_sig = None
+    elif use_aggregation_patterns:
+        q_sig = flat.aggregation_patterns
+    else:
+        q_sig = flat.signature_embeddings
     q_seed = None if flat is None else flat.seed_scores
     q_influence = None if flat is None else flat.influence_scores
-    gt_sig = prediction.all_identity_embeddings
+    gt_sig = prediction.all_identity_embeddings if use_aggregation_patterns else prediction.all_signature_embeddings
 
     if q_sig is None or gt_sig is None:
         ax.set_title(title)
         ax.axis("off")
-        ax.text(0.5, 0.5, "No identity patterns", ha="center", va="center", fontsize=11, transform=ax.transAxes)
+        empty_text = "No identity patterns" if use_aggregation_patterns else "No signature embeddings"
+        ax.text(0.5, 0.5, empty_text, ha="center", va="center", fontsize=11, transform=ax.transAxes)
         return
 
     q_sig_np = q_sig.detach().cpu().numpy()
@@ -634,6 +646,29 @@ def _draw_signature_umap(
     ax.set_yticks([])
     for spine in ax.spines.values():
         spine.set_alpha(0.3)
+
+
+def _draw_aggregation_similarity_map(
+    ax,
+    image_np: np.ndarray,
+    target: dict,
+    prediction: ResolvedPrediction,
+    *,
+    identity_similarity_metric: str,
+    class_names: Optional[Sequence[str]] = None,
+    title: str,
+):
+    _draw_signature_umap(
+        ax,
+        image_np,
+        target,
+        prediction,
+        identity_similarity_metric=identity_similarity_metric,
+        class_names=class_names,
+        title=title,
+        use_aggregation_patterns=True,
+        row_state=None,
+    )
 
 
 def _draw_instances(
@@ -790,7 +825,8 @@ def render_prediction_grid(
 ):
     num_samples = len(images)
     add_signature_column = any("GT Prototype" in title for title, _ in prediction_columns)
-    num_cols = 2 + len(prediction_columns) + int(add_signature_column)
+    extra_identity_cols = 2 if add_signature_column else 0
+    num_cols = 2 + len(prediction_columns) + extra_identity_cols
     fig, axes = plt.subplots(num_samples, num_cols, figsize=(5 * num_cols, 5 * max(num_samples, 1)), squeeze=False)
     row_states: List[_RowInteractionState] = []
 
@@ -866,6 +902,16 @@ def render_prediction_grid(
                     class_names=class_names,
                     title="GT Signature UMAP",
                     row_state=row_state,
+                )
+                next_col_idx += 1
+                _draw_aggregation_similarity_map(
+                    axes[row_idx, next_col_idx],
+                    image_np,
+                    target,
+                    prediction,
+                    identity_similarity_metric=identity_similarity_metric,
+                    class_names=class_names,
+                    title="Pattern Similarity",
                 )
                 next_col_idx += 1
 
