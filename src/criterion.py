@@ -292,6 +292,7 @@ class ClusterPanopticCriterion(nn.Module):
         q_seed_logits_flat: torch.Tensor, # [B,Q]
         features: torch.Tensor, # [B,C,Hf,Wf]
         identity_similarity_metric: str,
+        aggregation_similarity_metric: str,
     ):
         # q_seed_logits_flat: [B,Q], matched_query_mask: [B,Q]
         matched_query_mask, matched_gt_indices = hungarian_seed_assignment(
@@ -305,6 +306,7 @@ class ClusterPanopticCriterion(nn.Module):
         loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
 
         loss_seed_sig = features.sum() * 0.0
+        loss_seed_aggregation = features.sum() * 0.0
         matched_pos = matched_query_mask.nonzero(as_tuple=False)
         if matched_pos.numel() > 0:
             matched_gt = matched_gt_indices[matched_query_mask]
@@ -317,7 +319,38 @@ class ClusterPanopticCriterion(nn.Module):
             ).squeeze(-1).squeeze(-1)
             loss_seed_sig = (1.0 - matched_similarity).mean()
 
-        return loss_seed, loss_seed_sig
+            # Preserve, for every matched query column j, the relationship
+            # sim(query_i, query_j) ~= sim(query_i, matched_gt_j) for all i != j.
+            query_to_query_sim = pairwise_similarity(
+                q_sig_flat,
+                q_sig_flat,
+                metric=aggregation_similarity_metric,
+            )
+            query_to_gt_sim = pairwise_similarity(
+                q_sig_flat,
+                gt_sigs_norm,
+                metric=aggregation_similarity_metric,
+            )
+
+            matched_gt_indices_safe = matched_gt_indices.clamp_min(0)
+            matched_gt_sim = query_to_gt_sim.gather(
+                dim=2,
+                index=matched_gt_indices_safe.unsqueeze(1).expand(-1, q_sig_flat.shape[1], -1),
+            )
+
+            off_diag_mask = ~torch.eye(
+                q_sig_flat.shape[1],
+                dtype=torch.bool,
+                device=q_sig_flat.device,
+            ).unsqueeze(0)
+            matched_column_mask = matched_query_mask.unsqueeze(1).expand_as(query_to_query_sim)
+            aggregation_pair_mask = off_diag_mask & matched_column_mask
+
+            if aggregation_pair_mask.any():
+                aggregation_error = (query_to_query_sim - matched_gt_sim).pow(2)
+                loss_seed_aggregation = aggregation_error[aggregation_pair_mask].mean()
+
+        return loss_seed, loss_seed_sig, loss_seed_aggregation
 
     def compute_loss(self, model: CustomMask2Former, raw: RawOutputs, targets):
         features = raw.features
@@ -348,6 +381,7 @@ class ClusterPanopticCriterion(nn.Module):
             return zero, {
                 "loss_total": zero,
                 "loss_seed_sig": zero,
+                "loss_seed_aggregation": zero,
                 "loss_seed": zero,
                 "loss_cls": zero,
                 "loss_mask_ce": zero,
@@ -415,19 +449,21 @@ class ClusterPanopticCriterion(nn.Module):
             aggregation_similarity_metric=model.aggregation_similarity_metric,
         )
         
-        loss_seed, loss_seed_sig = self._compute_seed_losses(
+        loss_seed, loss_seed_sig, loss_seed_aggregation = self._compute_seed_losses(
             q_sig_flat=q_sig_flat,
             gt_sigs_norm=gt_sigs_norm,
             gt_pad_mask=gt_pad_mask,
             q_seed_logits_flat=q_seed_logits_flat,
             features=features,
             identity_similarity_metric=model.identity_similarity_metric,
+            aggregation_similarity_metric=model.aggregation_similarity_metric,
         )
 
         total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
 
         final_loss = (
             loss_seed_sig
+            + self.cfg.w_seed_aggregation * loss_seed_aggregation
             + loss_cls
             + total_loss_mask
             + self.cfg.w_seed * loss_seed
@@ -437,6 +473,7 @@ class ClusterPanopticCriterion(nn.Module):
         components = {
             "loss_total": final_loss,
             "loss_seed_sig": loss_seed_sig,
+            "loss_seed_aggregation": loss_seed_aggregation,
             "loss_seed": loss_seed,
             "loss_cls": loss_cls,
             "loss_mask_ce": loss_mask_ce,
