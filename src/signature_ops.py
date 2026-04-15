@@ -9,7 +9,7 @@ def _distance_to_similarity(
     *,
     eps: float,
 ) -> torch.Tensor:
-    d_max = distance.max()
+    d_max = distance.max().detach()
     if d_max <= eps:
         return torch.ones_like(distance)
     return 1.0 - (distance / d_max)
@@ -39,6 +39,7 @@ def _sigmoid_pairwise_jaccard(
     jaccard = intersection / union
 
     # Scale and shift to map expected random similarity to 0.0 and perfect similarity to 1.0.
+    return jaccard
     return 1.5 * (jaccard - (1.0 / 3.0))
 
 
@@ -53,6 +54,7 @@ def _sigmoid_pairwise_dice(
     dice = (2.0 * intersection) / denom
 
     # Scale and shift to map expected random similarity to 0.0 and perfect similarity to 1.0.
+    return dice
     return 2.0 * (dice - 0.5)
 
 
@@ -76,6 +78,7 @@ def _sigmoid_pairwise_overlap(
     overlap = intersection / overlap_mass.clamp_min(eps)
 
     # Scale and shift to map expected random similarity to 0.0 and perfect similarity to 1.0.
+    return overlap
     return 2.0 * (overlap - 0.5)
 
 
@@ -124,6 +127,19 @@ def _pairwise_mse_similarity(
     return _distance_to_similarity(distance, eps=eps)
 
 
+def _pairwise_centered_cosine_similarity(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    lhs = lhs - lhs.mean(dim=-1, keepdim=True)
+    rhs = rhs - rhs.mean(dim=-1, keepdim=True)
+    lhs = F.normalize(lhs, p=2, dim=-1, eps=eps)
+    rhs = F.normalize(rhs, p=2, dim=-1, eps=eps)
+    return torch.matmul(lhs, rhs.transpose(-1, -2))
+
+
 def pairwise_similarity(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -143,6 +159,11 @@ def pairwise_similarity(
     if metric_name == "cosine" and lhs.shape[-1] > 0:
         lhs = F.normalize(lhs, p=2, dim=-1, eps=eps)
         rhs = F.normalize(rhs, p=2, dim=-1, eps=eps)
+    elif metric_name == "centered-cosine" and lhs.shape[-1] > 0:
+        similarity = _pairwise_centered_cosine_similarity(lhs, rhs, eps=eps)
+        if clamp:
+            similarity = similarity.clamp(0.0, 1.0)
+        return similarity
     elif metric_name == "softmax":
         lhs = F.softmax(lhs/temp, dim=-1)
         rhs = F.softmax(rhs/temp, dim=-1)
@@ -191,6 +212,7 @@ def pairwise_similarity(
         "dot",
         "dot-sigmoid",
         "cosine",
+        "centered-cosine",
         "softmax",
         "jsd",
         "jaccard",

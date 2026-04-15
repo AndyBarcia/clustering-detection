@@ -38,10 +38,11 @@ class FlatQueryOutputs:
     foreground_confidence: torch.Tensor   # [Q]
     partition_confidence: torch.Tensor    # [Q]
     predicted_labels: torch.Tensor        # [Q]
+    aggregation_patterns: Optional[torch.Tensor] = None  # [Q, Q]
 
     @property
     def num_queries(self) -> int:
-        return int(self.signature_embeddings.shape[0])
+        return int(self.mask_embeddings.shape[0])
 
 
 @dataclass
@@ -62,6 +63,7 @@ class SeedClustering:
 @dataclass
 class PrototypeState:
     signature_embeddings: torch.Tensor    # [P, S]
+    aggregation_patterns: torch.Tensor    # [P, Q]
     class_logits: torch.Tensor            # [P, K]
     mask_embeddings: torch.Tensor         # [P, C]
     cluster_members: list[torch.Tensor]   # list[[Qc_i]]
@@ -74,7 +76,7 @@ class PrototypeState:
 
     @property
     def num_prototypes(self) -> int:
-        return int(self.signature_embeddings.shape[0])
+        return int(self.mask_embeddings.shape[0])
 
 
 @dataclass
@@ -93,12 +95,21 @@ class ResolvedPrediction:
     resolved_masks: list[torch.Tensor]    # list[[H, W]]
     resolved_labels: list[int]
     resolved_scores: list[float]
+    aggregation_patterns: Optional[torch.Tensor] = None  # [Pk, Q]
 
     @property
     def all_signature_embeddings(self) -> torch.Tensor:
         if self.prototypes is None:
             return self.signature_embeddings
         return self.prototypes.signature_embeddings
+
+    @property
+    def all_identity_embeddings(self) -> torch.Tensor:
+        if self.prototypes is not None and self.prototypes.aggregation_patterns.numel() > 0:
+            return self.prototypes.aggregation_patterns
+        if self.aggregation_patterns is not None and self.aggregation_patterns.numel() > 0:
+            return self.aggregation_patterns
+        return self.all_signature_embeddings
 
 
 @dataclass

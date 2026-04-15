@@ -13,14 +13,38 @@ import torch
 from src.signature_ops import pairwise_similarity
 
 
-METRICS = ["dot", "dot-sigmoid", "cosine", "softmax", "jsd", "jaccard", "dice", "overlap"]
-TEMPERATURE_METRICS = {"dot-sigmoid", "softmax", "jsd", "jaccard", "dice", "overlap"}
+METRICS = [
+    "dot",
+    "dot-sigmoid",
+    "cosine",
+    "centered-cosine",
+    "softmax",
+    "jsd",
+    "jaccard",
+    "dice",
+    "overlap",
+    "left-overlap",
+    "right-overlap",
+    "l2",
+    "mse"
+]
+TEMPERATURE_METRICS = {
+    "dot-sigmoid",
+    "softmax",
+    "jsd",
+    "jaccard",
+    "dice",
+    "overlap",
+    "left-overlap",
+    "right-overlap",
+}
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Plot the distribution of signature similarity metrics at random initialization."
+            "Plot similarity metric distributions at random initialization, either directly "
+            "in signature space or in identity space after inducing aggregation patterns."
         )
     )
     parser.add_argument(
@@ -50,7 +74,7 @@ def parse_args():
         "--temps",
         type=float,
         nargs="+",
-        default=[0.1, 0.5, 1.0],
+        default=[0.01, 0.1, 1.0],
         help="Temperatures to compare for temperature-aware metrics.",
     )
     parser.add_argument(
@@ -69,6 +93,26 @@ def parse_args():
         "--device",
         default="cpu",
         help="Torch device used for the computation, for example cpu or cuda.",
+    )
+    parser.add_argument(
+        "--plot-space",
+        choices=["aggregation", "identity"],
+        default="aggregation",
+        help=(
+            "Which initialization quantity to plot. "
+            "'aggregation' plots direct signature-space aggregation similarities. "
+            "'identity' first computes aggregation patterns using --aggregation-metric "
+            "and then plots identity similarities between those patterns."
+        ),
+    )
+    parser.add_argument(
+        "--aggregation-metric",
+        choices=METRICS,
+        default="cosine",
+        help=(
+            "Aggregation metric used to induce initial aggregation patterns when "
+            "--plot-space=identity."
+        ),
     )
     parser.add_argument(
         "--no-show",
@@ -96,10 +140,37 @@ def flatten_similarity(values: torch.Tensor) -> torch.Tensor:
     return values.detach().reshape(-1).to(torch.float32).cpu()
 
 
+def _pairwise_metric(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    metric: str,
+    temp: float | None = None,
+) -> torch.Tensor:
+    kwargs = {"metric": metric}
+    if temp is not None:
+        kwargs["temp"] = temp
+    return pairwise_similarity(lhs, rhs, **kwargs)
+
+
+def compute_initial_aggregation_patterns(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    aggregation_metric: str,
+    temp: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    lhs_patterns = _pairwise_metric(lhs, rhs, metric=aggregation_metric, temp=temp)
+    rhs_patterns = _pairwise_metric(rhs, rhs, metric=aggregation_metric, temp=temp)
+    return lhs_patterns, rhs_patterns
+
+
 def collect_metric_distributions(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
     temps: List[float],
+    plot_space: str,
+    aggregation_metric: str,
 ) -> Dict[str, Dict[str, torch.Tensor]]:
     distributions: Dict[str, Dict[str, torch.Tensor]] = {}
 
@@ -107,10 +178,27 @@ def collect_metric_distributions(
         metric_runs: Dict[str, torch.Tensor] = {}
         if metric in TEMPERATURE_METRICS:
             for temp in temps:
-                values = pairwise_similarity(lhs, rhs, metric=metric, temp=temp)
+                if plot_space == "aggregation":
+                    values = _pairwise_metric(lhs, rhs, metric=metric, temp=temp)
+                else:
+                    lhs_patterns, rhs_patterns = compute_initial_aggregation_patterns(
+                        lhs,
+                        rhs,
+                        aggregation_metric=aggregation_metric,
+                        temp=temp if aggregation_metric in TEMPERATURE_METRICS else None,
+                    )
+                    values = _pairwise_metric(lhs_patterns, rhs_patterns, metric=metric, temp=temp)
                 metric_runs[f"T={temp:g}"] = flatten_similarity(values)
         else:
-            values = pairwise_similarity(lhs, rhs, metric=metric)
+            if plot_space == "aggregation":
+                values = _pairwise_metric(lhs, rhs, metric=metric)
+            else:
+                lhs_patterns, rhs_patterns = compute_initial_aggregation_patterns(
+                    lhs,
+                    rhs,
+                    aggregation_metric=aggregation_metric,
+                )
+                values = _pairwise_metric(lhs_patterns, rhs_patterns, metric=metric)
             metric_runs["default"] = flatten_similarity(values)
         distributions[metric] = metric_runs
 
@@ -123,6 +211,8 @@ def plot_metric_distribution(
     runs: Dict[str, torch.Tensor],
     bins: int,
     sig_dim: int,
+    plot_space: str,
+    aggregation_metric: str,
 ):
     for label, values in runs.items():
         ax.hist(
@@ -136,7 +226,6 @@ def plot_metric_distribution(
         )
 
     ax.set_title(metric)
-    ax.set_xlabel("Similarity")
     ax.set_ylabel("Density")
     ax.set_xlim(0.0, 1.0)
     ax.set_yscale("log")
@@ -169,6 +258,8 @@ def save_combined_metric_figure(
     bins: int,
     sig_dim: int,
     show: bool,
+    plot_space: str,
+    aggregation_metric: str,
 ):
     num_metrics = len(distributions)
     cols = 3
@@ -187,11 +278,23 @@ def save_combined_metric_figure(
             runs=runs,
             bins=bins,
             sig_dim=sig_dim,
+            plot_space=plot_space,
+            aggregation_metric=aggregation_metric,
         )
 
-    fig.suptitle("Signature similarity metric distributions at random initialization", fontsize=15)
+    if plot_space == "identity":
+        title = (
+            "Identity similarity distributions at random initialization "
+            f"(aggregation patterns induced with {aggregation_metric})"
+        )
+        filename = f"identity_metric_distributions_from_{aggregation_metric}.png"
+    else:
+        title = "Aggregation similarity metric distributions at random initialization"
+        filename = "signature_metric_distributions.png"
+
+    fig.suptitle(title, fontsize=15)
     fig.tight_layout(rect=(0, 0, 1, 0.98))
-    output_path = output_dir / "signature_metric_distributions.png"
+    output_path = output_dir / filename
     fig.savefig(output_path, dpi=180)
 
     if show:
@@ -213,7 +316,13 @@ def main():
         device=args.device,
         seed=args.seed,
     )
-    distributions = collect_metric_distributions(lhs, rhs, args.temps)
+    distributions = collect_metric_distributions(
+        lhs,
+        rhs,
+        args.temps,
+        plot_space=args.plot_space,
+        aggregation_metric=args.aggregation_metric,
+    )
 
     output_path = save_combined_metric_figure(
         distributions=distributions,
@@ -221,6 +330,8 @@ def main():
         bins=args.bins,
         sig_dim=args.sig_dim,
         show=not args.no_show,
+        plot_space=args.plot_space,
+        aggregation_metric=args.aggregation_metric,
     )
 
     print(f"Saved combined plot to {output_path.resolve()}")

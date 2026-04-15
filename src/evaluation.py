@@ -126,17 +126,20 @@ def _compute_signature_set_distance_metrics(
 
 
 def _foreground_resolved_signature_embeddings(prediction: ResolvedPrediction) -> torch.Tensor:
-    signature_embeddings = prediction.signature_embeddings
-    if signature_embeddings.shape[0] == 0:
-        return signature_embeddings
+    if prediction.aggregation_patterns is not None:
+        identity_embeddings = prediction.aggregation_patterns
+    else:
+        identity_embeddings = prediction.signature_embeddings
+    if identity_embeddings.shape[0] == 0:
+        return identity_embeddings
 
-    if len(prediction.resolved_labels) != signature_embeddings.shape[0]:
+    if len(prediction.resolved_labels) != identity_embeddings.shape[0]:
         raise ValueError(
-            "Resolved prediction signatures and labels must stay aligned after filtering."
+            "Resolved prediction identity embeddings and labels must stay aligned after filtering."
         )
 
-    keep = torch.as_tensor(prediction.resolved_labels, dtype=torch.long, device=signature_embeddings.device) != 0
-    return signature_embeddings[keep]
+    keep = torch.as_tensor(prediction.resolved_labels, dtype=torch.long, device=identity_embeddings.device) != 0
+    return identity_embeddings[keep]
 
 
 def hungarian_match_instances(
@@ -450,7 +453,7 @@ def _evaluate_prediction_set(
     golden_query_evaluation = None
 
     gt_prediction = prediction_set.gt_signatures
-    gt_signatures = None if gt_prediction is None else gt_prediction.all_signature_embeddings
+    gt_signatures = None if gt_prediction is None else gt_prediction.all_identity_embeddings
 
     clustering_evaluation = evaluate_image(
         prediction_set.clustering,

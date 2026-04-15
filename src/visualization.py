@@ -485,15 +485,15 @@ def _draw_signature_umap(
     row_state: Optional[_RowInteractionState] = None,
 ):
     flat: Optional[FlatQueryOutputs] = prediction.flat_queries
-    q_sig = None if flat is None else flat.signature_embeddings
+    q_sig = None if flat is None else flat.aggregation_patterns
     q_seed = None if flat is None else flat.seed_scores
     q_influence = None if flat is None else flat.influence_scores
-    gt_sig = prediction.all_signature_embeddings
+    gt_sig = prediction.all_identity_embeddings
 
     if q_sig is None or gt_sig is None:
         ax.set_title(title)
         ax.axis("off")
-        ax.text(0.5, 0.5, "No signatures", ha="center", va="center", fontsize=11, transform=ax.transAxes)
+        ax.text(0.5, 0.5, "No identity patterns", ha="center", va="center", fontsize=11, transform=ax.transAxes)
         return
 
     q_sig_np = q_sig.detach().cpu().numpy()

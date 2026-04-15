@@ -419,6 +419,22 @@ class CustomMask2Former(Mask2FormerBase):
             clamp=clamp,
         )
 
+    def compute_aggregation_patterns(
+        self,
+        query_signatures: torch.Tensor,
+        prototype_signatures: torch.Tensor,
+        *,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        patterns = self.aggregation_similarity(
+            query_signatures,
+            prototype_signatures,
+            clamp=True,
+        )
+        if valid_mask is not None:
+            patterns = patterns.masked_fill(~valid_mask.unsqueeze(-2), 0.0)
+        return patterns.transpose(-1, -2)
+
     def encode_gts(self, memory, features, masks, labels, pad_mask, ttt_steps_override: Optional[int] = None):
         B_val, M_max = masks.shape[:2]
         _, C, Hf, Wf = features.shape
