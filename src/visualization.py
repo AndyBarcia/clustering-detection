@@ -818,7 +818,11 @@ def render_prediction_grid(
     interactive: bool = False,
 ):
     num_samples = len(images)
-    add_signature_column = any("GT Prototype" in title for title, _ in prediction_columns)
+    gt_signature_prediction_column_idx = next(
+        (idx for idx, (title, _) in enumerate(prediction_columns) if "GT Prototype" in title),
+        None,
+    )
+    add_signature_column = gt_signature_prediction_column_idx is not None
     num_cols = 2 + len(prediction_columns) + int(add_signature_column)
     fig, axes = plt.subplots(num_samples, num_cols, figsize=(5 * num_cols, 5 * max(num_samples, 1)), squeeze=False)
     row_states: List[_RowInteractionState] = []
@@ -851,7 +855,8 @@ def render_prediction_grid(
         row_state.axis_instances[axes[row_idx, 1]] = gt_instances
 
         next_col_idx = 2
-        for column_title, predictions in prediction_columns:
+        gt_signature_prediction = None
+        for column_idx, (column_title, predictions) in enumerate(prediction_columns):
             prediction = predictions[row_idx]
             pred_masks = [mask.detach().cpu().numpy() for mask in prediction.resolved_masks]
             pred_labels = [int(label) for label in prediction.resolved_labels]
@@ -874,7 +879,7 @@ def render_prediction_grid(
                 kind="prediction",
             )
             row_state.axis_instances[pred_axis] = pred_instances
-            if add_signature_column and "GT Prototype" in column_title:
+            if column_idx == gt_signature_prediction_column_idx:
                 row_state.prediction_panel = _PredictionPanelState(
                     axis=pred_axis,
                     image_np=image_np,
@@ -883,20 +888,20 @@ def render_prediction_grid(
                     class_names=class_names,
                     title=column_title,
                 )
+                gt_signature_prediction = prediction
             next_col_idx += 1
 
-            if add_signature_column and "GT Prototype" in column_title:
-                _draw_signature_umap(
-                    axes[row_idx, next_col_idx],
-                    image_np,
-                    target,
-                    prediction,
-                    identity_similarity_metric=identity_similarity_metric,
-                    class_names=class_names,
-                    title="GT Signature UMAP",
-                    row_state=row_state,
-                )
-                next_col_idx += 1
+        if add_signature_column and gt_signature_prediction is not None:
+            _draw_signature_umap(
+                axes[row_idx, next_col_idx],
+                image_np,
+                target,
+                gt_signature_prediction,
+                identity_similarity_metric=identity_similarity_metric,
+                class_names=class_names,
+                title="GT Signature UMAP",
+                row_state=row_state,
+            )
 
         if interactive:
             _clear_selection(row_state)
