@@ -22,7 +22,7 @@ except ImportError:
 
 from .dataset import SyntheticPanopticBatchGenerator
 from .mask_aggregation import project_mask_embeddings
-from .outputs import FlatQueryOutputs, ResolvedPrediction
+from .outputs import EvaluationPredictionSet, FlatQueryOutputs, ResolvedPrediction
 from .panoptic import PanopticSystem
 from .signature_ops import pairwise_distance
 
@@ -778,6 +778,35 @@ def run_predictions_with_gt_prototypes(
     return [predictions]
 
 
+@torch.no_grad()
+def run_evaluation_view_predictions(
+    system: PanopticSystem,
+    images: Sequence[torch.Tensor],
+    targets: Sequence[dict],
+    *,
+    device: Optional[torch.device] = None,
+) -> List[EvaluationPredictionSet]:
+    if len(images) == 0:
+        return []
+
+    model_device = device
+    if model_device is None:
+        model_device = next(system.parameters()).device
+
+    batch = torch.stack(list(images)).to(model_device)
+    was_training = system.training
+    system.eval()
+    try:
+        raw = system.model(batch)
+        predictions = system.predictor.predict_evaluation_views_from_raw(system.model, raw, targets)
+    finally:
+        system.train(was_training)
+
+    if isinstance(predictions, list):
+        return predictions
+    return [predictions]
+
+
 def render_prediction_grid(
     images: Sequence[torch.Tensor],
     targets: Sequence[dict],
@@ -938,6 +967,7 @@ def save_prediction_grid(
     predictions: Sequence[dict],
     *,
     gt_proto_predictions: Optional[Sequence[dict]] = None,
+    golden_predictions: Optional[Sequence[dict]] = None,
     class_names: Optional[Sequence[str]] = None,
     figure_title: Optional[str] = None,
 ):
@@ -946,6 +976,8 @@ def save_prediction_grid(
     prediction_columns = [("Clustered Prediction", predictions)]
     if gt_proto_predictions is not None:
         prediction_columns.append(("GT Prototype Prediction", gt_proto_predictions))
+    if golden_predictions is not None:
+        prediction_columns.append(("Golden Prediction", golden_predictions))
     fig = render_prediction_grid(
         images,
         targets,
@@ -965,6 +997,7 @@ def show_prediction_grid(
     predictions: Sequence[dict],
     *,
     gt_proto_predictions: Optional[Sequence[dict]] = None,
+    golden_predictions: Optional[Sequence[dict]] = None,
     class_names: Optional[Sequence[str]] = None,
     figure_title: Optional[str] = None,
     window_title: Optional[str] = None,
@@ -972,6 +1005,8 @@ def show_prediction_grid(
     prediction_columns = [("Clustered Prediction", predictions)]
     if gt_proto_predictions is not None:
         prediction_columns.append(("GT Prototype Prediction", gt_proto_predictions))
+    if golden_predictions is not None:
+        prediction_columns.append(("Golden Prediction", golden_predictions))
     fig = render_prediction_grid(
         images,
         targets,

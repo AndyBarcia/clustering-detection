@@ -16,8 +16,8 @@ from src.evaluation import evaluate_system, format_metrics_table
 from src.panoptic import PanopticSystem, load_system_checkpoint, save_system_checkpoint
 from src.visualization import (
     DEFAULT_CLASS_NAMES,
+    run_evaluation_view_predictions,
     run_predictions,
-    run_predictions_with_gt_prototypes,
     sample_synthetic_examples,
     save_prediction_grid,
 )
@@ -192,10 +192,15 @@ def save_epoch_visualization(output_dir: Path, system: PanopticSystem, images, t
     if len(images) == 0:
         return None
 
-    predictions = run_predictions(system, images)
     gt_proto_predictions = None
+    golden_predictions = None
     if system.supports_gt_prototypes:
-        gt_proto_predictions = run_predictions_with_gt_prototypes(system, images, targets)
+        eval_predictions = run_evaluation_view_predictions(system, images, targets)
+        predictions = [prediction_set.clustering for prediction_set in eval_predictions]
+        gt_proto_predictions = [prediction_set.gt_signatures for prediction_set in eval_predictions]
+        golden_predictions = [prediction_set.golden_queries for prediction_set in eval_predictions]
+    else:
+        predictions = run_predictions(system, images)
     path = output_dir / f"predictions_epoch_{epoch:03d}.png"
     save_prediction_grid(
         path,
@@ -203,6 +208,7 @@ def save_epoch_visualization(output_dir: Path, system: PanopticSystem, images, t
         targets,
         predictions,
         gt_proto_predictions=gt_proto_predictions,
+        golden_predictions=golden_predictions,
         class_names=DEFAULT_CLASS_NAMES,
         figure_title=f"Epoch {epoch} predictions",
     )

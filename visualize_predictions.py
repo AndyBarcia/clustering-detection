@@ -9,8 +9,8 @@ import torch
 from src.panoptic import load_system_checkpoint
 from src.visualization import (
     DEFAULT_CLASS_NAMES,
+    run_evaluation_view_predictions,
     run_predictions,
-    run_predictions_with_gt_prototypes,
     sample_synthetic_examples,
     save_prediction_grid,
     show_prediction_grid,
@@ -43,10 +43,15 @@ def main():
         max_objects=args.max_objects,
         seed=args.seed,
     )
-    predictions = run_predictions(system, images)
     gt_proto_predictions = None
+    golden_predictions = None
     if system.supports_gt_prototypes:
-        gt_proto_predictions = run_predictions_with_gt_prototypes(system, images, targets)
+        eval_predictions = run_evaluation_view_predictions(system, images, targets)
+        predictions = [prediction_set.clustering for prediction_set in eval_predictions]
+        gt_proto_predictions = [prediction_set.gt_signatures for prediction_set in eval_predictions]
+        golden_predictions = [prediction_set.golden_queries for prediction_set in eval_predictions]
+    else:
+        predictions = run_predictions(system, images)
 
     figure_title = f"Checkpoint preview: {args.checkpoint}"
     if args.save_path:
@@ -56,6 +61,7 @@ def main():
             targets,
             predictions,
             gt_proto_predictions=gt_proto_predictions,
+            golden_predictions=golden_predictions,
             class_names=DEFAULT_CLASS_NAMES,
             figure_title=figure_title,
         )
@@ -66,6 +72,7 @@ def main():
             targets,
             predictions,
             gt_proto_predictions=gt_proto_predictions,
+            golden_predictions=golden_predictions,
             class_names=DEFAULT_CLASS_NAMES,
             figure_title=figure_title,
             window_title="Synthetic Prediction Viewer",
