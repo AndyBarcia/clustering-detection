@@ -178,14 +178,19 @@ class TTTTransformerDecoder(nn.Module):
         weights = logits.softmax(dim=0)
         return torch.einsum("dbq,dbqc->bqc", weights, history_stack)
 
-    def forward(self, tgt, memory, **kwargs):
+    def forward(self, tgt, memory, memory_mask_fn=None, **kwargs):
         output = tgt
         history = [tgt]
         ttt_output = []
         
         for layer_idx, mod in enumerate(self.layers):
             layer_input = self._depth_attention_residual(history, layer_idx)
-            output, intermediate_ttt_q = mod(layer_input, memory, **kwargs)
+            layer_kwargs = dict(kwargs)
+            if memory_mask_fn is not None:
+                dynamic_memory_mask = memory_mask_fn(layer_input, layer_idx)
+                if dynamic_memory_mask is not None:
+                    layer_kwargs["memory_mask"] = dynamic_memory_mask
+            output, intermediate_ttt_q = mod(layer_input, memory, **layer_kwargs)
             history.append(output)
             ttt_output.append(intermediate_ttt_q)
 
@@ -271,15 +276,26 @@ class Mask2FormerBase(nn.Module):
         memory = memory + self.spatial_pos_embed[:, :memory.shape[1], :]
         return features, memory
 
-    def _decode_queries(self, memory, query_embed=None, ttt_steps_override: Optional[int] = None):
+    def _predict_mask_logits(self, q: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        mask_embs = self.mask_head(q)
+        return torch.einsum("bqc,bchw->bqhw", mask_embs, features)
+
+    def _decoder_memory_mask(self, query_state: torch.Tensor, features: torch.Tensor):
+        return None
+
+    def _decode_queries(self, memory, features, query_embed=None, ttt_steps_override: Optional[int] = None):
         B = memory.shape[0]
         if query_embed is None:
             query_embed = self.queries.weight.unsqueeze(0).repeat(B, 1, 1)
+
+        def memory_mask_fn(query_state, _layer_idx):
+            return self._decoder_memory_mask(query_state, features)
 
         with self._temporary_ttt_steps(ttt_steps_override):
             q_dec_all, intermediate_ttt_q = self.transformer_decoder(
                 tgt=query_embed,
                 memory=memory,
+                memory_mask_fn=memory_mask_fn,
                 seed_head=self._decoder_seed_head(),
             )
         return q_dec_all, intermediate_ttt_q
@@ -293,7 +309,11 @@ class Mask2FormerBase(nn.Module):
         H_img, W_img = images.shape[-2:]
 
         features, memory = self._build_memory(images)
-        q_dec_all, intermediate_ttt_q = self._decode_queries(memory, ttt_steps_override=ttt_steps_override)
+        q_dec_all, intermediate_ttt_q = self._decode_queries(
+            memory,
+            features,
+            ttt_steps_override=ttt_steps_override,
+        )
 
         mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds = self._run_heads(q_dec_all)
 
@@ -357,6 +377,15 @@ class CustomMask2Former(Mask2FormerBase):
 
     def _decoder_seed_head(self):
         return self.seed_head
+
+    def _decoder_memory_mask(self, query_state: torch.Tensor, features: torch.Tensor):
+        mask_logits = self._predict_mask_logits(query_state, features)
+        mask_bias = mask_logits.flatten(2)
+        mask_bias = mask_bias - mask_bias.mean(dim=-1, keepdim=True)
+        mask_bias = mask_bias / mask_bias.std(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        num_heads = self.transformer_decoder.layers[0].multihead_attn.num_heads
+        return mask_bias.repeat_interleave(num_heads, dim=0)
 
     def prepare_signature_embeddings(self, signatures: torch.Tensor) -> torch.Tensor:
         if not self.signature_normalize or signatures.shape[-1] == 0:
@@ -433,7 +462,8 @@ class CustomMask2Former(Mask2FormerBase):
         attn_mask = masks_small.flatten(2) < 0.5
         all_masked = attn_mask.all(dim=2, keepdim=True)
         attn_mask = attn_mask.masked_fill(all_masked, False)
-        attn_mask_rep = attn_mask.repeat_interleave(4, dim=0)
+        num_heads = self.transformer_decoder.layers[0].multihead_attn.num_heads
+        attn_mask_rep = attn_mask.repeat_interleave(num_heads, dim=0)
 
         with self._temporary_ttt_steps(ttt_steps_override):
             q_gt_all, _ = self.transformer_decoder(
