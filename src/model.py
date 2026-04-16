@@ -272,8 +272,10 @@ class Mask2FormerBase(nn.Module):
     def _build_memory(self, images):
         features = self.backbone(images)
         B, C, H_f, W_f = features.shape
+        pos_tokens = self.spatial_pos_embed[:, :H_f * W_f, :]
+        pos_features = pos_tokens.permute(0, 2, 1).reshape(1, C, H_f, W_f)
+        features = features + pos_features
         memory = features.view(B, C, -1).permute(0, 2, 1)
-        memory = memory + self.spatial_pos_embed[:, :memory.shape[1], :]
         return features, memory
 
     def _predict_mask_logits(self, q: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
@@ -364,10 +366,15 @@ class CustomMask2Former(Mask2FormerBase):
         )
 
         self.gt_cls_embed = nn.Embedding(num_classes, hidden_dim)
-        self.gt_query_proj = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+        self.gt_bbox_proj = nn.Sequential(
+            nn.Linear(4, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.gt_query_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 1, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, sig_dim),
         )
 
         if cfg.learned_alpha:
@@ -456,9 +463,37 @@ class CustomMask2Former(Mask2FormerBase):
         denom = masks_small.flatten(2).sum(dim=2, keepdim=True).clamp_min(1e-6)
         pooled_feat = torch.einsum("bmhw,bchw->bmc", masks_small, features) / denom
 
-        cls_emb = self.gt_cls_embed(labels)
-        query_init = self.gt_query_proj(torch.cat([pooled_feat, cls_emb], dim=-1))
+        ys = torch.linspace(0.0, 1.0, Hf, device=features.device, dtype=features.dtype).view(1, 1, Hf, 1)
+        xs = torch.linspace(0.0, 1.0, Wf, device=features.device, dtype=features.dtype).view(1, 1, 1, Wf)
+        cx = (masks_small * xs).flatten(2).sum(dim=2, keepdim=True) / denom
+        cy = (masks_small * ys).flatten(2).sum(dim=2, keepdim=True) / denom
 
+        binary_masks = masks_small >= 0.5
+        cols = binary_masks.any(dim=2)
+        rows = binary_masks.any(dim=3)
+        x_min = cols.float().argmax(dim=2)
+        x_max = (Wf - 1) - cols.flip(2).float().argmax(dim=2)
+        y_min = rows.float().argmax(dim=2)
+        y_max = (Hf - 1) - rows.flip(2).float().argmax(dim=2)
+        valid_boxes = pad_mask & binary_masks.flatten(2).any(dim=2)
+
+        width = torch.where(valid_boxes, (x_max - x_min + 1).to(features.dtype), torch.zeros_like(cx.squeeze(-1)))
+        height = torch.where(valid_boxes, (y_max - y_min + 1).to(features.dtype), torch.zeros_like(cy.squeeze(-1)))
+        bbox_features = torch.stack(
+            [
+                cx.squeeze(-1),
+                cy.squeeze(-1),
+                width / float(Wf),
+                height / float(Hf),
+            ],
+            dim=-1,
+        )
+
+        cls_emb = self.gt_cls_embed(labels)
+        bbox_emb = self.gt_bbox_proj(bbox_features)
+        query_init = self.gt_query_proj(torch.cat([bbox_emb], dim=-1))
+
+        """
         attn_mask = masks_small.flatten(2) < 0.5
         all_masked = attn_mask.all(dim=2, keepdim=True)
         attn_mask = attn_mask.masked_fill(all_masked, False)
@@ -476,6 +511,8 @@ class CustomMask2Former(Mask2FormerBase):
 
         sig = self.sig_head(q_gt)
         return self.prepare_signature_embeddings(sig)
+        """
+        return self.prepare_signature_embeddings(query_init)
 
     def _run_heads(self, q):
         mask_embs = self.mask_head(q)

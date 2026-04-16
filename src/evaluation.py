@@ -8,6 +8,8 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 from .dataset import SyntheticPanopticBatchGenerator, BatchedSyntheticIterableDataset
@@ -29,6 +31,21 @@ class ImageEvaluation:
     signature_count_gt: int | None = None
     signature_chamfer_distance: float | None = None
     signature_hausdorff_distance: float | None = None
+
+
+class _ProbeMLP(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 def _stack_masks(masks: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -422,14 +439,17 @@ def _build_summary_payload(
     clustering_summary: Dict[str, float],
     gt_signature_summary: Dict[str, float] | None,
     golden_query_summary: Dict[str, float] | None,
+    signature_probe_summary: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     return {
         "clustering": clustering_summary,
         "gt_signatures": gt_signature_summary,
         "golden_queries": golden_query_summary,
+        "signature_probes": signature_probe_summary,
         "available_evaluations": [
             name
             for name, metrics in (
+                ("signature_probes", signature_probe_summary),
                 ("gt_signatures", gt_signature_summary),
                 ("golden_queries", golden_query_summary),
                 ("clustering", clustering_summary),
@@ -560,6 +580,7 @@ def evaluate_system(
     gt_signature_evaluations: List[ImageEvaluation] | None = [] if system.supports_gt_prototypes else None
     golden_query_evaluations: List[ImageEvaluation] | None = [] if system.supports_gt_prototypes else None
     object_counts: List[int] = []
+    signature_probe_records: list[dict[str, Any]] = []
 
     try:
         for batch, targets in dataset:
@@ -569,7 +590,15 @@ def evaluate_system(
                 system.predictor.predict_evaluation_views_from_raw(system.model, raw, targets)
             )
 
-            for prediction_set, target in zip(prediction_sets, targets):
+            for batch_index, (prediction_set, target) in enumerate(zip(prediction_sets, targets)):
+                signature_probe_records.extend(
+                    _extract_signature_probe_records(
+                        prediction_set,
+                        batch[batch_index],
+                        target,
+                        batch_device=batch.device,
+                    )
+                )
                 clustering_eval, gt_eval, golden_eval = _evaluate_prediction_set(
                     prediction_set,
                     target,
@@ -592,6 +621,7 @@ def evaluate_system(
         summarize_evaluations(clustering_evaluations),
         None if gt_signature_evaluations is None else summarize_evaluations(gt_signature_evaluations),
         None if golden_query_evaluations is None else summarize_evaluations(golden_query_evaluations),
+        _evaluate_signature_probe_summary(signature_probe_records, device=torch.device(device)),
     )
     by_count = _summarize_grouped_evaluations(
         clustering_evaluations,
@@ -736,6 +766,230 @@ def _format_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
     return "\n".join(lines)
 
 
+def _extract_signature_probe_records(
+    prediction_set: EvaluationPredictionSet,
+    image: torch.Tensor,
+    target: Dict[str, Any],
+    *,
+    batch_device: torch.device,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if prediction_set.gt_signatures is None:
+        return records
+
+    height = image.shape[-2]
+    width = image.shape[-1]
+    labels = target["labels"].to(batch_device)
+    masks = target["masks"].to(batch_device).float()
+    boxes = target["boxes"].to(batch_device).float()
+    signatures = prediction_set.gt_signatures.all_signature_embeddings.to(batch_device)
+
+    if signatures.shape[0] <= 1:
+        return records
+
+    fg_signatures = signatures[1:]
+    fg_labels = labels[1:]
+    fg_masks = masks[1:]
+    fg_boxes = boxes[1:]
+    fg_count = int(fg_labels.shape[0])
+
+    areas = fg_masks.flatten(1).sum(dim=1)
+    centers_x = (fg_boxes[:, 0] + fg_boxes[:, 2]) * 0.5
+    centers_y = (fg_boxes[:, 1] + fg_boxes[:, 3]) * 0.5
+    size_scalar = torch.sqrt(areas / float(height * width)).unsqueeze(-1)
+    position_xy = torch.stack(
+        [centers_x / float(width - 1), centers_y / float(height - 1)],
+        dim=-1,
+    )
+    color_mean = (
+        torch.einsum("nhw,chw->nc", fg_masks, image)
+        / areas.unsqueeze(-1).clamp_min(1e-6)
+    )
+
+    for obj_idx in range(fg_signatures.shape[0]):
+        records.append(
+            {
+                "signature": fg_signatures[obj_idx].detach().cpu(),
+                "size": size_scalar[obj_idx].detach().cpu(),
+                "position": position_xy[obj_idx].detach().cpu(),
+                "color": color_mean[obj_idx].detach().cpu(),
+                "class": fg_labels[obj_idx].detach().cpu(),
+                "object_count": fg_count,
+            }
+        )
+
+    return records
+
+
+def _train_probe_regressor(
+    train_x: torch.Tensor,
+    train_y: torch.Tensor,
+    val_x: torch.Tensor,
+    val_y: torch.Tensor,
+    *,
+    device: torch.device,
+    epochs: int = 40,
+    batch_size: int = 256,
+) -> tuple[_ProbeMLP, torch.Tensor, torch.Tensor]:
+    mean = train_y.mean(dim=0, keepdim=True)
+    std = train_y.std(dim=0, keepdim=True).clamp_min(1e-6)
+    train_y_norm = (train_y - mean) / std
+    val_y_norm = (val_y - mean) / std
+
+    model = _ProbeMLP(train_x.shape[1], train_y.shape[1]).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    best_state = None
+    best_val = math.inf
+
+    for _ in range(epochs):
+        perm = torch.randperm(train_x.shape[0])
+        for start in range(0, train_x.shape[0], batch_size):
+            idx = perm[start:start + batch_size]
+            batch_x = train_x[idx].to(device)
+            batch_y = train_y_norm[idx].to(device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = F.mse_loss(model(batch_x), batch_y)
+            loss.backward()
+            optimizer.step()
+
+        with torch.no_grad():
+            pred = model(val_x.to(device))
+            val_loss = float(F.mse_loss(pred, val_y_norm.to(device)).item())
+        if val_loss < best_val:
+            best_val = val_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    model.load_state_dict(best_state)
+    return model, mean, std
+
+
+def _train_probe_classifier(
+    train_x: torch.Tensor,
+    train_y: torch.Tensor,
+    val_x: torch.Tensor,
+    val_y: torch.Tensor,
+    *,
+    num_classes: int,
+    device: torch.device,
+    epochs: int = 40,
+    batch_size: int = 256,
+) -> _ProbeMLP:
+    model = _ProbeMLP(train_x.shape[1], num_classes).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    best_state = None
+    best_val = math.inf
+
+    for _ in range(epochs):
+        perm = torch.randperm(train_x.shape[0])
+        for start in range(0, train_x.shape[0], batch_size):
+            idx = perm[start:start + batch_size]
+            batch_x = train_x[idx].to(device)
+            batch_y = train_y[idx].to(device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = F.cross_entropy(model(batch_x), batch_y)
+            loss.backward()
+            optimizer.step()
+
+        with torch.no_grad():
+            val_loss = float(F.cross_entropy(model(val_x.to(device)), val_y.to(device)).item())
+        if val_loss < best_val:
+            best_val = val_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    model.load_state_dict(best_state)
+    return model
+
+
+def _regression_r2(pred: torch.Tensor, target: torch.Tensor) -> list[float]:
+    target_mean = target.mean(dim=0, keepdim=True)
+    ss_res = ((target - pred) ** 2).sum(dim=0)
+    ss_tot = ((target - target_mean) ** 2).sum(dim=0).clamp_min(1e-12)
+    return (1.0 - (ss_res / ss_tot)).tolist()
+
+
+def _evaluate_signature_probe_summary(
+    records: list[dict[str, Any]],
+    *,
+    device: torch.device,
+) -> dict[str, Any] | None:
+    if len(records) < 32:
+        return None
+
+    signatures = torch.stack([record["signature"] for record in records], dim=0)
+    size = torch.stack([record["size"] for record in records], dim=0)
+    position = torch.stack([record["position"] for record in records], dim=0)
+    color = torch.stack([record["color"] for record in records], dim=0)
+    labels = torch.stack([record["class"] for record in records], dim=0).long()
+    object_counts = torch.tensor([int(record["object_count"]) for record in records], dtype=torch.long)
+
+    perm = torch.randperm(signatures.shape[0])
+    train_end = int(0.7 * signatures.shape[0])
+    val_end = int(0.85 * signatures.shape[0])
+    train_idx = perm[:train_end]
+    val_idx = perm[train_end:val_end]
+    test_idx = perm[val_end:]
+    if train_idx.numel() == 0 or val_idx.numel() == 0 or test_idx.numel() == 0:
+        return None
+
+    train_x = signatures[train_idx]
+    val_x = signatures[val_idx]
+    test_x = signatures[test_idx]
+
+    with torch.enable_grad():
+        size_model, size_mean, size_std = _train_probe_regressor(
+            train_x, size[train_idx], val_x, size[val_idx], device=device
+        )
+        pos_model, pos_mean, pos_std = _train_probe_regressor(
+            train_x, position[train_idx], val_x, position[val_idx], device=device
+        )
+        color_model, color_mean, color_std = _train_probe_regressor(
+            train_x, color[train_idx], val_x, color[val_idx], device=device
+        )
+        cls_model = _train_probe_classifier(
+            train_x,
+            labels[train_idx],
+            val_x,
+            labels[val_idx],
+            num_classes=int(labels.max().item()) + 1,
+            device=device,
+        )
+
+    with torch.no_grad():
+        size_pred = size_model(test_x.to(device)).cpu() * size_std + size_mean
+        pos_pred = pos_model(test_x.to(device)).cpu() * pos_std + pos_mean
+        color_pred = color_model(test_x.to(device)).cpu() * color_std + color_mean
+        cls_pred = cls_model(test_x.to(device)).cpu().argmax(dim=-1)
+
+    per_count: dict[int, dict[str, float]] = {}
+    test_counts = object_counts[test_idx]
+    for count in sorted(int(v) for v in test_counts.unique().tolist()):
+        idx = torch.nonzero(test_counts == count, as_tuple=False).squeeze(1)
+        per_count[count] = {
+            "num_samples": int(idx.numel()),
+            "size_r2": _regression_r2(size_pred[idx], size[test_idx][idx])[0],
+            "pos_r2_x": _regression_r2(pos_pred[idx], position[test_idx][idx])[0],
+            "pos_r2_y": _regression_r2(pos_pred[idx], position[test_idx][idx])[1],
+            "color_r2_r": _regression_r2(color_pred[idx], color[test_idx][idx])[0],
+            "color_r2_g": _regression_r2(color_pred[idx], color[test_idx][idx])[1],
+            "color_r2_b": _regression_r2(color_pred[idx], color[test_idx][idx])[2],
+            "class_acc": float((cls_pred[idx] == labels[test_idx][idx]).float().mean().item()),
+        }
+
+    return {
+        "num_train": int(train_idx.numel()),
+        "num_val": int(val_idx.numel()),
+        "num_test": int(test_idx.numel()),
+        "size_r2": _regression_r2(size_pred, size[test_idx])[0],
+        "pos_r2_x": _regression_r2(pos_pred, position[test_idx])[0],
+        "pos_r2_y": _regression_r2(pos_pred, position[test_idx])[1],
+        "color_r2_r": _regression_r2(color_pred, color[test_idx])[0],
+        "color_r2_g": _regression_r2(color_pred, color[test_idx])[1],
+        "color_r2_b": _regression_r2(color_pred, color[test_idx])[2],
+        "class_acc": float((cls_pred == labels[test_idx]).float().mean().item()),
+        "by_count": per_count,
+    }
+
+
 def _append_overall_row(
     rows: List[List[str]],
     metrics: Dict[str, Any],
@@ -870,5 +1124,48 @@ def format_metrics_table(
 
         _append_overall_row(rows, overall_metrics, value_columns=value_columns)
         sections.append(title + "\n" + _format_table(headers, rows))
+
+    probe_metrics = overall.get("signature_probes")
+    if probe_metrics is not None:
+        headers = [
+            "obj.",
+            "n",
+            "size_r2",
+            "pos_r2_x",
+            "pos_r2_y",
+            "color_r2_r",
+            "color_r2_g",
+            "color_r2_b",
+            "class_acc",
+        ]
+        rows: List[List[str]] = []
+        for object_count, metrics in sorted(probe_metrics.get("by_count", {}).items()):
+            rows.append(
+                [
+                    str(object_count),
+                    str(metrics["num_samples"]),
+                    _format_float(metrics.get("size_r2")),
+                    _format_float(metrics.get("pos_r2_x")),
+                    _format_float(metrics.get("pos_r2_y")),
+                    _format_float(metrics.get("color_r2_r")),
+                    _format_float(metrics.get("color_r2_g")),
+                    _format_float(metrics.get("color_r2_b")),
+                    _format_float(metrics.get("class_acc")),
+                ]
+            )
+        rows.append(
+            [
+                "all",
+                str(probe_metrics["num_test"]),
+                _format_float(probe_metrics.get("size_r2")),
+                _format_float(probe_metrics.get("pos_r2_x")),
+                _format_float(probe_metrics.get("pos_r2_y")),
+                _format_float(probe_metrics.get("color_r2_r")),
+                _format_float(probe_metrics.get("color_r2_g")),
+                _format_float(probe_metrics.get("color_r2_b")),
+                _format_float(probe_metrics.get("class_acc")),
+            ]
+        )
+        sections.append("Signature probes by object count\n" + _format_table(headers, rows))
 
     return "\n\n".join(sections)

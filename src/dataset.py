@@ -55,11 +55,13 @@ class SyntheticPanopticBatchGenerator:
         height=256,
         width=256,
         max_objects=10,
+        palette_size=4,
         device="cuda",
     ):
         self.height = height
         self.width = width
         self.max_objects = max_objects
+        self.palette_size = int(palette_size)
         self.device = torch.device(
             device if (device == "cpu" or torch.cuda.is_available()) else "cpu"
         )
@@ -70,6 +72,8 @@ class SyntheticPanopticBatchGenerator:
         self.min_size = 10
         self.max_size = 40
 
+        if self.palette_size <= 0:
+            raise ValueError("palette_size must be > 0.")
         if self.width <= 2 * self.margin or self.height <= 2 * self.margin:
             raise ValueError("height/width are too small for margin=20.")
 
@@ -80,6 +84,20 @@ class SyntheticPanopticBatchGenerator:
         self.xx = torch.arange(self.width, device=self.device, dtype=torch.int32).view(
             1, 1, 1, self.width
         )
+        self.instance_palette = self._build_instance_palette()
+
+    def _build_instance_palette(self) -> torch.Tensor:
+        """
+        Returns a small shared RGB palette so multiple instances can reuse colors.
+        """
+        base_levels = torch.tensor([32, 96, 160, 224], dtype=torch.uint8, device=self.device)
+        grid = torch.cartesian_prod(base_levels, base_levels, base_levels).to(torch.uint8)
+
+        if self.palette_size >= grid.shape[0]:
+            return grid
+
+        perm = torch.randperm(grid.shape[0], device=self.device)[: self.palette_size]
+        return grid[perm]
 
     def _boxes_from_masks(self, masks: torch.Tensor) -> torch.Tensor:
         """
@@ -139,13 +157,14 @@ class SyntheticPanopticBatchGenerator:
             dtype=torch.int64,
         )  # 1=square, 2=triangle
 
-        colors = torch.randint(
+        color_indices = torch.randint(
             low=0,
-            high=256,
-            size=(B, M, 3),
+            high=self.instance_palette.shape[0],
+            size=(B, M),
             device=device,
-            dtype=torch.uint8,
-        )  # [B, M, 3]
+            dtype=torch.int64,
+        )
+        colors = self.instance_palette[color_indices]  # [B, M, 3]
 
         cx = torch.randint(
             low=self.margin,
