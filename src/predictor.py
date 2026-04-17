@@ -52,12 +52,6 @@ from .outputs import (
 from .signature_ops import pairwise_distance, pairwise_similarity
 
 
-def _alpha_value(alpha_obj) -> float:
-    if isinstance(alpha_obj, torch.Tensor):
-        return float(alpha_obj.detach().cpu().item())
-    return float(alpha_obj)
-
-
 def _connected_components_labels(affinity: np.ndarray, threshold: float) -> np.ndarray:
     n = affinity.shape[0]
     adj = affinity >= threshold
@@ -212,9 +206,6 @@ class ModularPrototypePredictor:
 
         eligible_mask = torch.ones_like(effective_scores, dtype=torch.bool)
 
-        if cfg.exclude_background:
-            eligible_mask &= flat_queries.predicted_labels != 0
-
         if cfg.min_foreground_prob > 0:
             eligible_mask &= flat_queries.partition_confidence >= cfg.min_foreground_prob
 
@@ -359,11 +350,7 @@ class ModularPrototypePredictor:
         cluster_members: list[torch.Tensor] = []
         next_cluster_id = 0
 
-        if cfg.cluster_per_class:
-            seed_classes = flat_queries.predicted_labels[selection.indices]
-            groups = [torch.where(seed_classes == class_id)[0] for class_id in seed_classes.unique().tolist()]
-        else:
-            groups = [torch.arange(selection.indices.numel(), device=device)]
+        groups = [torch.arange(selection.indices.numel(), device=device)]
 
         for position_group in groups:
             local_seed_indices = selection.indices[position_group]
@@ -461,10 +448,7 @@ class ModularPrototypePredictor:
         if prototypes.num_prototypes == 0:
             return prototypes
 
-        if cfg.use_all_queries:
-            source_query_indices = torch.arange(flat_queries.num_queries, device=device)
-        else:
-            source_query_indices = prototypes.source_query_indices
+        source_query_indices = torch.arange(flat_queries.num_queries, device=device)
 
         query_signatures = flat_queries.signature_embeddings[source_query_indices]
         query_logits = flat_queries.class_logits[source_query_indices]
@@ -474,7 +458,6 @@ class ModularPrototypePredictor:
         prototype_signatures = prototypes.signature_embeddings
         prototype_logits = prototypes.class_logits
 
-        alpha = _alpha_value(model.alpha_focal) if cfg.use_alpha_focal else 1.0
         final_raw_weights = None
         final_normalized_weights = None
 
@@ -487,7 +470,7 @@ class ModularPrototypePredictor:
             raw_weights = assignment_weights_with_influence(
                 similarity=similarity,
                 influence=flat_queries.influence_scores[source_query_indices],
-                alpha=alpha,
+                alpha=1.0,
                 similarity_floor=cfg.similarity_floor,
             )
 
@@ -512,7 +495,7 @@ class ModularPrototypePredictor:
 
             normalized_weights = normalize_assignment_weights(
                 raw_weights,
-                normalize_over_queries=cfg.normalize_over_queries,
+                normalize_over_queries=True,
             )
 
             prototype_logits = aggregate_with_weights(normalized_weights, query_logits)
@@ -555,7 +538,6 @@ class ModularPrototypePredictor:
         if num_prototypes == 0:
             return self._empty_prototype_state(flat_queries)
 
-        alpha = _alpha_value(model.alpha_focal) if self.cfg.assign.use_alpha_focal else 1.0
         similarity = pairwise_similarity(
             flat_queries.signature_embeddings,
             signature_embeddings,
@@ -564,7 +546,7 @@ class ModularPrototypePredictor:
         raw_weights = assignment_weights_with_influence(
             similarity=similarity,
             influence=flat_queries.influence_scores,
-            alpha=alpha,
+            alpha=1.0,
             similarity_floor=self.cfg.assign.similarity_floor,
         )
         normalized_weights = normalize_assignment_weights(
@@ -677,15 +659,11 @@ class ModularPrototypePredictor:
         prototype_scores = torch.ones_like(class_confidence)
         if cfg.use_class_confidence:
             prototype_scores = prototype_scores * class_confidence
-        if cfg.use_foreground_confidence:
-            prototype_scores = prototype_scores * foreground_confidence
         if cfg.use_assignment_strength and prototypes.assignment_strength.numel() > 0:
             normalized_strength = prototypes.assignment_strength / (prototypes.assignment_strength.max() + 1e-6)
             prototype_scores = prototype_scores * normalized_strength.pow(cfg.assignment_strength_power)
 
         keep_mask = torch.ones_like(prototype_scores, dtype=torch.bool)
-        if cfg.remove_background:
-            keep_mask &= predicted_labels != 0
         keep_mask &= prototype_scores >= cfg.min_prototype_score
 
         if keep_mask.sum() == 0:
@@ -1000,12 +978,8 @@ class StandardMask2FormerPredictor:
         scores = torch.ones_like(flat_queries.seed_scores)
         if cfg.use_class_confidence:
             scores = scores * flat_queries.class_probabilities.max(dim=-1).values
-        if cfg.use_foreground_confidence:
-            scores = scores * flat_queries.foreground_confidence
 
         keep_mask = torch.ones_like(scores, dtype=torch.bool)
-        if cfg.remove_background:
-            keep_mask &= flat_queries.predicted_labels != 0
         keep_mask &= scores >= cfg.min_prototype_score
 
         resolved_masks = []

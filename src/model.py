@@ -242,6 +242,7 @@ class Mask2FormerBase(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.mask_features = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
         self.cls_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -275,6 +276,7 @@ class Mask2FormerBase(nn.Module):
         pos_tokens = self.spatial_pos_embed[:, :H_f * W_f, :]
         pos_features = pos_tokens.permute(0, 2, 1).reshape(1, C, H_f, W_f)
         features = features + pos_features
+        features = self.mask_features(features)
         memory = features.view(B, C, -1).permute(0, 2, 1)
         return features, memory
 
@@ -365,22 +367,12 @@ class CustomMask2Former(Mask2FormerBase):
             nn.Linear(hidden_dim, 1),
         )
 
-        self.gt_cls_embed = nn.Embedding(num_classes, hidden_dim)
+        self.gt_cls_proj = nn.Embedding(num_classes, sig_dim)
         self.gt_bbox_proj = nn.Sequential(
             nn.Linear(4, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.gt_query_proj = nn.Sequential(
-            nn.Linear(hidden_dim * 1, hidden_dim),
-            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, sig_dim),
         )
-
-        if cfg.learned_alpha:
-            self.alpha_focal = nn.Parameter(torch.tensor(cfg.alpha_focal, dtype=torch.float32))
-        else:
-            self.alpha_focal = cfg.alpha_focal
 
     def _decoder_seed_head(self):
         return self.seed_head
@@ -489,30 +481,10 @@ class CustomMask2Former(Mask2FormerBase):
             dim=-1,
         )
 
-        cls_emb = self.gt_cls_embed(labels)
+        cls_emb = self.gt_cls_proj(labels)
         bbox_emb = self.gt_bbox_proj(bbox_features)
-        query_init = self.gt_query_proj(torch.cat([bbox_emb], dim=-1))
-
-        """
-        attn_mask = masks_small.flatten(2) < 0.5
-        all_masked = attn_mask.all(dim=2, keepdim=True)
-        attn_mask = attn_mask.masked_fill(all_masked, False)
-        num_heads = self.transformer_decoder.layers[0].multihead_attn.num_heads
-        attn_mask_rep = attn_mask.repeat_interleave(num_heads, dim=0)
-
-        with self._temporary_ttt_steps(ttt_steps_override):
-            q_gt_all, _ = self.transformer_decoder(
-                tgt=query_init,
-                memory=memory,
-                memory_mask=attn_mask_rep,
-                seed_head=self.seed_head,
-            )
-        q_gt = q_gt_all[-1]
-
-        sig = self.sig_head(q_gt)
-        return self.prepare_signature_embeddings(sig)
-        """
-        return self.prepare_signature_embeddings(query_init)
+        gt_signature = cls_emb + bbox_emb
+        return self.prepare_signature_embeddings(gt_signature)
 
     def _run_heads(self, q):
         mask_embs = self.mask_head(q)

@@ -14,6 +14,7 @@ from scipy.optimize import linear_sum_assignment
 
 from .dataset import SyntheticPanopticBatchGenerator, BatchedSyntheticIterableDataset
 from .outputs import EvaluationPredictionSet, ResolvedPrediction
+from .predictor import ModularPrototypePredictor
 from .signature_ops import pairwise_distance
 
 

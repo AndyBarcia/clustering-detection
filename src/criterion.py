@@ -192,7 +192,6 @@ class ClusterPanopticCriterion(nn.Module):
         gt_pad_mask: torch.Tensor, # [B,GT]
         q_mask_emb_flat: torch.Tensor, # [B,Q,Cm]
         q_cls_flat: torch.Tensor, # [B,Q,K]
-        alpha,
         aggregation_similarity_metric: str,
     ):
         sim = pairwise_similarity(
@@ -203,7 +202,7 @@ class ClusterPanopticCriterion(nn.Module):
         weights_flat = assignment_weights_with_influence(
             similarity=sim,
             influence=q_influence_flat,
-            alpha=alpha,
+            alpha=1.0,
             valid_mask=gt_pad_mask,
         )
         # norm_w: [B,Q,GT] normalized across queries so each GT builds a soft prototype.
@@ -263,7 +262,6 @@ class ClusterPanopticCriterion(nn.Module):
         gt_masks_pad: torch.Tensor, # [B,GT,H,W]
         features_val: torch.Tensor, # [B,C,Hf,Wf]
         img_shape: tuple[int, int],
-        alpha,
         aggregation_similarity_metric: str,
     ):
         proto_mask_emb, proto_cls = self._compute_assignment_aggregation(
@@ -273,7 +271,6 @@ class ClusterPanopticCriterion(nn.Module):
             gt_pad_mask=gt_pad_mask,
             q_mask_emb_flat=q_mask_emb_flat,
             q_cls_flat=q_cls_flat,
-            alpha=alpha,
             aggregation_similarity_metric=aggregation_similarity_metric,
         )
         loss_cls = self._compute_aggregated_cls_loss(
@@ -419,7 +416,6 @@ class ClusterPanopticCriterion(nn.Module):
             gt_masks_pad=gt_masks_pad,
             features_val=features_val,
             img_shape=(H_img, W_img),
-            alpha=model.alpha_focal,
             aggregation_similarity_metric=model.aggregation_similarity_metric,
         )
         

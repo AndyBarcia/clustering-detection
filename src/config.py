@@ -47,8 +47,6 @@ class ModelConfig:
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     heads: HeadConfig = field(default_factory=HeadConfig)
 
-    learned_alpha: bool = False
-    alpha_focal: float = 1.0
     spatial_hw: int = 64
 
 
@@ -76,7 +74,6 @@ class SeedFilterConfig:
     quality_threshold: float = 0.07
     topk: Optional[int] = None
     min_num_seeds: int = 1
-    exclude_background: bool = False
     min_foreground_prob: float = 0.22
     max_influence: Optional[float] = 0.4
     use_foreground_in_score: bool = True
@@ -86,7 +83,6 @@ class SeedFilterConfig:
 @dataclass
 class ClusterConfig:
     method: str = "cc"   # ["dbscan", "hdbscan", "cc", "louvain", "leiden"]
-    cluster_per_class: bool = False
     promote_noise_to_singletons: bool = True
 
     # DBSCAN
@@ -111,10 +107,8 @@ class ClusterConfig:
 
 @dataclass
 class SoftAssignmentConfig:
-    use_all_queries: bool = True
     refinement_steps: int = 1
 
-    use_alpha_focal: bool = False
     similarity_floor: float = 0.005
 
     # Backward-compatible name: this now uses predicted seedness as the per-query weighting signal.
@@ -125,7 +119,6 @@ class SoftAssignmentConfig:
     foreground_prob_power: float = 0.71
 
     class_compat_power: float = 0.0   # 0 disables class-aware assignment
-    normalize_over_queries: bool = True
 
 
 @dataclass
@@ -134,7 +127,6 @@ class OverlapResolutionConfig:
     morphology_kernel_size: int = 0
     morphology_iterations: int = 1
 
-    remove_background: bool = True
     min_prototype_score: float = 0.06
     min_area: int = 18
 
@@ -142,7 +134,6 @@ class OverlapResolutionConfig:
     pixel_score_threshold: float = 0.21
 
     use_class_confidence: bool = True
-    use_foreground_confidence: bool = False
     use_assignment_strength: bool = False
     assignment_strength_power: float = 0.55
 
