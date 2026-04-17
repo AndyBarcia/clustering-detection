@@ -7,30 +7,9 @@ import contextlib
 from typing import Optional
 
 from .config import ModelConfig
+from .backbone import TinyDetEncoder
 from .outputs import RawOutputs
 from .signature_ops import pairwise_distance, pairwise_similarity
-
-
-class SimpleBackbone(nn.Module):
-    def __init__(self, hidden_dim=128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1), 
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), 
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            
-            nn.Conv2d(64, hidden_dim, kernel_size=3, stride=1, padding=1), 
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True)
-        )
-        
-    def forward(self, x):
-        return self.net(x)
-
 
 
 class TransformerDecoderLayer(nn.Module):
@@ -178,19 +157,21 @@ class TTTTransformerDecoder(nn.Module):
         weights = logits.softmax(dim=0)
         return torch.einsum("dbq,dbqc->bqc", weights, history_stack)
 
-    def forward(self, tgt, memory, memory_mask_fn=None, **kwargs):
+    def forward(self, tgt, memory, memory_mask_fn=None, memory_sequence=None, **kwargs):
         output = tgt
         history = [tgt]
         ttt_output = []
+        memory_sequence = memory_sequence or [memory] * self.num_layers
         
         for layer_idx, mod in enumerate(self.layers):
             layer_input = self._depth_attention_residual(history, layer_idx)
             layer_kwargs = dict(kwargs)
+            layer_memory = memory_sequence[layer_idx % len(memory_sequence)]
             if memory_mask_fn is not None:
-                dynamic_memory_mask = memory_mask_fn(layer_input, layer_idx)
+                dynamic_memory_mask = memory_mask_fn(layer_input, layer_idx, layer_memory)
                 if dynamic_memory_mask is not None:
                     layer_kwargs["memory_mask"] = dynamic_memory_mask
-            output, intermediate_ttt_q = mod(layer_input, memory, **layer_kwargs)
+            output, intermediate_ttt_q = mod(layer_input, layer_memory, **layer_kwargs)
             history.append(output)
             ttt_output.append(intermediate_ttt_q)
 
@@ -217,7 +198,13 @@ class Mask2FormerBase(nn.Module):
         self.num_queries = num_queries
         self.num_layers = num_layers
 
-        self.backbone = SimpleBackbone(hidden_dim=hidden_dim)
+        self.backbone = TinyDetEncoder(
+            in_ch=cfg.backbone.in_channels,
+            backbone_channels=cfg.backbone.channels,
+            fpn_channels=hidden_dim,
+            norm=cfg.backbone.norm,
+            act=cfg.backbone.act,
+        )
         self.queries = nn.Embedding(num_queries, hidden_dim)
 
         dlcfg = cfg.decoder_layer
@@ -242,15 +229,23 @@ class Mask2FormerBase(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        self.mask_features = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
         self.cls_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, num_classes),
         )
 
-        spatial_tokens = cfg.spatial_hw * cfg.spatial_hw
-        self.spatial_pos_embed = nn.Parameter(torch.randn(1, spatial_tokens, hidden_dim) * 0.02)
+        self.feature_levels = ("p2", "p3", "p4", "p5")
+        self.decoder_feature_levels = ("p3", "p4", "p5")
+        self.level_embed = nn.Parameter(torch.randn(len(self.feature_levels), hidden_dim) * 0.02)
+
+        spatial_hw = cfg.spatial_hw
+        self.spatial_pos_embeds = nn.ParameterDict({
+            "p2": nn.Parameter(torch.randn(1, spatial_hw * spatial_hw, hidden_dim) * 0.02),
+            "p3": nn.Parameter(torch.randn(1, (spatial_hw // 2) * (spatial_hw // 2), hidden_dim) * 0.02),
+            "p4": nn.Parameter(torch.randn(1, (spatial_hw // 4) * (spatial_hw // 4), hidden_dim) * 0.02),
+            "p5": nn.Parameter(torch.randn(1, (spatial_hw // 8) * (spatial_hw // 8), hidden_dim) * 0.02),
+        })
 
     def _decoder_seed_head(self):
         return None
@@ -270,35 +265,50 @@ class Mask2FormerBase(nn.Module):
             for layer, previous in zip(self.transformer_decoder.layers, previous_steps):
                 layer.ttt_steps = previous
 
+    def _add_level_position(self, feat: torch.Tensor, level_name: str) -> torch.Tensor:
+        _, _, height, width = feat.shape
+        pos_tokens = self.spatial_pos_embeds[level_name][:, : height * width, :]
+        pos_features = pos_tokens.permute(0, 2, 1).reshape(1, self.hidden_dim, height, width)
+        level_idx = self.feature_levels.index(level_name)
+        return feat + pos_features + self.level_embed[level_idx].view(1, self.hidden_dim, 1, 1)
+
     def _build_memory(self, images):
-        features = self.backbone(images)
-        B, C, H_f, W_f = features.shape
-        pos_tokens = self.spatial_pos_embed[:, :H_f * W_f, :]
-        pos_features = pos_tokens.permute(0, 2, 1).reshape(1, C, H_f, W_f)
-        features = features + pos_features
-        features = self.mask_features(features)
-        memory = features.view(B, C, -1).permute(0, 2, 1)
-        return features, memory
+        pyramid_feats = self.backbone(images)
+        enriched_feats = {
+            level_name: self._add_level_position(feat, level_name)
+            for level_name, feat in pyramid_feats.items()
+        }
+        memory_levels = [
+            enriched_feats[level_name].flatten(2).transpose(1, 2)
+            for level_name in self.decoder_feature_levels
+        ]
+        return enriched_feats, memory_levels
 
     def _predict_mask_logits(self, q: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
         mask_embs = self.mask_head(q)
         return torch.einsum("bqc,bchw->bqhw", mask_embs, features)
 
-    def _decoder_memory_mask(self, query_state: torch.Tensor, features: torch.Tensor):
+    def _decoder_memory_mask(self, query_state: torch.Tensor, features: torch.Tensor, memory_hw=None):
         return None
 
-    def _decode_queries(self, memory, features, query_embed=None, ttt_steps_override: Optional[int] = None):
-        B = memory.shape[0]
+    def _decode_queries(self, memory_levels, features, query_embed=None, ttt_steps_override: Optional[int] = None):
+        B = features.shape[0]
         if query_embed is None:
             query_embed = self.queries.weight.unsqueeze(0).repeat(B, 1, 1)
 
-        def memory_mask_fn(query_state, _layer_idx):
-            return self._decoder_memory_mask(query_state, features)
+        def memory_mask_fn(query_state, _layer_idx, layer_memory):
+            num_tokens = layer_memory.shape[1]
+            memory_hw = None
+            side = int(num_tokens ** 0.5)
+            if side * side == num_tokens:
+                memory_hw = (side, side)
+            return self._decoder_memory_mask(query_state, features, memory_hw)
 
         with self._temporary_ttt_steps(ttt_steps_override):
             q_dec_all, intermediate_ttt_q = self.transformer_decoder(
                 tgt=query_embed,
-                memory=memory,
+                memory=memory_levels[0],
+                memory_sequence=memory_levels,
                 memory_mask_fn=memory_mask_fn,
                 seed_head=self._decoder_seed_head(),
             )
@@ -312,9 +322,11 @@ class Mask2FormerBase(nn.Module):
     def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
 
-        features, memory = self._build_memory(images)
+        enriched_feats, memory_levels = self._build_memory(images)
+        features = enriched_feats["p2"]
+        memory = memory_levels[0]
         q_dec_all, intermediate_ttt_q = self._decode_queries(
-            memory,
+            memory_levels,
             features,
             ttt_steps_override=ttt_steps_override,
         )
@@ -377,8 +389,10 @@ class CustomMask2Former(Mask2FormerBase):
     def _decoder_seed_head(self):
         return self.seed_head
 
-    def _decoder_memory_mask(self, query_state: torch.Tensor, features: torch.Tensor):
+    def _decoder_memory_mask(self, query_state: torch.Tensor, features: torch.Tensor, memory_hw=None):
         mask_logits = self._predict_mask_logits(query_state, features)
+        if memory_hw is not None and mask_logits.shape[-2:] != memory_hw:
+            mask_logits = F.interpolate(mask_logits, size=memory_hw, mode="bilinear", align_corners=False)
         mask_bias = mask_logits.flatten(2)
         mask_bias = mask_bias - mask_bias.mean(dim=-1, keepdim=True)
         mask_bias = mask_bias / mask_bias.std(dim=-1, keepdim=True).clamp_min(1e-6)

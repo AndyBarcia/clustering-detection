@@ -6,8 +6,9 @@ from typing import Optional, List, Tuple, Union, get_origin, get_args
 class BackboneConfig:
     hidden_dim: int = 256
     in_channels: int = 3
-    conv1_channels: int = 32
-    conv2_channels: int = 64
+    channels: Tuple[int, int, int, int, int] = (32, 64, 96, 160, 224)
+    norm: str = "gn"
+    act: str = "silu"
 
 
 @dataclass
