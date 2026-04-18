@@ -9,6 +9,7 @@ import torch
 @dataclass
 class RawOutputs:
     features: torch.Tensor          # [B, C, Hf, Wf]
+    feature_maps: dict[str, torch.Tensor]
     memory: torch.Tensor            # [B, HW, C]
     queries: torch.Tensor           # [L, B, Nq, C]
     intermediate_ttt_q: torch.Tensor

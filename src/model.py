@@ -291,18 +291,21 @@ class Mask2FormerBase(nn.Module):
     def _decoder_memory_mask(self, query_state: torch.Tensor, features: torch.Tensor, memory_hw=None):
         return None
 
-    def _decode_queries(self, memory_levels, features, query_embed=None, ttt_steps_override: Optional[int] = None):
-        B = features.shape[0]
+    def _decode_queries(self, memory_levels, feature_maps, query_embed=None, ttt_steps_override: Optional[int] = None):
+        reference_features = feature_maps[self.feature_levels[0]]
+        B = reference_features.shape[0]
         if query_embed is None:
             query_embed = self.queries.weight.unsqueeze(0).repeat(B, 1, 1)
 
         def memory_mask_fn(query_state, _layer_idx, layer_memory):
+            level_name = self.decoder_feature_levels[_layer_idx % len(self.decoder_feature_levels)]
+            level_features = feature_maps[level_name]
             num_tokens = layer_memory.shape[1]
             memory_hw = None
             side = int(num_tokens ** 0.5)
             if side * side == num_tokens:
                 memory_hw = (side, side)
-            return self._decoder_memory_mask(query_state, features, memory_hw)
+            return self._decoder_memory_mask(query_state, level_features, memory_hw)
 
         with self._temporary_ttt_steps(ttt_steps_override):
             q_dec_all, intermediate_ttt_q = self.transformer_decoder(
@@ -327,7 +330,7 @@ class Mask2FormerBase(nn.Module):
         memory = memory_levels[0]
         q_dec_all, intermediate_ttt_q = self._decode_queries(
             memory_levels,
-            features,
+            enriched_feats,
             ttt_steps_override=ttt_steps_override,
         )
 
@@ -335,6 +338,7 @@ class Mask2FormerBase(nn.Module):
 
         return RawOutputs(
             features=features,
+            feature_maps=enriched_feats,
             memory=memory,
             queries=q_dec_all,
             intermediate_ttt_q=intermediate_ttt_q,

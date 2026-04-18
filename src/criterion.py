@@ -157,6 +157,17 @@ class ClusterPanopticCriterion(nn.Module):
     def forward(self, model: CustomMask2Former, raw: RawOutputs, targets):
         return self.compute_loss(model, raw, targets)
 
+    def _ordered_feature_maps(
+        self,
+        model: Mask2FormerBase,
+        raw: RawOutputs,
+    ) -> list[tuple[str, torch.Tensor]]:
+        return [
+            (level_name, raw.feature_maps[level_name])
+            for level_name in model.feature_levels
+            if level_name in raw.feature_maps
+        ]
+
     def _compute_loss_inter(
         self,
         gt_sigs_norm: torch.Tensor, # [B,GT,S]
@@ -228,27 +239,31 @@ class ClusterPanopticCriterion(nn.Module):
     def _compute_aggregated_mask_losses(
         self,
         proto_mask_emb: torch.Tensor, # [B,GT,C]
-        features_val: torch.Tensor, # [B,C,Hf,Wf]
+        feature_maps_val: list[tuple[str, torch.Tensor]],
         gt_masks_pad: torch.Tensor, # [B,GT,H,W]
         gt_pad_mask: torch.Tensor, # [B,GT]
         img_shape: tuple[int, int],
     ):
-        H_img, W_img = img_shape
-        # proto_mask_emb: [B,GT,C], features_val: [B,C,Hf,Wf] -> mask_logits: [B,GT,Hf,Wf]
-        mask_logits = project_mask_embeddings(
-            proto_mask_emb,
-            features_val,
-            (H_img, W_img),
-        )
+        level_loss_mask_ce = {}
+        level_loss_mask_iou = {}
 
-        neg_inf = torch.finfo(mask_logits.dtype).min
-        mask_logits_masked = mask_logits.masked_fill(~gt_pad_mask[:, :, None, None], neg_inf)
-        # gt_mask_target: [B,H,W] stores the winning GT index per pixel.
-        gt_mask_target = gt_masks_pad.argmax(dim=1)
+        for level_name, features_val in feature_maps_val:
+            mask_logits = project_mask_embeddings(
+                proto_mask_emb,
+                features_val,
+                img_shape,
+            )
 
-        loss_mask_ce = F.cross_entropy(mask_logits_masked, gt_mask_target)
-        loss_mask_iou = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
-        return loss_mask_ce, loss_mask_iou
+            neg_inf = torch.finfo(mask_logits.dtype).min
+            mask_logits_masked = mask_logits.masked_fill(~gt_pad_mask[:, :, None, None], neg_inf)
+            gt_mask_target = gt_masks_pad.argmax(dim=1)
+
+            level_loss_mask_ce[level_name] = F.cross_entropy(mask_logits_masked, gt_mask_target)
+            level_loss_mask_iou[level_name] = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
+
+        loss_mask_ce = torch.stack(list(level_loss_mask_ce.values())).mean()
+        loss_mask_iou = torch.stack(list(level_loss_mask_iou.values())).mean()
+        return loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou
 
     def _compute_mask_cls_losses(
         self,
@@ -260,7 +275,7 @@ class ClusterPanopticCriterion(nn.Module):
         q_cls_flat: torch.Tensor, # [B,Q,K]
         gt_labels_pad: torch.Tensor, # [B,GT]
         gt_masks_pad: torch.Tensor, # [B,GT,H,W]
-        features_val: torch.Tensor, # [B,C,Hf,Wf]
+        feature_maps_val: list[tuple[str, torch.Tensor]],
         img_shape: tuple[int, int],
         aggregation_similarity_metric: str,
     ):
@@ -278,14 +293,14 @@ class ClusterPanopticCriterion(nn.Module):
             gt_labels_pad, 
             gt_pad_mask
         )
-        loss_mask_ce, loss_mask_iou = self._compute_aggregated_mask_losses(
+        loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou = self._compute_aggregated_mask_losses(
             proto_mask_emb=proto_mask_emb,
-            features_val=features_val,
+            feature_maps_val=feature_maps_val,
             gt_masks_pad=gt_masks_pad,
             gt_pad_mask=gt_pad_mask,
             img_shape=img_shape,
         )
-        return loss_cls, loss_mask_ce, loss_mask_iou
+        return loss_cls, loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou
 
     def _compute_seed_losses(
         self,
@@ -327,6 +342,7 @@ class ClusterPanopticCriterion(nn.Module):
     def compute_loss(self, model: CustomMask2Former, raw: RawOutputs, targets):
         features = raw.features
         memory = raw.memory
+        feature_maps = self._ordered_feature_maps(model, raw)
         mask_embs = raw.mask_embs
         cls_preds = raw.cls_preds
         sig_embs = raw.sig_embs
@@ -377,6 +393,7 @@ class ClusterPanopticCriterion(nn.Module):
 
         features_val = features[valid_b]
         memory_val = memory[valid_b]
+        feature_maps_val = [(level_name, level_features[valid_b]) for level_name, level_features in feature_maps]
 
         q_sig = sig_embs[:, valid_b]
         q_mask_emb = mask_embs[:, valid_b]
@@ -405,7 +422,7 @@ class ClusterPanopticCriterion(nn.Module):
             identity_similarity_metric=model.identity_similarity_metric,
         )
         
-        loss_cls, loss_mask_ce, loss_mask_iou = self._compute_mask_cls_losses(
+        loss_cls, loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou = self._compute_mask_cls_losses(
             q_sig_flat=q_sig_flat,
             q_influence_flat=q_influence_flat,
             gt_sigs_norm=gt_sigs_norm,
@@ -414,7 +431,7 @@ class ClusterPanopticCriterion(nn.Module):
             q_cls_flat=q_cls_flat,
             gt_labels_pad=gt_labels_pad,
             gt_masks_pad=gt_masks_pad,
-            features_val=features_val,
+            feature_maps_val=feature_maps_val,
             img_shape=(H_img, W_img),
             aggregation_similarity_metric=model.aggregation_similarity_metric,
         )
@@ -448,6 +465,10 @@ class ClusterPanopticCriterion(nn.Module):
             "loss_mask_total": total_loss_mask,
             "loss_inter": loss_inter,
         }
+        for level_name, loss_value in level_loss_mask_ce.items():
+            components[f"loss_mask_ce_{level_name}"] = loss_value
+        for level_name, loss_value in level_loss_mask_iou.items():
+            components[f"loss_mask_iou_{level_name}"] = loss_value
 
         return final_loss, components
 
@@ -462,42 +483,41 @@ class StandardMask2FormerCriterion(nn.Module):
 
     def _compute_single_layer_loss(
         self,
-        features: torch.Tensor,
+        feature_maps: list[tuple[str, torch.Tensor]],
         q_mask_emb: torch.Tensor,
         q_cls: torch.Tensor,
         targets,
         img_shape: tuple[int, int],
     ):
-        H_img, W_img = img_shape
-        # q_mask_emb: [B,Q,C], features: [B,C,Hf,Wf] -> mask_logits: [B,Q,Hf,Wf]
-        mask_logits = project_mask_embeddings(
-            q_mask_emb,
-            features,
-            (H_img, W_img),
-        )
-
         num_classes = q_cls.shape[-1]
-        class_weights = torch.ones(num_classes, device=features.device, dtype=features.dtype)
+        reference_features = feature_maps[0][1]
+        class_weights = torch.ones(num_classes, device=reference_features.device, dtype=reference_features.dtype)
         class_weights[0] = self.cfg.no_object_weight
 
         cls_losses = []
-        matched_mask_logits = []
-        matched_mask_targets = []
+        matched_mask_logits = {level_name: [] for level_name, _ in feature_maps}
+        matched_mask_targets = {level_name: [] for level_name, _ in feature_maps}
 
-        for b in range(features.shape[0]):
-            labels = targets[b]["labels"].to(features.device)
-            masks = targets[b]["masks"].to(features.device).float()
+        for b in range(reference_features.shape[0]):
+            labels = targets[b]["labels"].to(reference_features.device)
+            masks = targets[b]["masks"].to(reference_features.device).float()
             fg_keep = labels != 0
             gt_labels = labels[fg_keep]
             gt_masks = masks[fg_keep]
 
-            target_classes = torch.zeros(q_cls.shape[1], dtype=torch.long, device=features.device)
+            target_classes = torch.zeros(q_cls.shape[1], dtype=torch.long, device=reference_features.device)
 
             if gt_labels.numel() > 0:
+                match_features = feature_maps[0][1]
+                match_mask_logits = project_mask_embeddings(
+                    q_mask_emb[b:b + 1],
+                    match_features[b:b + 1],
+                    img_shape,
+                )[0]
                 # Match the current layer queries [Q,...] against foreground GTs [M,...].
                 matched_query_idx, matched_gt_idx = hungarian_mask2former_assignment(
                     cls_logits=q_cls[b],
-                    mask_logits=mask_logits[b],
+                    mask_logits=match_mask_logits,
                     gt_labels=gt_labels,
                     gt_masks=gt_masks,
                     cfg=self.cfg,
@@ -505,44 +525,61 @@ class StandardMask2FormerCriterion(nn.Module):
                 target_classes[matched_query_idx] = gt_labels[matched_gt_idx]
 
                 if matched_query_idx.numel() > 0:
-                    matched_mask_logits.append(mask_logits[b, matched_query_idx])
-                    matched_mask_targets.append(gt_masks[matched_gt_idx])
+                    for level_name, level_features in feature_maps:
+                        level_mask_logits = project_mask_embeddings(
+                            q_mask_emb[b:b + 1],
+                            level_features[b:b + 1],
+                            img_shape,
+                        )[0]
+                        matched_mask_logits[level_name].append(level_mask_logits[matched_query_idx])
+                        matched_mask_targets[level_name].append(gt_masks[matched_gt_idx])
 
             cls_losses.append(F.cross_entropy(q_cls[b], target_classes, weight=class_weights))
 
         if cls_losses:
             loss_cls = torch.stack(cls_losses).mean()
         else:
-            loss_cls = features.sum() * 0.0
+            loss_cls = reference_features.sum() * 0.0
 
-        if matched_mask_logits:
-            matched_logits = torch.cat(matched_mask_logits, dim=0)
-            matched_targets = torch.cat(matched_mask_targets, dim=0)
-            loss_mask_bce = F.binary_cross_entropy_with_logits(matched_logits, matched_targets)
-            loss_mask_dice = dice_loss_from_logits(matched_logits, matched_targets).mean()
-        else:
-            loss_mask_bce = features.sum() * 0.0
-            loss_mask_dice = features.sum() * 0.0
+        level_loss_mask_bce = {}
+        level_loss_mask_dice = {}
+        zero = reference_features.sum() * 0.0
+        for level_name, _ in feature_maps:
+            if matched_mask_logits[level_name]:
+                matched_logits = torch.cat(matched_mask_logits[level_name], dim=0)
+                matched_targets = torch.cat(matched_mask_targets[level_name], dim=0)
+                level_loss_mask_bce[level_name] = F.binary_cross_entropy_with_logits(matched_logits, matched_targets)
+                level_loss_mask_dice[level_name] = dice_loss_from_logits(matched_logits, matched_targets).mean()
+            else:
+                level_loss_mask_bce[level_name] = zero
+                level_loss_mask_dice[level_name] = zero
 
-        return loss_cls, loss_mask_bce, loss_mask_dice
+        loss_mask_bce = torch.stack(list(level_loss_mask_bce.values())).mean()
+        loss_mask_dice = torch.stack(list(level_loss_mask_dice.values())).mean()
+
+        return loss_cls, loss_mask_bce, loss_mask_dice, level_loss_mask_bce, level_loss_mask_dice
 
     def compute_loss(self, model: Mask2FormerBase, raw: RawOutputs, targets):
-        del model
-
-        features = raw.features
+        feature_maps = [
+            (level_name, raw.feature_maps[level_name])
+            for level_name in model.feature_levels
+            if level_name in raw.feature_maps
+        ]
+        reference_features = raw.features
         # raw.mask_embs/raw.cls_preds are lists over decoder layers.
         layer_losses = [
-            self._compute_single_layer_loss(features, q_mask_emb, q_cls, targets, raw.img_shape)
+            self._compute_single_layer_loss(feature_maps, q_mask_emb, q_cls, targets, raw.img_shape)
             for q_mask_emb, q_cls in zip(raw.mask_embs, raw.cls_preds)
         ]
 
         loss_cls = torch.stack([loss[0] for loss in layer_losses]).mean()
         loss_mask_bce = torch.stack([loss[1] for loss in layer_losses]).mean()
         loss_mask_dice = torch.stack([loss[2] for loss in layer_losses]).mean()
+        level_names = [level_name for level_name, _ in feature_maps]
 
         total_loss_mask = self.cfg.w_mask_bce * loss_mask_bce + self.cfg.w_mask_dice * loss_mask_dice
         final_loss = loss_cls + total_loss_mask
-        zero = features.sum() * 0.0
+        zero = reference_features.sum() * 0.0
 
         components = {
             "loss_total": final_loss,
@@ -554,6 +591,9 @@ class StandardMask2FormerCriterion(nn.Module):
             "loss_mask_total": total_loss_mask,
             "loss_inter": zero,
         }
+        for level_name in level_names:
+            components[f"loss_mask_bce_{level_name}"] = torch.stack([loss[3][level_name] for loss in layer_losses]).mean()
+            components[f"loss_mask_dice_{level_name}"] = torch.stack([loss[4][level_name] for loss in layer_losses]).mean()
         return final_loss, components
 
 

@@ -121,7 +121,13 @@ def format_epoch_metrics(epoch_metrics):
         "loss_mask_total",
         "loss_inter",
     ]
-    return " | ".join(f"{key}={epoch_metrics[key]:.4f}" for key in ordered_keys if key in epoch_metrics)
+    formatted = [f"{key}={epoch_metrics[key]:.4f}" for key in ordered_keys if key in epoch_metrics]
+    extra_mask_keys = sorted(
+        key for key in epoch_metrics
+        if key.startswith("loss_mask_") and key not in ordered_keys
+    )
+    formatted.extend(f"{key}={epoch_metrics[key]:.4f}" for key in extra_mask_keys)
+    return " | ".join(formatted)
 
 
 def format_iteration_metrics(metrics):
