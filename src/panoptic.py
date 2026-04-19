@@ -6,6 +6,7 @@ from dataclasses import asdict
 from .model import build_model
 from .criterion import PanopticCriterion
 from .predictor import build_predictor
+from .dataset import DEFAULT_INSTANCE_PALETTE_RGB
 from .config import (
     PrototypeInferenceConfig, 
     PanopticSystemConfig, 
@@ -58,6 +59,7 @@ def save_system_checkpoint(system: PanopticSystem, path: str, optimizer=None, ex
         "model_config": asdict(system.cfg.model),
         "loss_config": asdict(system.cfg.loss),
         "inference_config": asdict(system.cfg.inference),
+        "dataset_palette": [list(color) for color in DEFAULT_INSTANCE_PALETTE_RGB],
         "extra": extra or {},
     }
     if optimizer is not None:

@@ -11,7 +11,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.config import PanopticSystemConfig
-from src.dataset import SyntheticPanopticBatchGenerator, BatchedSyntheticIterableDataset
+from src.dataset import (
+    BatchedSyntheticIterableDataset,
+    DEFAULT_INSTANCE_PALETTE_RGB,
+    SyntheticPanopticBatchGenerator,
+)
 from src.evaluation import evaluate_system, format_metrics_table
 from src.panoptic import PanopticSystem, load_system_checkpoint, save_system_checkpoint
 from src.visualization import (
@@ -25,6 +29,53 @@ from src.visualization import (
 
 CHECKPOINT_NAME = "checkpoint.pt"
 METRICS_NAME = "training_losses.json"
+
+
+def _normalize_palette(palette):
+    if palette is None:
+        return None
+    return [tuple(int(channel) for channel in color) for color in palette]
+
+
+def _format_palette(palette):
+    return ", ".join(str(tuple(int(channel) for channel in color)) for color in palette)
+
+
+def _report_palette_compatibility(checkpoint_palette):
+    dataset_palette = _normalize_palette(DEFAULT_INSTANCE_PALETTE_RGB)
+    checkpoint_palette = _normalize_palette(checkpoint_palette)
+
+    if checkpoint_palette is None:
+        print(
+            "Checkpoint does not include a saved dataset palette. "
+            f"Treating all current dataset colors as zero-shot: {_format_palette(dataset_palette)}",
+            flush=True,
+        )
+        return
+
+    zero_shot_colors = [color for color in dataset_palette if color not in checkpoint_palette]
+    missing_from_dataset = [color for color in checkpoint_palette if color not in dataset_palette]
+
+    if not zero_shot_colors and not missing_from_dataset:
+        print(f"Dataset palette matches checkpoint: {_format_palette(dataset_palette)}", flush=True)
+        return
+
+    print(
+        "Dataset palette differs from checkpoint. "
+        f"Dataset palette: {_format_palette(dataset_palette)} | "
+        f"Checkpoint palette: {_format_palette(checkpoint_palette)}",
+        flush=True,
+    )
+    if zero_shot_colors:
+        print(
+            f"Zero-shot dataset colors not present in checkpoint: {_format_palette(zero_shot_colors)}",
+            flush=True,
+        )
+    if missing_from_dataset:
+        print(
+            f"Checkpoint colors not present in current dataset: {_format_palette(missing_from_dataset)}",
+            flush=True,
+        )
 
 
 def parse_args():
@@ -139,6 +190,7 @@ def load_training_state(output_dir: Path, device: torch.device, lr: float, weigh
     if checkpoint_path.exists():
         system, ckpt = load_system_checkpoint(checkpoint_path, map_location=device)
         system = system.to(device)
+        _report_palette_compatibility(ckpt.get("dataset_palette"))
         if system.cfg.model.variant != model_variant:
             print(
                 f"Requested model variant '{model_variant}', "

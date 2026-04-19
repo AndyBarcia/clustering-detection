@@ -4,6 +4,18 @@ from torch.utils.data import IterableDataset
 import matplotlib.pyplot as plt
 
 
+DEFAULT_INSTANCE_PALETTE_RGB = (
+    (224, 64, 64),
+    (64, 160, 224),
+    (96, 192, 96),
+    (240, 192, 64),
+)
+
+
+def get_default_instance_palette(device="cpu") -> torch.Tensor:
+    return torch.tensor(DEFAULT_INSTANCE_PALETTE_RGB, dtype=torch.uint8, device=device)
+
+
 class BatchedSyntheticIterableDataset(IterableDataset):
     def __init__(
         self,
@@ -55,13 +67,11 @@ class SyntheticPanopticBatchGenerator:
         height=256,
         width=256,
         max_objects=10,
-        palette_size=4,
         device="cuda",
     ):
         self.height = height
         self.width = width
         self.max_objects = max_objects
-        self.palette_size = int(palette_size)
         self.device = torch.device(
             device if (device == "cpu" or torch.cuda.is_available()) else "cpu"
         )
@@ -72,8 +82,6 @@ class SyntheticPanopticBatchGenerator:
         self.min_size = 10
         self.max_size = 40
 
-        if self.palette_size <= 0:
-            raise ValueError("palette_size must be > 0.")
         if self.width <= 2 * self.margin or self.height <= 2 * self.margin:
             raise ValueError("height/width are too small for margin=20.")
 
@@ -87,17 +95,7 @@ class SyntheticPanopticBatchGenerator:
         self.instance_palette = self._build_instance_palette()
 
     def _build_instance_palette(self) -> torch.Tensor:
-        """
-        Returns a small shared RGB palette so multiple instances can reuse colors.
-        """
-        base_levels = torch.tensor([32, 96, 160, 224], dtype=torch.uint8, device=self.device)
-        grid = torch.cartesian_prod(base_levels, base_levels, base_levels).to(torch.uint8)
-
-        if self.palette_size >= grid.shape[0]:
-            return grid
-
-        perm = torch.randperm(grid.shape[0], device=self.device)[: self.palette_size]
-        return grid[perm]
+        return get_default_instance_palette(device=self.device)
 
     def _boxes_from_masks(self, masks: torch.Tensor) -> torch.Tensor:
         """
@@ -263,14 +261,17 @@ class SyntheticPanopticBatchGenerator:
             fg_masks_b = visible_masks[b][kb].to(torch.uint8)
             fg_labels_b = class_ids[b][kb].to(torch.int64)
             fg_boxes_b = boxes_flat[b][kb].to(torch.float32)
+            fg_colors_b = colors[b][kb].to(torch.uint8)
 
             bg_masks_b = background_masks[b].unsqueeze(0).to(torch.uint8)
             bg_labels_b = torch.zeros((1,), dtype=torch.int64, device=device)
             bg_boxes_b = background_boxes[b].unsqueeze(0).to(torch.float32)
+            bg_colors_b = torch.zeros((1, 3), dtype=torch.uint8, device=device)
 
             masks_b = torch.cat([bg_masks_b, fg_masks_b], dim=0)
             labels_b = torch.cat([bg_labels_b, fg_labels_b], dim=0)
             boxes_b = torch.cat([bg_boxes_b, fg_boxes_b], dim=0)
+            colors_b = torch.cat([bg_colors_b, fg_colors_b], dim=0)
 
             area_b = masks_b.flatten(1).sum(dim=1).to(torch.float32)
             iscrowd_b = torch.zeros((labels_b.numel(),), dtype=torch.int64, device=device)
@@ -281,6 +282,7 @@ class SyntheticPanopticBatchGenerator:
                     "boxes": boxes_b,
                     "labels": labels_b,
                     "masks": masks_b,
+                    "color": colors_b,
                     "image_id": image_id_b,
                     "area": area_b,
                     "iscrowd": iscrowd_b,

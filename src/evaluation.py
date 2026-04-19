@@ -802,10 +802,7 @@ def _extract_signature_probe_records(
         [centers_x / float(width - 1), centers_y / float(height - 1)],
         dim=-1,
     )
-    color_mean = (
-        torch.einsum("nhw,chw->nc", fg_masks, image)
-        / areas.unsqueeze(-1).clamp_min(1e-6)
-    )
+    color = target.get("color").to(batch_device).float()[1:] / 255.0
 
     for obj_idx in range(fg_signatures.shape[0]):
         records.append(
@@ -813,7 +810,7 @@ def _extract_signature_probe_records(
                 "signature": fg_signatures[obj_idx].detach().cpu(),
                 "size": size_scalar[obj_idx].detach().cpu(),
                 "position": position_xy[obj_idx].detach().cpu(),
-                "color": color_mean[obj_idx].detach().cpu(),
+                "color": color[obj_idx].detach().cpu(),
                 "class": fg_labels[obj_idx].detach().cpu(),
                 "object_count": fg_count,
             }
