@@ -141,7 +141,10 @@ def extract_probe_dataset(system, num_images: int, batch_size: int, device: torc
 
             signatures = model.encode_gts(
                 raw.memory[sample_index:sample_index + 1],
-                raw.features[sample_index:sample_index + 1],
+                {
+                    level_name: level_features[sample_index:sample_index + 1]
+                    for level_name, level_features in raw.feature_maps.items()
+                },
                 gt_masks,
                 gt_labels,
                 gt_pad_mask,

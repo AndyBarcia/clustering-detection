@@ -413,7 +413,11 @@ class ClusterPanopticCriterion(nn.Module):
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
 
         # gt_sigs_norm: [Bv,GT,S]
-        gt_sigs_norm = model.encode_gts(memory_val, features_val, gt_masks_pad, gt_labels_pad, gt_pad_mask)
+        feature_maps_dict = {
+            level_name: level_features
+            for level_name, level_features in feature_maps_val
+        }
+        gt_sigs_norm = model.encode_gts(memory_val, feature_maps_dict, gt_masks_pad, gt_labels_pad, gt_pad_mask)
         
         loss_inter = self._compute_loss_inter(
             gt_sigs_norm, 

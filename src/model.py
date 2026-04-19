@@ -389,6 +389,11 @@ class CustomMask2Former(Mask2FormerBase):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, sig_dim),
         )
+        self.gt_mask_context_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, sig_dim),
+        )
 
     def _decoder_seed_head(self):
         return self.seed_head
@@ -465,16 +470,39 @@ class CustomMask2Former(Mask2FormerBase):
             clamp=clamp,
         )
 
+    def _encode_gt_mask_context(self, feature_map: torch.Tensor, masks: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
+        _, _, height, width = feature_map.shape
+        masks_small = F.interpolate(masks.float(), size=(height, width), mode="bilinear", align_corners=False)
+        masks_small = masks_small * pad_mask[:, :, None, None].to(dtype=feature_map.dtype)
+
+        inside_denom = masks_small.flatten(2).sum(dim=2, keepdim=True).clamp_min(1e-6)
+        pooled_inside = torch.einsum("bmhw,bchw->bmc", masks_small, feature_map) / inside_denom
+
+        outside_masks = (1.0 - masks_small) * pad_mask[:, :, None, None].to(dtype=feature_map.dtype)
+        outside_denom = outside_masks.flatten(2).sum(dim=2, keepdim=True).clamp_min(1e-6)
+        pooled_outside = torch.einsum("bmhw,bchw->bmc", outside_masks, feature_map) / outside_denom
+
+        pooled_context = torch.cat([pooled_inside, pooled_outside], dim=-1)
+        return self.gt_mask_context_proj(pooled_context)
+
     def encode_gts(self, memory, features, masks, labels, pad_mask, ttt_steps_override: Optional[int] = None):
-        B_val, M_max = masks.shape[:2]
-        _, C, Hf, Wf = features.shape
+        del memory, ttt_steps_override
+
+        if isinstance(features, dict):
+            feature_maps = [features[level_name] for level_name in self.feature_levels if level_name in features]
+            reference_features = feature_maps[0]
+        else:
+            feature_maps = [features]
+            reference_features = features
+
+        _, _, Hf, Wf = reference_features.shape
 
         masks_small = F.interpolate(masks.float(), size=(Hf, Wf), mode="bilinear", align_corners=False)
+        masks_small = masks_small * pad_mask[:, :, None, None].to(dtype=reference_features.dtype)
         denom = masks_small.flatten(2).sum(dim=2, keepdim=True).clamp_min(1e-6)
-        pooled_feat = torch.einsum("bmhw,bchw->bmc", masks_small, features) / denom
 
-        ys = torch.linspace(0.0, 1.0, Hf, device=features.device, dtype=features.dtype).view(1, 1, Hf, 1)
-        xs = torch.linspace(0.0, 1.0, Wf, device=features.device, dtype=features.dtype).view(1, 1, 1, Wf)
+        ys = torch.linspace(0.0, 1.0, Hf, device=reference_features.device, dtype=reference_features.dtype).view(1, 1, Hf, 1)
+        xs = torch.linspace(0.0, 1.0, Wf, device=reference_features.device, dtype=reference_features.dtype).view(1, 1, 1, Wf)
         cx = (masks_small * xs).flatten(2).sum(dim=2, keepdim=True) / denom
         cy = (masks_small * ys).flatten(2).sum(dim=2, keepdim=True) / denom
 
@@ -487,8 +515,8 @@ class CustomMask2Former(Mask2FormerBase):
         y_max = (Hf - 1) - rows.flip(2).float().argmax(dim=2)
         valid_boxes = pad_mask & binary_masks.flatten(2).any(dim=2)
 
-        width = torch.where(valid_boxes, (x_max - x_min + 1).to(features.dtype), torch.zeros_like(cx.squeeze(-1)))
-        height = torch.where(valid_boxes, (y_max - y_min + 1).to(features.dtype), torch.zeros_like(cy.squeeze(-1)))
+        width = torch.where(valid_boxes, (x_max - x_min + 1).to(reference_features.dtype), torch.zeros_like(cx.squeeze(-1)))
+        height = torch.where(valid_boxes, (y_max - y_min + 1).to(reference_features.dtype), torch.zeros_like(cy.squeeze(-1)))
         bbox_features = torch.stack(
             [
                 cx.squeeze(-1),
@@ -502,6 +530,8 @@ class CustomMask2Former(Mask2FormerBase):
         cls_emb = self.gt_cls_proj(labels)
         bbox_emb = self.gt_bbox_proj(bbox_features)
         gt_signature = cls_emb + bbox_emb
+        for feature_map in feature_maps:
+            gt_signature = gt_signature + self._encode_gt_mask_context(feature_map, masks, pad_mask)
         return self.prepare_signature_embeddings(gt_signature)
 
     def _run_heads(self, q):

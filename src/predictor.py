@@ -596,7 +596,10 @@ class ModularPrototypePredictor:
 
         return model.encode_gts(
             raw.memory[batch_index:batch_index + 1],
-            raw.features[batch_index:batch_index + 1],
+            {
+                level_name: level_features[batch_index:batch_index + 1]
+                for level_name, level_features in raw.feature_maps.items()
+            },
             gt_masks,
             gt_labels,
             gt_pad_mask,
