@@ -329,7 +329,7 @@ class ClusterPanopticCriterion(nn.Module):
         if matched_pos.numel() > 0:
             matched_gt = matched_gt_indices[matched_query_mask]
             matched_q_sig = q_sig_flat[matched_query_mask]
-            matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt]
+            matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt].detach()
             matched_similarity = pairwise_similarity(
                 matched_q_sig.unsqueeze(1),
                 matched_gt_sig.unsqueeze(1),
