@@ -426,7 +426,7 @@ class ModularPrototypePredictor:
 
             prototype_logits.append((flat_queries.class_logits[member_query_indices] * weights.unsqueeze(1)).sum(dim=0))
             prototype_mask_embeddings.append((flat_queries.mask_embeddings[member_query_indices] * weights.unsqueeze(1)).sum(dim=0))
-            prototype_signatures.append(flat_queries.signature_embeddings[representative_query_index])
+            prototype_signatures.append((flat_queries.signature_embeddings[member_query_indices] * weights.unsqueeze(1)).sum(dim=0))
 
         return PrototypeState(
             signature_embeddings=torch.stack(prototype_signatures, dim=0),
@@ -440,6 +440,24 @@ class ModularPrototypePredictor:
             assignment_weights=torch.empty((flat_queries.num_queries, 0), device=device),
             assignment_strength=torch.empty((0,), device=device),
         )
+
+    def aggregate_seed_signatures_from_gt(
+        self,
+        model: CustomMask2Former,
+        flat_queries: FlatQueryOutputs,
+        gt_signatures: torch.Tensor,
+    ) -> torch.Tensor:
+        if gt_signatures.shape[0] == 0:
+            return gt_signatures
+
+        similarity = pairwise_similarity(
+            flat_queries.signature_embeddings,
+            gt_signatures,
+            metric=model.identity_similarity_metric,
+        )
+        seed_weights = (similarity + flat_queries.seed_scores.unsqueeze(1)).clamp(0.0, 1.0)
+        seed_weights = normalize_assignment_weights(seed_weights, normalize_over_queries=True)
+        return torch.matmul(seed_weights.transpose(0, 1), flat_queries.signature_embeddings)
 
     def refine_prototypes(self, model: CustomMask2Former, flat_queries: FlatQueryOutputs, prototypes: PrototypeState) -> PrototypeState:
         cfg = self.cfg.assign
@@ -616,10 +634,11 @@ class ModularPrototypePredictor:
         if gt_signatures.shape[0] == 0:
             return self._empty_prototype_state(flat_queries)
 
+        aggregated_signatures = self.aggregate_seed_signatures_from_gt(model, flat_queries, gt_signatures)
         return self.build_signature_prototypes(
             model,
             flat_queries,
-            gt_signatures,
+            aggregated_signatures,
             target_indices=target_indices,
         )
 

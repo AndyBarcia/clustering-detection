@@ -302,40 +302,60 @@ class ClusterPanopticCriterion(nn.Module):
         )
         return loss_cls, loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou
 
+    def _compute_seed_aggregation(
+        self,
+        q_sig_flat: torch.Tensor, # [B,Q,S]
+        q_seed_scores_flat: torch.Tensor, # [B,Q]
+        gt_sigs_norm: torch.Tensor, # [B,GT,S]
+        gt_pad_mask: torch.Tensor, # [B,GT]
+        identity_similarity_metric: str,
+    ) -> torch.Tensor:
+        seed_similarity = pairwise_similarity(
+            q_sig_flat,
+            gt_sigs_norm,
+            metric=identity_similarity_metric,
+        )
+        seed_weights = assignment_weights_with_influence(
+            similarity=seed_similarity,
+            alpha=1.0,
+            influence=None,
+            gating=q_seed_scores_flat,
+            valid_mask=gt_pad_mask,
+        )
+        seed_weights = normalize_assignment_weights(seed_weights, normalize_over_queries=True)
+        return aggregate_with_weights(seed_weights, q_sig_flat)
+
     def _compute_seed_losses(
         self,
         q_sig_flat: torch.Tensor, # [B,Q,S]
         gt_sigs_norm: torch.Tensor, # [B,GT,S]
         gt_pad_mask: torch.Tensor, # [B,GT]
-        q_seed_logits_flat: torch.Tensor, # [B,Q]
+        q_seed_scores_flat: torch.Tensor, # [B,Q]
         features: torch.Tensor, # [B,C,Hf,Wf]
         identity_similarity_metric: str,
     ):
-        # q_seed_logits_flat: [B,Q], matched_query_mask: [B,Q]
-        matched_query_mask, matched_gt_indices = hungarian_seed_assignment(
-            q_sig_flat,
-            gt_sigs_norm,
-            gt_pad_mask,
-            q_seed_logits_flat=q_seed_logits_flat,
-            similarity_metric=identity_similarity_metric,
-            seed_cost_weight=self.cfg.matcher_cost_seed,
+        proto_sig = self._compute_seed_aggregation(
+            q_sig_flat=q_sig_flat,
+            q_seed_scores_flat=q_seed_scores_flat,
+            gt_sigs_norm=gt_sigs_norm,
+            gt_pad_mask=gt_pad_mask,
+            identity_similarity_metric=identity_similarity_metric,
         )
 
-        seed_targets = matched_query_mask.float()
-        loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
-
         loss_seed_sig = features.sum() * 0.0
-        matched_pos = matched_query_mask.nonzero(as_tuple=False)
-        if matched_pos.numel() > 0:
-            matched_gt = matched_gt_indices[matched_query_mask]
-            matched_q_sig = q_sig_flat[matched_query_mask]
-            matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt]
-            matched_similarity = pairwise_similarity(
-                matched_q_sig.unsqueeze(1),
-                matched_gt_sig.unsqueeze(1),
+        loss_seed = features.sum() * 0.0
+        if gt_pad_mask.any():
+            proto_sig_valid = proto_sig[gt_pad_mask]
+            gt_sigs_valid = gt_sigs_norm[gt_pad_mask]
+            proto_similarity = pairwise_similarity(
+                proto_sig_valid.unsqueeze(1),
+                gt_sigs_valid.unsqueeze(1),
                 metric=identity_similarity_metric,
             ).squeeze(-1).squeeze(-1)
-            loss_seed_sig = (1.0 - matched_similarity).mean()
+            loss_seed_sig = (1.0 - proto_similarity).mean()
+
+            proto_norm = torch.linalg.vector_norm(proto_sig_valid, ord=2, dim=-1)
+            loss_seed = (1.0 - proto_norm).pow(2).mean()
 
         return loss_seed, loss_seed_sig
 
@@ -444,7 +464,7 @@ class ClusterPanopticCriterion(nn.Module):
             q_sig_flat=q_sig_flat,
             gt_sigs_norm=gt_sigs_norm,
             gt_pad_mask=gt_pad_mask,
-            q_seed_logits_flat=q_seed_logits_flat,
+            q_seed_scores_flat=torch.sigmoid(q_seed_logits_flat),
             features=features,
             identity_similarity_metric=model.identity_similarity_metric,
         )
