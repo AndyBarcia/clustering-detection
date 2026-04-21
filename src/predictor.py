@@ -100,39 +100,43 @@ def _binary_erode(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
     return ~_binary_dilate(~mask.to(dtype=torch.bool), kernel_size)
 
 
+def _apply_mask_morphology(mask: torch.Tensor, cfg: PrototypeInferenceConfig) -> torch.Tensor:
+    overlap_cfg = cfg.overlap
+    op = overlap_cfg.morphology_op.lower()
+    kernel_size = int(overlap_cfg.morphology_kernel_size)
+    iterations = max(1, int(overlap_cfg.morphology_iterations))
+
+    if op == "none" or kernel_size <= 1:
+        return mask.to(dtype=torch.bool)
+    if kernel_size % 2 == 0:
+        raise ValueError("overlap.morphology_kernel_size must be odd when morphology is enabled.")
+
+    out = mask.to(dtype=torch.bool)
+
+    for _ in range(iterations):
+        if op == "opening":
+            out = _binary_dilate(_binary_erode(out, kernel_size), kernel_size)
+        elif op == "closing":
+            out = _binary_erode(_binary_dilate(out, kernel_size), kernel_size)
+        elif op == "open_close":
+            out = _binary_erode(_binary_dilate(_binary_dilate(_binary_erode(out, kernel_size), kernel_size), kernel_size), kernel_size)
+        elif op == "close_open":
+            out = _binary_dilate(_binary_erode(_binary_erode(_binary_dilate(out, kernel_size), kernel_size), kernel_size), kernel_size)
+        else:
+            raise ValueError(
+                "overlap.morphology_op must be one of "
+                "{'none', 'opening', 'closing', 'open_close', 'close_open'}."
+            )
+
+    return out
+
+
 class ModularPrototypePredictor:
     def __init__(self, cfg: PrototypeInferenceConfig):
         self.cfg = cfg
 
     def _apply_morphology(self, mask: torch.Tensor) -> torch.Tensor:
-        cfg = self.cfg.overlap
-        op = cfg.morphology_op.lower()
-        kernel_size = int(cfg.morphology_kernel_size)
-        iterations = max(1, int(cfg.morphology_iterations))
-
-        if op == "none" or kernel_size <= 1:
-            return mask.to(dtype=torch.bool)
-        if kernel_size % 2 == 0:
-            raise ValueError("overlap.morphology_kernel_size must be odd when morphology is enabled.")
-
-        out = mask.to(dtype=torch.bool)
-
-        for _ in range(iterations):
-            if op == "opening":
-                out = _binary_dilate(_binary_erode(out, kernel_size), kernel_size)
-            elif op == "closing":
-                out = _binary_erode(_binary_dilate(out, kernel_size), kernel_size)
-            elif op == "open_close":
-                out = _binary_erode(_binary_dilate(_binary_dilate(_binary_erode(out, kernel_size), kernel_size), kernel_size), kernel_size)
-            elif op == "close_open":
-                out = _binary_dilate(_binary_erode(_binary_erode(_binary_dilate(out, kernel_size), kernel_size), kernel_size), kernel_size)
-            else:
-                raise ValueError(
-                    "overlap.morphology_op must be one of "
-                    "{'none', 'opening', 'closing', 'open_close', 'close_open'}."
-                )
-
-        return out
+        return _apply_mask_morphology(mask, self.cfg)
 
     @torch.no_grad()
     def predict(self, model: CustomMask2Former, images: torch.Tensor):
@@ -908,6 +912,9 @@ class StandardMask2FormerPredictor:
     def __init__(self, cfg: PrototypeInferenceConfig):
         self.cfg = cfg
 
+    def _apply_morphology(self, mask: torch.Tensor) -> torch.Tensor:
+        return _apply_mask_morphology(mask, self.cfg)
+
     @torch.no_grad()
     def predict(self, model: Mask2FormerBase, images: torch.Tensor):
         raw = model(images)
@@ -976,35 +983,86 @@ class StandardMask2FormerPredictor:
             (flat_queries.image_height, flat_queries.image_width),
         )[0]
         mask_probabilities = torch.sigmoid(mask_logits)
-        binary_masks = mask_probabilities >= cfg.mask_threshold
 
-        scores = torch.ones_like(flat_queries.seed_scores)
         if cfg.use_class_confidence:
-            scores = scores * flat_queries.class_probabilities.max(dim=-1).values
+            scores, labels = flat_queries.class_probabilities.max(dim=-1)
+        else:
+            labels = flat_queries.predicted_labels
+            scores = torch.ones_like(flat_queries.seed_scores)
 
-        keep_mask = torch.ones_like(scores, dtype=torch.bool)
+        keep_mask = labels.ne(cfg.no_object_class_index)
         keep_mask &= scores >= cfg.min_prototype_score
+
+        kept_query_indices = torch.where(keep_mask)[0]
+        empty_mask_grid = torch.empty((0, flat_queries.image_height, flat_queries.image_width), device=flat_queries.features.device)
+
+        if kept_query_indices.numel() == 0:
+            return ResolvedPrediction(
+                flat_queries=flat_queries,
+                prototypes=None,
+                kept_prototype_indices=kept_query_indices,
+                resolved_target_indices=None,
+                signature_embeddings=torch.empty((0, 0), device=flat_queries.features.device),
+                class_logits=flat_queries.class_logits[kept_query_indices],
+                class_probabilities=flat_queries.class_probabilities[kept_query_indices],
+                mask_embeddings=flat_queries.mask_embeddings[kept_query_indices],
+                scores=scores[kept_query_indices],
+                raw_mask_logits=empty_mask_grid,
+                raw_mask_probabilities=empty_mask_grid,
+                resolved_masks=[],
+                resolved_labels=[],
+                resolved_scores=[],
+            )
+
+        kept_scores = scores[kept_query_indices]
+        kept_labels = labels[kept_query_indices]
+        kept_mask_logits = mask_logits[kept_query_indices]
+        kept_mask_probabilities = mask_probabilities[kept_query_indices]
+        probability_masks = kept_scores[:, None, None] * kept_mask_probabilities
+        winner_positions = probability_masks.argmax(dim=0)
 
         resolved_masks = []
         resolved_labels = []
         resolved_scores = []
-        kept_mask_logits = []
-        kept_mask_probabilities = []
-        kept_query_indices = []
+        resolved_kept_positions = []
 
-        for query_index in torch.where(keep_mask)[0].tolist():
-            mask = binary_masks[query_index]
+        for kept_position in range(kept_query_indices.numel()):
+            pred_class = int(kept_labels[kept_position].item())
+            original_mask = kept_mask_probabilities[kept_position] >= cfg.mask_threshold
+            original_area = int(original_mask.sum().item())
+            assigned_mask = winner_positions == kept_position
+            mask_area = int(assigned_mask.sum().item())
+            mask = assigned_mask & original_mask
+
+            if mask_area <= 0 or original_area <= 0 or mask.sum().item() < cfg.min_area:
+                continue
+            if (mask_area / max(original_area, 1)) < cfg.overlap_threshold:
+                continue
+
+            mask = self._apply_morphology(mask)
             if mask.sum().item() < cfg.min_area:
                 continue
-            kept_query_indices.append(query_index)
-            kept_mask_logits.append(mask_logits[query_index])
-            kept_mask_probabilities.append(mask_probabilities[query_index])
-            resolved_masks.append(mask)
-            resolved_labels.append(int(flat_queries.predicted_labels[query_index].item()))
-            resolved_scores.append(float(scores[query_index].item()))
 
-        kept_query_indices = torch.as_tensor(kept_query_indices, device=flat_queries.features.device, dtype=torch.long)
-        empty_mask_grid = torch.empty((0, flat_queries.image_height, flat_queries.image_width), device=flat_queries.features.device)
+            resolved_kept_positions.append(kept_position)
+            resolved_masks.append(mask)
+            resolved_labels.append(pred_class)
+            resolved_scores.append(float(kept_scores[kept_position].item()))
+
+        if resolved_kept_positions:
+            resolved_index_tensor = torch.as_tensor(
+                resolved_kept_positions,
+                device=flat_queries.features.device,
+                dtype=torch.long,
+            )
+            kept_query_indices = kept_query_indices[resolved_index_tensor]
+            kept_mask_logits = kept_mask_logits[resolved_index_tensor]
+            kept_mask_probabilities = kept_mask_probabilities[resolved_index_tensor]
+            kept_scores = kept_scores[resolved_index_tensor]
+        else:
+            kept_query_indices = kept_query_indices[:0]
+            kept_mask_logits = kept_mask_logits[:0]
+            kept_mask_probabilities = kept_mask_probabilities[:0]
+            kept_scores = kept_scores[:0]
 
         return ResolvedPrediction(
             flat_queries=flat_queries,
@@ -1015,9 +1073,9 @@ class StandardMask2FormerPredictor:
             class_logits=flat_queries.class_logits[kept_query_indices],
             class_probabilities=flat_queries.class_probabilities[kept_query_indices],
             mask_embeddings=flat_queries.mask_embeddings[kept_query_indices],
-            scores=scores[kept_query_indices],
-            raw_mask_logits=torch.stack(kept_mask_logits, dim=0) if kept_mask_logits else empty_mask_grid,
-            raw_mask_probabilities=torch.stack(kept_mask_probabilities, dim=0) if kept_mask_probabilities else empty_mask_grid,
+            scores=kept_scores,
+            raw_mask_logits=kept_mask_logits,
+            raw_mask_probabilities=kept_mask_probabilities,
             resolved_masks=resolved_masks,
             resolved_labels=resolved_labels,
             resolved_scores=resolved_scores,

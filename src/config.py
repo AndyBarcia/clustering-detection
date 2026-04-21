@@ -134,6 +134,8 @@ class OverlapResolutionConfig:
 
     mask_threshold: float = 0.51
     pixel_score_threshold: float = 0.21
+    overlap_threshold: float = 0.8
+    no_object_class_index: int = 0
 
     use_class_confidence: bool = True
     use_assignment_strength: bool = False

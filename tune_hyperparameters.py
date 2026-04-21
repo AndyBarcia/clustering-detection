@@ -73,8 +73,13 @@ from src.evaluation import evaluate_system_many_configs
 from src.panoptic import load_system_checkpoint
 
 
-DEFAULT_SEARCH_SPACE = {
+SHARED_SEARCH_SPACE = {
     "ttt_steps": {"type": "int", "low": 0, "high": 20},
+    "overlap.min_area": {"type": "int", "low": 1, "high": 64},
+    "overlap.mask_threshold": {"type": "float", "low": 0.3, "high": 0.7},
+}
+
+CLUSTERED_ONLY_SEARCH_SPACE = {
     "seed.quality_threshold": {"type": "float", "low": 0.03, "high": 0.2},
     "seed.topk": {"type": "categorical", "choices": [None, 10, 20, 40]},
     "seed.min_num_seeds": {"type": "int", "low": 1, "high": 4},
@@ -103,15 +108,27 @@ DEFAULT_SEARCH_SPACE = {
     # "assign.class_compat_power": {"type": "float", "low": 0.0, "high": 1.0},
     "assign.query_quality_power": {"type": "float", "low": 0.5, "high": 2.0},
     "overlap.min_prototype_score": {"type": "float", "low": 0.01, "high": 0.1},
-    "overlap.min_area": {"type": "int", "low": 1, "high": 64},
     "overlap.pixel_score_threshold": {"type": "float", "low": 0.15, "high": 0.35},
-    "overlap.mask_threshold": {"type": "float", "low": 0.3, "high": 0.7},
     "overlap.use_class_confidence": {"type": "categorical", "choices": [True, False]},
     "overlap.use_assignment_strength": {"type": "categorical", "choices": [True, False]},
     "overlap.assignment_strength_power": {"type": "float", "low": 0.0, "high": 2.0},
 }
 
-BEST_KNOWN_PARAMS = {
+STANDARD_MASK2FORMER_ONLY_SEARCH_SPACE = {
+    "overlap.overlap_threshold": {"type": "float", "low": 0.5, "high": 1.0},
+}
+
+DEFAULT_SEARCH_SPACE = {
+    **SHARED_SEARCH_SPACE,
+    **CLUSTERED_ONLY_SEARCH_SPACE,
+}
+
+SHARED_BEST_KNOWN_PARAMS = {
+    "overlap.mask_threshold": 0.51,
+    "overlap.min_area": 18,
+}
+
+CLUSTERED_ONLY_BEST_KNOWN_PARAMS = {
     "assign.foreground_prob_power": 0.71,
     "assign.similarity_floor": 0.005,
     "assign.use_foreground_prob": True,
@@ -123,8 +140,6 @@ BEST_KNOWN_PARAMS = {
     "cluster.method": "cc",
     "cluster.promote_noise_to_singletons": True,
     "overlap.assignment_strength_power": 0.55,
-    "overlap.mask_threshold": 0.51,
-    "overlap.min_area": 18,
     "overlap.min_prototype_score": 0.06,
     "overlap.pixel_score_threshold": 0.21,
     "overlap.use_assignment_strength": False,
@@ -136,6 +151,10 @@ BEST_KNOWN_PARAMS = {
     "seed.topk": None,
     "seed.quality_threshold": 0.07,
     "seed.use_foreground_in_score": True,
+}
+
+STANDARD_MASK2FORMER_ONLY_BEST_KNOWN_PARAMS = {
+    "overlap.overlap_threshold": 0.8,
 }
 
 METRIC_ALIASES = {
@@ -272,7 +291,7 @@ def configure_cpu_threading(args):
 
 def load_search_space(path: str | None) -> Dict[str, Dict[str, Any]]:
     if path is None:
-        return json.loads(json.dumps(DEFAULT_SEARCH_SPACE))
+        return {}
 
     payload = json.loads(Path(path).read_text())
     if not isinstance(payload, dict):
@@ -389,6 +408,24 @@ def canonicalize_params(params: Dict[str, Any]) -> str:
     return json.dumps(sanitize_for_json(params), sort_keys=True, separators=(",", ":"))
 
 
+def build_default_search_space(model_variant: str) -> Dict[str, Dict[str, Any]]:
+    search_space = dict(SHARED_SEARCH_SPACE)
+    if model_variant == "standard_mask2former":
+        search_space.update(STANDARD_MASK2FORMER_ONLY_SEARCH_SPACE)
+    else:
+        search_space.update(CLUSTERED_ONLY_SEARCH_SPACE)
+    return json.loads(json.dumps(search_space))
+
+
+def build_best_known_params(model_variant: str) -> Dict[str, Any]:
+    params = dict(SHARED_BEST_KNOWN_PARAMS)
+    if model_variant == "standard_mask2former":
+        params.update(STANDARD_MASK2FORMER_ONLY_BEST_KNOWN_PARAMS)
+    else:
+        params.update(CLUSTERED_ONLY_BEST_KNOWN_PARAMS)
+    return json.loads(json.dumps(params))
+
+
 def get_best_trial(study: optuna.Study):
     completed_trials = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
     if not completed_trials:
@@ -492,8 +529,6 @@ def main():
     configure_cpu_threading(args)
     output_path = Path(args.output_json)
     checkpoint_path = Path(args.checkpoint).resolve()
-    search_space = load_search_space(args.search_space_json)
-
     if args.storage is None:
         storage_path = output_path.with_suffix(".db").resolve()
         storage = f"sqlite:///{storage_path}"
@@ -503,6 +538,12 @@ def main():
     system, ckpt = load_system_checkpoint(str(checkpoint_path), map_location=args.device)
     system = system.to(args.device)
     base_inference_cfg = dataclass_from_dict(PrototypeInferenceConfig, ckpt["inference_config"])
+    model_variant = ckpt["model_config"]["variant"]
+    default_search_space = build_default_search_space(model_variant)
+    best_known_params = build_best_known_params(model_variant)
+    custom_search_space = load_search_space(args.search_space_json)
+    search_space = dict(default_search_space)
+    search_space.update(custom_search_space)
 
     sampler = optuna.samplers.TPESampler(seed=args.seed, n_startup_trials=args.startup_trials)
     study = optuna.create_study(
@@ -530,7 +571,7 @@ def main():
         },
     )
 
-    maybe_enqueue_trial(study, BEST_KNOWN_PARAMS)
+    maybe_enqueue_trial(study, best_known_params)
 
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Study name: {study.study_name}")
