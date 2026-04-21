@@ -14,7 +14,7 @@ from scipy.optimize import linear_sum_assignment
 
 from .dataset import SyntheticPanopticBatchGenerator, BatchedSyntheticIterableDataset
 from .outputs import EvaluationPredictionSet, ResolvedPrediction
-from .predictor import ModularPrototypePredictor
+from .predictor import build_predictor
 from .signature_ops import pairwise_distance
 
 
@@ -671,7 +671,7 @@ def evaluate_system_many_configs(
     system.eval()
 
     predictors = {
-        key: ModularPrototypePredictor(cfg)
+        key: build_predictor(cfg, system.cfg.model.variant)
         for key, cfg in inference_cfgs.items()
     }
     clustering_evaluations = {key: [] for key in inference_cfgs}
