@@ -59,6 +59,19 @@ def project_mask_embeddings(
     features: torch.Tensor,
     image_shape: tuple[int, int],
 ) -> torch.Tensor:
+    mask_logits = project_mask_embeddings_native(mask_embeddings, features)
+    return F.interpolate(
+        mask_logits,
+        size=image_shape,
+        mode="bilinear",
+        align_corners=False,
+    )
+
+
+def project_mask_embeddings_native(
+    mask_embeddings: torch.Tensor,
+    features: torch.Tensor,
+) -> torch.Tensor:
     if mask_embeddings.dim() == 3 and features.dim() == 4:
         mask_logits = torch.einsum("bmc,bchw->bmhw", mask_embeddings, features)
     elif mask_embeddings.dim() == 2 and features.dim() == 3:
@@ -68,9 +81,4 @@ def project_mask_embeddings(
             "project_mask_embeddings expects [B,M,C] x [B,C,H,W] or [M,C] x [C,H,W] tensors, "
             f"got {tuple(mask_embeddings.shape)} and {tuple(features.shape)}."
         )
-    return F.interpolate(
-        mask_logits,
-        size=image_shape,
-        mode="bilinear",
-        align_corners=False,
-    )
+    return mask_logits

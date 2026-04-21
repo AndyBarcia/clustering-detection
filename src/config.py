@@ -59,6 +59,7 @@ class LossConfig:
     w_seed: float = 2.0
     w_inter: float = 10.0
     inter_margin: float = 0.0
+    clustered_mask_target_mode: str = "native_soft"
 
     matcher_cost_class: float = 2.0
     matcher_cost_mask_bce: float = 5.0

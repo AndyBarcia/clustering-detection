@@ -9,6 +9,7 @@ from .mask_aggregation import (
     aggregate_with_weights,
     normalize_assignment_weights,
     project_mask_embeddings,
+    project_mask_embeddings_native,
 )
 from .model import CustomMask2Former, Mask2FormerBase
 from .outputs import RawOutputs
@@ -34,6 +35,18 @@ def soft_partition_iou_loss(logits, targets, valid_mask, eps=1e-6):
     if valid_mask.any():
         return 1.0 - iou[valid_mask].mean()
     return logits.sum() * 0.0
+
+
+def soft_target_cross_entropy_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    neg_inf = torch.finfo(logits.dtype).min
+    masked_logits = logits.masked_fill(~valid_mask[:, :, None, None], neg_inf)
+    log_probs = F.log_softmax(masked_logits, dim=1)
+    loss_map = -(targets * log_probs).sum(dim=1)
+    return loss_map.mean()
 
 
 def hungarian_seed_assignment(
@@ -246,20 +259,48 @@ class ClusterPanopticCriterion(nn.Module):
     ):
         level_loss_mask_ce = {}
         level_loss_mask_iou = {}
+        target_mode = getattr(self.cfg, "clustered_mask_target_mode", "fullres_hard")
 
         for level_name, features_val in feature_maps_val:
-            mask_logits = project_mask_embeddings(
-                proto_mask_emb,
-                features_val,
-                img_shape,
-            )
+            if target_mode == "native_soft":
+                mask_logits = project_mask_embeddings_native(proto_mask_emb, features_val)
+                gt_masks_level = F.interpolate(
+                    gt_masks_pad,
+                    size=features_val.shape[-2:],
+                    mode="area",
+                )
+                gt_masks_level = gt_masks_level * gt_pad_mask[:, :, None, None]
+                gt_partition_mass = gt_masks_level.sum(dim=1, keepdim=True).clamp_min(1e-6)
+                gt_masks_level = gt_masks_level / gt_partition_mass
 
-            neg_inf = torch.finfo(mask_logits.dtype).min
-            mask_logits_masked = mask_logits.masked_fill(~gt_pad_mask[:, :, None, None], neg_inf)
-            gt_mask_target = gt_masks_pad.argmax(dim=1)
+                level_loss_mask_ce[level_name] = soft_target_cross_entropy_loss(
+                    mask_logits,
+                    gt_masks_level,
+                    gt_pad_mask,
+                )
+                level_loss_mask_iou[level_name] = soft_partition_iou_loss(
+                    mask_logits,
+                    gt_masks_level,
+                    gt_pad_mask,
+                )
+            elif target_mode == "fullres_hard":
+                mask_logits = project_mask_embeddings(
+                    proto_mask_emb,
+                    features_val,
+                    img_shape,
+                )
 
-            level_loss_mask_ce[level_name] = F.cross_entropy(mask_logits_masked, gt_mask_target)
-            level_loss_mask_iou[level_name] = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
+                neg_inf = torch.finfo(mask_logits.dtype).min
+                mask_logits_masked = mask_logits.masked_fill(~gt_pad_mask[:, :, None, None], neg_inf)
+                gt_mask_target = gt_masks_pad.argmax(dim=1)
+
+                level_loss_mask_ce[level_name] = F.cross_entropy(mask_logits_masked, gt_mask_target)
+                level_loss_mask_iou[level_name] = soft_partition_iou_loss(mask_logits, gt_masks_pad, gt_pad_mask)
+            else:
+                raise ValueError(
+                    f"Unknown clustered_mask_target_mode={target_mode!r}; "
+                    "expected 'native_soft' or 'fullres_hard'."
+                )
 
         loss_mask_ce = torch.stack(list(level_loss_mask_ce.values())).mean()
         loss_mask_iou = torch.stack(list(level_loss_mask_iou.values())).mean()
