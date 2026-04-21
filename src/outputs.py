@@ -34,7 +34,7 @@ class FlatQueryOutputs:
     class_probabilities: torch.Tensor     # [Q, K]
     signature_embeddings: torch.Tensor    # [Q, S]
     seed_scores: torch.Tensor             # [Q]
-    influence_scores: torch.Tensor        # [Q]
+    influence_scores: Optional[torch.Tensor]        # [Q]
     background_confidence: torch.Tensor   # [Q]
     foreground_confidence: torch.Tensor   # [Q]
     partition_confidence: torch.Tensor    # [Q]

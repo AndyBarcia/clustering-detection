@@ -391,8 +391,10 @@ class ClusterPanopticCriterion(nn.Module):
         influence_preds = raw.influence_preds
         H_img, W_img = raw.img_shape
 
-        if sig_embs is None or seed_logits is None or influence_preds is None:
-            raise ValueError("Clustered criterion requires signature, seed, and influence predictions.")
+        if sig_embs is None or seed_logits is None:
+            raise ValueError("Clustered criterion requires signature and seed predictions.")
+        if model.use_influence_for_mask_aggregation and influence_preds is None:
+            raise ValueError("Clustered criterion requires influence predictions when influence aggregation is enabled.")
 
         # features: [B,C,Hf,Wf], memory: [B,N_mem,C]
         B = features.shape[0]
@@ -440,7 +442,7 @@ class ClusterPanopticCriterion(nn.Module):
         q_mask_emb = mask_embs[:, valid_b]
         q_cls = cls_preds[:, valid_b]
         q_seed_logits = seed_logits[:, valid_b]
-        q_influence = influence_preds[:, valid_b]
+        q_influence = None if influence_preds is None else influence_preds[:, valid_b]
 
         # Decoder outputs are [L,Bv,Q,...]; we flatten layers and queries into a single query axis.
         L, _, N_q, S = q_sig.shape
@@ -451,7 +453,7 @@ class ClusterPanopticCriterion(nn.Module):
         q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, L * N_q, -1)
         # q_seed_logits_flat/q_influence_flat: [Bv,L*Q]
         q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
-        q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
+        q_influence_flat = None if q_influence is None else q_influence.transpose(0, 1).reshape(B_val, L * N_q)
 
         # gt_sigs_norm: [Bv,GT,S]
         feature_maps_dict = {

@@ -403,6 +403,7 @@ class CustomMask2Former(Mask2FormerBase):
 
         self.sig_dim = sig_dim
         self.signature_normalize = cfg.heads.normalize_signatures
+        self.use_influence_for_mask_aggregation = cfg.heads.use_influence_for_mask_aggregation
         self.aggregation_similarity_metric = cfg.heads.aggregation_similarity_metric
         self.identity_similarity_metric = cfg.heads.identity_similarity_metric
 
@@ -416,11 +417,14 @@ class CustomMask2Former(Mask2FormerBase):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
         )
-        self.influence_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
+        if self.use_influence_for_mask_aggregation:
+            self.influence_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, 1),
+            )
+        else:
+            self.influence_head = None
 
         self.gt_cls_proj = nn.Embedding(num_classes, sig_dim)
         self.gt_bbox_proj = nn.Sequential(
@@ -599,7 +603,9 @@ class CustomMask2Former(Mask2FormerBase):
         sig_embs = self.prepare_signature_embeddings(self.sig_head(q))
         seed_logits = self.seed_head(q).squeeze(-1)
         seed_scores = torch.sigmoid(seed_logits)
-        influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
+        influence_preds = None
+        if self.influence_head is not None:
+            influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
         return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds
 
 

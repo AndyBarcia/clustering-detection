@@ -166,7 +166,7 @@ class ModularPrototypePredictor:
         query_class_logits = raw.cls_preds[:, batch_index]
         query_signature_embeddings = raw.sig_embs[:, batch_index]
         query_seed_scores = raw.seed_scores[:, batch_index]
-        query_influence_scores = raw.influence_preds[:, batch_index]
+        query_influence_scores = None if raw.influence_preds is None else raw.influence_preds[:, batch_index]
 
         num_layers, queries_per_layer, signature_dim = query_signature_embeddings.shape
         num_classes = query_class_logits.shape[-1]
@@ -175,7 +175,8 @@ class ModularPrototypePredictor:
         query_class_logits = query_class_logits.reshape(num_layers * queries_per_layer, num_classes)
         query_signature_embeddings = query_signature_embeddings.reshape(num_layers * queries_per_layer, signature_dim)
         query_seed_scores = query_seed_scores.reshape(num_layers * queries_per_layer)
-        query_influence_scores = query_influence_scores.reshape(num_layers * queries_per_layer)
+        if query_influence_scores is not None:
+            query_influence_scores = query_influence_scores.reshape(num_layers * queries_per_layer)
 
         query_class_probabilities = F.softmax(query_class_logits, dim=-1)
         predicted_labels = query_class_probabilities.argmax(dim=-1)
@@ -213,7 +214,7 @@ class ModularPrototypePredictor:
         if cfg.min_foreground_prob > 0:
             eligible_mask &= flat_queries.partition_confidence >= cfg.min_foreground_prob
 
-        if cfg.max_influence is not None:
+        if cfg.max_influence is not None and flat_queries.influence_scores is not None:
             eligible_mask &= flat_queries.influence_scores <= cfg.max_influence
 
         selected_mask = eligible_mask.clone()
@@ -473,7 +474,10 @@ class ModularPrototypePredictor:
             )
             raw_weights = assignment_weights_with_influence(
                 similarity=similarity,
-                influence=flat_queries.influence_scores[source_query_indices],
+                influence=(
+                    flat_queries.influence_scores[source_query_indices]
+                    if model.use_influence_for_mask_aggregation else None
+                ),
                 alpha=1.0,
                 similarity_floor=cfg.similarity_floor,
             )
@@ -549,7 +553,7 @@ class ModularPrototypePredictor:
         )
         raw_weights = assignment_weights_with_influence(
             similarity=similarity,
-            influence=flat_queries.influence_scores,
+            influence=flat_queries.influence_scores if model.use_influence_for_mask_aggregation else None,
             alpha=1.0,
             similarity_floor=self.cfg.assign.similarity_floor,
         )

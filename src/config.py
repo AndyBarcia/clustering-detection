@@ -36,6 +36,7 @@ class HeadConfig:
     hidden_dim: int = 1024
     sig_dim: int = 64
     normalize_signatures: bool = True
+    use_influence_for_mask_aggregation: bool = False
     aggregation_similarity_metric: str = "cosine"
     identity_similarity_metric: str = "cosine"
 

@@ -6,11 +6,14 @@ import torch.nn.functional as F
 
 def assignment_affinity(
     similarity: torch.Tensor,
-    influence: torch.Tensor,
+    influence: torch.Tensor | None,
     similarity_floor: float = 0.0,
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    affinity = (similarity + influence.unsqueeze(-1)).clamp(0.0, 1.0)
+    if influence is not None:
+        affinity = (similarity + influence.unsqueeze(-1)).clamp(0.0, 1.0)
+    else:
+        affinity = similarity.clamp(0.0, 1.0)
     if similarity_floor > 0.0:
         affinity = affinity.clamp_min(similarity_floor)
     if valid_mask is not None:
@@ -20,7 +23,7 @@ def assignment_affinity(
 
 def assignment_weights_with_influence(
     similarity: torch.Tensor,
-    influence: torch.Tensor,
+    influence: torch.Tensor | None,
     alpha: float | torch.Tensor,
     valid_mask: torch.Tensor | None = None,
     similarity_floor: float = 0.0,
