@@ -164,7 +164,7 @@ class ClusterPanopticCriterion(nn.Module):
     ) -> list[tuple[str, torch.Tensor]]:
         return [
             (level_name, raw.feature_maps[level_name])
-            for level_name in model.feature_levels
+            for level_name in model.get_mask_loss_feature_levels()
             if level_name in raw.feature_maps
         ]
 
@@ -566,7 +566,7 @@ class StandardMask2FormerCriterion(nn.Module):
     def compute_loss(self, model: Mask2FormerBase, raw: RawOutputs, targets):
         feature_maps = [
             (level_name, raw.feature_maps[level_name])
-            for level_name in model.feature_levels
+            for level_name in model.get_mask_loss_feature_levels()
             if level_name in raw.feature_maps
         ]
         reference_features = raw.features

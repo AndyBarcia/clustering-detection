@@ -246,6 +246,7 @@ class Mask2FormerBase(nn.Module):
             "p4": nn.Parameter(torch.randn(1, (spatial_hw // 4) * (spatial_hw // 4), hidden_dim) * 0.02),
             "p5": nn.Parameter(torch.randn(1, (spatial_hw // 8) * (spatial_hw // 8), hidden_dim) * 0.02),
         })
+        self._current_decoder_feature_maps: Optional[dict[str, torch.Tensor]] = None
 
     def _decoder_seed_head(self):
         return None
@@ -288,6 +289,40 @@ class Mask2FormerBase(nn.Module):
         mask_embs = self.mask_head(q)
         return torch.einsum("bqc,bchw->bqhw", mask_embs, features)
 
+    def get_mask_loss_feature_levels(self) -> tuple[str, ...]:
+        configured_levels = self.cfg.mask_loss_levels
+        unknown_levels = tuple(level_name for level_name in configured_levels if level_name not in self.feature_levels)
+        if unknown_levels:
+            raise ValueError(
+                f"ModelConfig.mask_loss_levels contains unknown levels {unknown_levels!r}. "
+                f"Available levels are {self.feature_levels!r}."
+            )
+
+        valid_levels = tuple(configured_levels)
+        if not valid_levels:
+            raise ValueError(
+                "ModelConfig.mask_loss_levels must include at least one known feature level. "
+                f"Got {configured_levels!r} for available levels {self.feature_levels!r}."
+            )
+        return valid_levels
+
+    def get_cross_attention_mask_source_level(self, target_level_name: str) -> str:
+        trained_levels = self.get_mask_loss_feature_levels()
+        if target_level_name in trained_levels:
+            return target_level_name
+
+        target_idx = self.feature_levels.index(target_level_name)
+        for source_idx in range(target_idx - 1, -1, -1):
+            candidate_level = self.feature_levels[source_idx]
+            if candidate_level in trained_levels:
+                return candidate_level
+
+        raise ValueError(
+            "Cross-attention masking requires at least one trained mask level at or above each decoder level. "
+            f"No higher-resolution trained level is available for decoder level '{target_level_name}' "
+            f"with mask_loss_levels={trained_levels!r}."
+        )
+
     def _decoder_memory_mask(self, query_state: torch.Tensor, features: torch.Tensor, memory_hw=None):
         return None
 
@@ -307,14 +342,18 @@ class Mask2FormerBase(nn.Module):
                 memory_hw = (side, side)
             return self._decoder_memory_mask(query_state, level_features, memory_hw)
 
-        with self._temporary_ttt_steps(ttt_steps_override):
-            q_dec_all, intermediate_ttt_q = self.transformer_decoder(
-                tgt=query_embed,
-                memory=memory_levels[0],
-                memory_sequence=memory_levels,
-                memory_mask_fn=memory_mask_fn,
-                seed_head=self._decoder_seed_head(),
-            )
+        self._current_decoder_feature_maps = feature_maps
+        try:
+            with self._temporary_ttt_steps(ttt_steps_override):
+                q_dec_all, intermediate_ttt_q = self.transformer_decoder(
+                    tgt=query_embed,
+                    memory=memory_levels[0],
+                    memory_sequence=memory_levels,
+                    memory_mask_fn=memory_mask_fn,
+                    seed_head=self._decoder_seed_head(),
+                )
+        finally:
+            self._current_decoder_feature_maps = None
         return q_dec_all, intermediate_ttt_q
 
     def _run_heads(self, q):
@@ -399,7 +438,27 @@ class CustomMask2Former(Mask2FormerBase):
         return self.seed_head
 
     def _decoder_memory_mask(self, query_state: torch.Tensor, features: torch.Tensor, memory_hw=None):
-        mask_logits = self._predict_mask_logits(query_state, features)
+        if self._current_decoder_feature_maps is None:
+            raise RuntimeError("Decoder feature maps are unavailable while building the cross-attention mask.")
+
+        target_level_name = next(
+            (
+                level_name
+                for level_name in self.decoder_feature_levels
+                if self._current_decoder_feature_maps[level_name].shape[-2:] == features.shape[-2:]
+            ),
+            None,
+        )
+
+        if target_level_name is None:
+            raise ValueError(
+                f"Unable to infer decoder level for feature shape {tuple(features.shape[-2:])} "
+                f"and memory size {memory_hw!r}."
+            )
+
+        source_level_name = self.get_cross_attention_mask_source_level(target_level_name)
+        source_features = self._current_decoder_feature_maps[source_level_name]
+        mask_logits = self._predict_mask_logits(query_state, source_features)
         if memory_hw is not None and mask_logits.shape[-2:] != memory_hw:
             mask_logits = F.interpolate(mask_logits, size=memory_hw, mode="bilinear", align_corners=False)
         mask_bias = mask_logits.flatten(2)

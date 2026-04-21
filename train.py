@@ -118,6 +118,11 @@ def parse_args():
         help="Disable the synthetic evaluation pass after each epoch.",
     )
     parser.add_argument(
+        "--mask-loss-levels",
+        default=None,
+        help="Comma-separated feature levels used for mask supervision, e.g. p2,p3,p4. Defaults to all levels.",
+    )
+    parser.add_argument(
         "--output-dir",
         default="outputs",
         help="Directory where checkpoints and JSON metrics will be written.",
@@ -129,6 +134,15 @@ def resolve_device(requested_device: Optional[str]) -> torch.device:
     if requested_device:
         return torch.device(requested_device)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def parse_mask_loss_levels(mask_loss_levels_arg: Optional[str]) -> Optional[tuple[str, ...]]:
+    if mask_loss_levels_arg is None:
+        return None
+    levels = tuple(level.strip() for level in mask_loss_levels_arg.split(",") if level.strip())
+    if not levels:
+        raise ValueError("--mask-loss-levels must specify at least one level when provided.")
+    return levels
 
 
 def build_dataloader(args, device):
@@ -276,6 +290,7 @@ def save_epoch_visualization(output_dir: Path, system: PanopticSystem, images, t
 def main():
     args = parse_args()
     device = resolve_device(args.device)
+    mask_loss_levels = parse_mask_loss_levels(args.mask_loss_levels)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -286,6 +301,8 @@ def main():
         weight_decay=args.weight_decay,
         model_variant=args.model_variant,
     )
+    if mask_loss_levels is not None:
+        system.cfg.model.mask_loss_levels = mask_loss_levels
     data_loader = build_dataloader(args, device)
     vis_images, vis_targets = build_visualization_batch(args)
 

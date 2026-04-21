@@ -47,6 +47,7 @@ class ModelConfig:
     decoder_layer: DecoderLayerConfig = field(default_factory=DecoderLayerConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     heads: HeadConfig = field(default_factory=HeadConfig)
+    mask_loss_levels: Tuple[str, ...] = ("p2", "p3", "p4", "p5")
 
     spatial_hw: int = 64
 
