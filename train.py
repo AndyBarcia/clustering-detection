@@ -123,6 +123,26 @@ def parse_args():
         help="Comma-separated feature levels used for mask supervision, e.g. p2,p3,p4. Defaults to all levels.",
     )
     parser.add_argument(
+        "--mask-ce-level-weights",
+        default=None,
+        help="Comma-separated per-level CE weights, e.g. p2=1.0,p3=1.0,p4=1.5,p5=2.0. Unspecified levels default to 1.0.",
+    )
+    parser.add_argument(
+        "--mask-iou-level-weights",
+        default=None,
+        help="Comma-separated per-level IoU weights, e.g. p2=2.0,p3=1.5,p4=1.0,p5=0.5. Unspecified levels default to 1.0.",
+    )
+    parser.add_argument(
+        "--clustered-mask-target-mode",
+        default=None,
+        help="Global clustered mask target mode. Supported values: native_soft, fullres_hard.",
+    )
+    parser.add_argument(
+        "--clustered-mask-target-mode-per-level",
+        default=None,
+        help="Comma-separated per-level target modes, e.g. p2=native_soft,p5=fullres_hard. Unspecified levels fall back to --clustered-mask-target-mode or the config default.",
+    )
+    parser.add_argument(
         "--output-dir",
         default="outputs",
         help="Directory where checkpoints and JSON metrics will be written.",
@@ -143,6 +163,68 @@ def parse_mask_loss_levels(mask_loss_levels_arg: Optional[str]) -> Optional[tupl
     if not levels:
         raise ValueError("--mask-loss-levels must specify at least one level when provided.")
     return levels
+
+
+def parse_level_weights(level_weights_arg: Optional[str], *, arg_name: str) -> Optional[dict[str, float]]:
+    if level_weights_arg is None:
+        return None
+
+    weights = {}
+    for raw_entry in level_weights_arg.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise ValueError(
+                f"{arg_name} entries must use LEVEL=WEIGHT format, got {entry!r}."
+            )
+        level_name, raw_weight = entry.split("=", 1)
+        level_name = level_name.strip()
+        raw_weight = raw_weight.strip()
+        if not level_name:
+            raise ValueError(f"{arg_name} contains an empty level name in {entry!r}.")
+        try:
+            weight = float(raw_weight)
+        except ValueError as exc:
+            raise ValueError(
+                f"{arg_name} weight for level {level_name!r} must be a float, got {raw_weight!r}."
+            ) from exc
+        if weight < 0.0:
+            raise ValueError(
+                f"{arg_name} weight for level {level_name!r} must be non-negative, got {weight}."
+            )
+        weights[level_name] = weight
+
+    if not weights:
+        raise ValueError(f"{arg_name} must specify at least one LEVEL=WEIGHT entry when provided.")
+    return weights
+
+
+def parse_level_modes(level_modes_arg: Optional[str], *, arg_name: str) -> Optional[dict[str, str]]:
+    if level_modes_arg is None:
+        return None
+
+    modes = {}
+    for raw_entry in level_modes_arg.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise ValueError(
+                f"{arg_name} entries must use LEVEL=MODE format, got {entry!r}."
+            )
+        level_name, raw_mode = entry.split("=", 1)
+        level_name = level_name.strip()
+        mode = raw_mode.strip()
+        if not level_name:
+            raise ValueError(f"{arg_name} contains an empty level name in {entry!r}.")
+        if not mode:
+            raise ValueError(f"{arg_name} contains an empty mode for level {level_name!r}.")
+        modes[level_name] = mode
+
+    if not modes:
+        raise ValueError(f"{arg_name} must specify at least one LEVEL=MODE entry when provided.")
+    return modes
 
 
 def build_dataloader(args, device):
@@ -291,6 +373,18 @@ def main():
     args = parse_args()
     device = resolve_device(args.device)
     mask_loss_levels = parse_mask_loss_levels(args.mask_loss_levels)
+    mask_ce_level_weights = parse_level_weights(
+        args.mask_ce_level_weights,
+        arg_name="--mask-ce-level-weights",
+    )
+    mask_iou_level_weights = parse_level_weights(
+        args.mask_iou_level_weights,
+        arg_name="--mask-iou-level-weights",
+    )
+    clustered_mask_target_mode_per_level = parse_level_modes(
+        args.clustered_mask_target_mode_per_level,
+        arg_name="--clustered-mask-target-mode-per-level",
+    )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -303,6 +397,14 @@ def main():
     )
     if mask_loss_levels is not None:
         system.cfg.model.mask_loss_levels = mask_loss_levels
+    if mask_ce_level_weights is not None:
+        system.cfg.loss.mask_ce_level_weights = mask_ce_level_weights
+    if mask_iou_level_weights is not None:
+        system.cfg.loss.mask_iou_level_weights = mask_iou_level_weights
+    if args.clustered_mask_target_mode is not None:
+        system.cfg.loss.clustered_mask_target_mode = args.clustered_mask_target_mode
+    if clustered_mask_target_mode_per_level is not None:
+        system.cfg.loss.clustered_mask_target_mode_per_level = clustered_mask_target_mode_per_level
     data_loader = build_dataloader(args, device)
     vis_images, vis_targets = build_visualization_batch(args)
 

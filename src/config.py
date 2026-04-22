@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Optional, List, Tuple, Union, get_origin, get_args
+from typing import Dict, Optional, List, Tuple, Union, get_origin, get_args
 
 
 @dataclass
@@ -57,10 +57,13 @@ class ModelConfig:
 class LossConfig:
     w_mask_ce: float = 2.0
     w_mask_iou: float = 5.0
+    mask_ce_level_weights: Dict[str, float] = field(default_factory=dict)
+    mask_iou_level_weights: Dict[str, float] = field(default_factory=dict)
     w_seed: float = 2.0
     w_inter: float = 10.0
     inter_margin: float = 0.0
-    clustered_mask_target_mode: str = "native_soft"
+    clustered_mask_target_mode: str = "fullres_hard"
+    clustered_mask_target_mode_per_level: Dict[str, str] = field(default_factory=dict)
 
     matcher_cost_class: float = 2.0
     matcher_cost_mask_bce: float = 5.0
@@ -184,6 +187,13 @@ def _convert_value(tp, value):
         if len(args) == 2 and args[1] is Ellipsis:
             return tuple(_convert_value(args[0], x) for x in value)
         return tuple(_convert_value(a, x) for a, x in zip(args, value))
+
+    if origin in (dict, Dict):
+        key_tp, value_tp = get_args(tp)
+        return {
+            _convert_value(key_tp, key): _convert_value(value_tp, item)
+            for key, item in value.items()
+        }
 
     return value
 

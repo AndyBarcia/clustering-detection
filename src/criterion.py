@@ -167,6 +167,41 @@ class ClusterPanopticCriterion(nn.Module):
         super().__init__()
         self.cfg = cfg
 
+    def _resolve_level_target_mode(self, level_name: str) -> str:
+        default_mode = getattr(self.cfg, "clustered_mask_target_mode", "fullres_hard")
+        per_level_modes = getattr(self.cfg, "clustered_mask_target_mode_per_level", {})
+        return per_level_modes.get(level_name, default_mode)
+
+    def _weighted_level_mean(
+        self,
+        level_losses: dict[str, torch.Tensor],
+        level_weights: dict[str, float],
+        loss_name: str,
+    ) -> torch.Tensor:
+        if not level_losses:
+            raise ValueError(f"Cannot compute weighted mean for {loss_name} without any level losses.")
+
+        weighted_losses = []
+        total_weight = 0.0
+        for level_name, loss_value in level_losses.items():
+            weight = float(level_weights.get(level_name, 1.0))
+            if weight < 0.0:
+                raise ValueError(
+                    f"{loss_name} level weight for {level_name!r} must be non-negative, got {weight}."
+                )
+            if weight == 0.0:
+                continue
+            weighted_losses.append(loss_value * weight)
+            total_weight += weight
+
+        if total_weight <= 0.0:
+            raise ValueError(
+                f"{loss_name} level weights must leave at least one positive-weight level. "
+                f"Got weights={level_weights!r} for levels={tuple(level_losses.keys())!r}."
+            )
+
+        return torch.stack(weighted_losses).sum() / total_weight
+
     def forward(self, model: CustomMask2Former, raw: RawOutputs, targets):
         return self.compute_loss(model, raw, targets)
 
@@ -259,9 +294,9 @@ class ClusterPanopticCriterion(nn.Module):
     ):
         level_loss_mask_ce = {}
         level_loss_mask_iou = {}
-        target_mode = getattr(self.cfg, "clustered_mask_target_mode", "fullres_hard")
 
         for level_name, features_val in feature_maps_val:
+            target_mode = self._resolve_level_target_mode(level_name)
             if target_mode == "native_soft":
                 mask_logits = project_mask_embeddings_native(proto_mask_emb, features_val)
                 gt_masks_level = F.interpolate(
@@ -302,8 +337,16 @@ class ClusterPanopticCriterion(nn.Module):
                     "expected 'native_soft' or 'fullres_hard'."
                 )
 
-        loss_mask_ce = torch.stack(list(level_loss_mask_ce.values())).mean()
-        loss_mask_iou = torch.stack(list(level_loss_mask_iou.values())).mean()
+        loss_mask_ce = self._weighted_level_mean(
+            level_loss_mask_ce,
+            getattr(self.cfg, "mask_ce_level_weights", {}),
+            "mask_ce",
+        )
+        loss_mask_iou = self._weighted_level_mean(
+            level_loss_mask_iou,
+            getattr(self.cfg, "mask_iou_level_weights", {}),
+            "mask_iou",
+        )
         return loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou
 
     def _compute_mask_cls_losses(
