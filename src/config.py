@@ -56,13 +56,13 @@ class ModelConfig:
 @dataclass
 class LossConfig:
     w_mask_ce: float = 2.0
-    w_mask_iou: float = 5.0
+    w_mask_iou: float = 0.0
     mask_ce_level_weights: Dict[str, float] = field(default_factory=dict)
     mask_iou_level_weights: Dict[str, float] = field(default_factory=dict)
     w_seed: float = 2.0
     w_inter: float = 10.0
     inter_margin: float = 0.0
-    clustered_mask_target_mode: str = "fullres_hard"
+    clustered_mask_target_mode: str = "native_soft"
     clustered_mask_target_mode_per_level: Dict[str, str] = field(default_factory=dict)
 
     matcher_cost_class: float = 2.0

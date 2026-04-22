@@ -238,6 +238,10 @@ class Mask2FormerBase(nn.Module):
         self.feature_levels = ("p2", "p3", "p4", "p5")
         self.decoder_feature_levels = ("p3", "p4", "p5")
         self.level_embed = nn.Parameter(torch.randn(len(self.feature_levels), hidden_dim) * 0.02)
+        self.mask_fusion_weights = nn.ParameterDict({
+            level_name: nn.Parameter(torch.tensor(1.0))
+            for level_name in cfg.mask_loss_levels
+        })
 
         spatial_hw = cfg.spatial_hw
         self.spatial_pos_embeds = nn.ParameterDict({
@@ -288,6 +292,52 @@ class Mask2FormerBase(nn.Module):
     def _predict_mask_logits(self, q: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
         mask_embs = self.mask_head(q)
         return torch.einsum("bqc,bchw->bqhw", mask_embs, features)
+
+    def project_masks_to_level(
+        self,
+        mask_embeddings: torch.Tensor,
+        level_features: torch.Tensor,
+        img_shape: tuple[int, int],
+    ) -> torch.Tensor:
+        mask_logits = torch.einsum("bqc,bchw->bqhw", mask_embeddings, level_features)
+        if mask_logits.shape[-2:] != img_shape:
+            mask_logits = F.interpolate(mask_logits, size=img_shape, mode="bilinear", align_corners=False)
+        return mask_logits
+
+    def project_masks_all_levels(
+        self,
+        mask_embeddings: torch.Tensor,
+        feature_maps: dict[str, torch.Tensor],
+        img_shape: tuple[int, int],
+    ) -> dict[str, torch.Tensor]:
+        return {
+            level_name: self.project_masks_to_level(mask_embeddings, feature_maps[level_name], img_shape)
+            for level_name in self.get_mask_loss_feature_levels()
+            if level_name in feature_maps
+        }
+
+    def fuse_mask_logits(
+        self,
+        level_mask_logits: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        ordered_levels = self.get_mask_loss_feature_levels()
+        fusion_inputs = [
+            level_mask_logits[level_name] * self.mask_fusion_weights[level_name]
+            for level_name in ordered_levels
+            if level_name in level_mask_logits
+        ]
+        if not fusion_inputs:
+            raise ValueError("Cannot fuse mask logits without any configured level predictions.")
+        return torch.stack(fusion_inputs, dim=0).sum(dim=0)
+
+    def predict_fused_mask_logits(
+        self,
+        mask_embeddings: torch.Tensor,
+        feature_maps: dict[str, torch.Tensor],
+        img_shape: tuple[int, int],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        level_mask_logits = self.project_masks_all_levels(mask_embeddings, feature_maps, img_shape)
+        return self.fuse_mask_logits(level_mask_logits), level_mask_logits
 
     def get_mask_loss_feature_levels(self) -> tuple[str, ...]:
         configured_levels = self.cfg.mask_loss_levels

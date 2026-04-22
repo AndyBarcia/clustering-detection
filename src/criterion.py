@@ -286,6 +286,7 @@ class ClusterPanopticCriterion(nn.Module):
 
     def _compute_aggregated_mask_losses(
         self,
+        model: CustomMask2Former,
         proto_mask_emb: torch.Tensor, # [B,GT,C]
         feature_maps_val: list[tuple[str, torch.Tensor]],
         gt_masks_pad: torch.Tensor, # [B,GT,H,W]
@@ -294,6 +295,7 @@ class ClusterPanopticCriterion(nn.Module):
     ):
         level_loss_mask_ce = {}
         level_loss_mask_iou = {}
+        feature_map_dict = {level_name: features_val for level_name, features_val in feature_maps_val}
 
         for level_name, features_val in feature_maps_val:
             target_mode = self._resolve_level_target_mode(level_name)
@@ -337,20 +339,37 @@ class ClusterPanopticCriterion(nn.Module):
                     "expected 'native_soft' or 'fullres_hard'."
                 )
 
-        loss_mask_ce = self._weighted_level_mean(
+        fused_mask_logits, _ = model.predict_fused_mask_logits(
+            proto_mask_emb,
+            feature_map_dict,
+            img_shape,
+        )
+        neg_inf = torch.finfo(fused_mask_logits.dtype).min
+        fused_mask_logits_masked = fused_mask_logits.masked_fill(~gt_pad_mask[:, :, None, None], neg_inf)
+        gt_mask_target = gt_masks_pad.argmax(dim=1)
+        fused_loss_mask_ce = F.cross_entropy(fused_mask_logits_masked, gt_mask_target)
+        fused_loss_mask_iou = soft_partition_iou_loss(fused_mask_logits, gt_masks_pad, gt_pad_mask)
+
+        level_loss_mask_ce["fused"] = fused_loss_mask_ce
+        level_loss_mask_iou["fused"] = fused_loss_mask_iou
+
+        independent_loss_mask_ce = self._weighted_level_mean(
             level_loss_mask_ce,
-            getattr(self.cfg, "mask_ce_level_weights", {}),
+            {**getattr(self.cfg, "mask_ce_level_weights", {}), "fused": 0.0},
             "mask_ce",
         )
-        loss_mask_iou = self._weighted_level_mean(
+        independent_loss_mask_iou = self._weighted_level_mean(
             level_loss_mask_iou,
-            getattr(self.cfg, "mask_iou_level_weights", {}),
+            {**getattr(self.cfg, "mask_iou_level_weights", {}), "fused": 0.0},
             "mask_iou",
         )
+        loss_mask_ce = independent_loss_mask_ce + fused_loss_mask_ce
+        loss_mask_iou = independent_loss_mask_iou + fused_loss_mask_iou
         return loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou
 
     def _compute_mask_cls_losses(
         self,
+        model: CustomMask2Former,
         q_sig_flat: torch.Tensor, # [B,Q,S]
         q_influence_flat: torch.Tensor, # [B,Q]
         gt_sigs_norm: torch.Tensor, # [B,GT,S]
@@ -378,6 +397,7 @@ class ClusterPanopticCriterion(nn.Module):
             gt_pad_mask
         )
         loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou = self._compute_aggregated_mask_losses(
+            model=model,
             proto_mask_emb=proto_mask_emb,
             feature_maps_val=feature_maps_val,
             gt_masks_pad=gt_masks_pad,
@@ -513,6 +533,7 @@ class ClusterPanopticCriterion(nn.Module):
         )
         
         loss_cls, loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou = self._compute_mask_cls_losses(
+            model=model,
             q_sig_flat=q_sig_flat,
             q_influence_flat=q_influence_flat,
             gt_sigs_norm=gt_sigs_norm,
@@ -573,6 +594,7 @@ class StandardMask2FormerCriterion(nn.Module):
 
     def _compute_single_layer_loss(
         self,
+        model: Mask2FormerBase,
         feature_maps: list[tuple[str, torch.Tensor]],
         q_mask_emb: torch.Tensor,
         q_cls: torch.Tensor,
@@ -587,6 +609,9 @@ class StandardMask2FormerCriterion(nn.Module):
         cls_losses = []
         matched_mask_logits = {level_name: [] for level_name, _ in feature_maps}
         matched_mask_targets = {level_name: [] for level_name, _ in feature_maps}
+        matched_mask_logits["fused"] = []
+        matched_mask_targets["fused"] = []
+        feature_map_dict = {level_name: level_features for level_name, level_features in feature_maps}
 
         for b in range(reference_features.shape[0]):
             labels = targets[b]["labels"].to(reference_features.device)
@@ -623,6 +648,13 @@ class StandardMask2FormerCriterion(nn.Module):
                         )[0]
                         matched_mask_logits[level_name].append(level_mask_logits[matched_query_idx])
                         matched_mask_targets[level_name].append(gt_masks[matched_gt_idx])
+                    fused_mask_logits, _ = model.predict_fused_mask_logits(
+                        q_mask_emb[b:b + 1],
+                        {level_name: level_features[b:b + 1] for level_name, level_features in feature_map_dict.items()},
+                        img_shape,
+                    )
+                    matched_mask_logits["fused"].append(fused_mask_logits[0, matched_query_idx])
+                    matched_mask_targets["fused"].append(gt_masks[matched_gt_idx])
 
             cls_losses.append(F.cross_entropy(q_cls[b], target_classes, weight=class_weights))
 
@@ -634,7 +666,7 @@ class StandardMask2FormerCriterion(nn.Module):
         level_loss_mask_bce = {}
         level_loss_mask_dice = {}
         zero = reference_features.sum() * 0.0
-        for level_name, _ in feature_maps:
+        for level_name in tuple(level_name for level_name, _ in feature_maps) + ("fused",):
             if matched_mask_logits[level_name]:
                 matched_logits = torch.cat(matched_mask_logits[level_name], dim=0)
                 matched_targets = torch.cat(matched_mask_targets[level_name], dim=0)
@@ -644,8 +676,10 @@ class StandardMask2FormerCriterion(nn.Module):
                 level_loss_mask_bce[level_name] = zero
                 level_loss_mask_dice[level_name] = zero
 
-        loss_mask_bce = torch.stack(list(level_loss_mask_bce.values())).mean()
-        loss_mask_dice = torch.stack(list(level_loss_mask_dice.values())).mean()
+        independent_mask_bce = torch.stack([level_loss_mask_bce[level_name] for level_name, _ in feature_maps]).mean()
+        independent_mask_dice = torch.stack([level_loss_mask_dice[level_name] for level_name, _ in feature_maps]).mean()
+        loss_mask_bce = independent_mask_bce + level_loss_mask_bce["fused"]
+        loss_mask_dice = independent_mask_dice + level_loss_mask_dice["fused"]
 
         return loss_cls, loss_mask_bce, loss_mask_dice, level_loss_mask_bce, level_loss_mask_dice
 
@@ -658,7 +692,7 @@ class StandardMask2FormerCriterion(nn.Module):
         reference_features = raw.features
         # raw.mask_embs/raw.cls_preds are lists over decoder layers.
         layer_losses = [
-            self._compute_single_layer_loss(feature_maps, q_mask_emb, q_cls, targets, raw.img_shape)
+            self._compute_single_layer_loss(model, feature_maps, q_mask_emb, q_cls, targets, raw.img_shape)
             for q_mask_emb, q_cls in zip(raw.mask_embs, raw.cls_preds)
         ]
 
@@ -684,6 +718,8 @@ class StandardMask2FormerCriterion(nn.Module):
         for level_name in level_names:
             components[f"loss_mask_bce_{level_name}"] = torch.stack([loss[3][level_name] for loss in layer_losses]).mean()
             components[f"loss_mask_dice_{level_name}"] = torch.stack([loss[4][level_name] for loss in layer_losses]).mean()
+        components["loss_mask_bce_fused"] = torch.stack([loss[3]["fused"] for loss in layer_losses]).mean()
+        components["loss_mask_dice_fused"] = torch.stack([loss[4]["fused"] for loss in layer_losses]).mean()
         return final_loss, components
 
 

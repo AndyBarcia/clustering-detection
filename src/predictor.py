@@ -631,7 +631,14 @@ class ModularPrototypePredictor:
             target_indices=target_indices,
         )
 
-    def resolve_prediction(self, flat_queries: FlatQueryOutputs, prototypes: PrototypeState) -> ResolvedPrediction:
+    def resolve_prediction(
+        self,
+        model: CustomMask2Former,
+        raw: RawOutputs,
+        batch_index: int,
+        flat_queries: FlatQueryOutputs,
+        prototypes: PrototypeState,
+    ) -> ResolvedPrediction:
         cfg = self.cfg.overlap
         features = flat_queries.features
         image_height, image_width = flat_queries.image_height, flat_queries.image_width
@@ -655,11 +662,15 @@ class ModularPrototypePredictor:
                 resolved_scores=[],
             )
 
-        mask_logits = project_mask_embeddings(
+        fused_mask_logits, _ = model.predict_fused_mask_logits(
             prototypes.mask_embeddings.unsqueeze(0),
-            features.unsqueeze(0),
+            {
+                level_name: level_features[batch_index:batch_index + 1]
+                for level_name, level_features in raw.feature_maps.items()
+            },
             (image_height, image_width),
-        )[0]
+        )
+        mask_logits = fused_mask_logits[0]
         mask_probabilities = F.softmax(mask_logits, dim=0)
 
         class_probabilities = F.softmax(prototypes.class_logits, dim=-1)
@@ -782,7 +793,7 @@ class ModularPrototypePredictor:
         seed_clustering = self.cluster_seed_queries(model, flat_queries, seed_selection)
         prototypes = self.initialize_clustered_prototypes(flat_queries, seed_clustering)
         prototypes = self.refine_prototypes(model, flat_queries, prototypes)
-        return self.resolve_prediction(flat_queries, prototypes)
+        return self.resolve_prediction(model, raw, batch_index, flat_queries, prototypes)
 
     def predict_with_gt_signatures_single(self, model: CustomMask2Former, raw: RawOutputs, targets, batch_index: int) -> ResolvedPrediction:
         flat_queries = self.flatten_outputs(raw, batch_index)
@@ -795,7 +806,7 @@ class ModularPrototypePredictor:
             gt_signatures,
             target_indices=torch.arange(labels.shape[0], device=device, dtype=torch.long),
         )
-        return self.resolve_prediction(flat_queries, prototypes)
+        return self.resolve_prediction(model, raw, batch_index, flat_queries, prototypes)
 
     def predict_with_golden_queries_single(
         self,
@@ -819,7 +830,7 @@ class ModularPrototypePredictor:
 
         candidate_indices = torch.arange(flat_queries.num_queries, device=flat_queries.signature_embeddings.device)
         if gt_signatures.shape[0] == 0 or candidate_indices.numel() == 0:
-            empty_prediction = self.resolve_prediction(flat_queries, self._empty_prototype_state(flat_queries))
+            empty_prediction = self.resolve_prediction(model, raw, batch_index, flat_queries, self._empty_prototype_state(flat_queries))
             return empty_prediction, GoldenQueryDiagnostics()
 
         query_signatures = flat_queries.signature_embeddings[candidate_indices]
@@ -869,7 +880,7 @@ class ModularPrototypePredictor:
             prototype_seed_indices=matched_query_indices,
             target_indices=matched_gt_indices,
         )
-        prediction = self.resolve_prediction(flat_queries, prototypes)
+        prediction = self.resolve_prediction(model, raw, batch_index, flat_queries, prototypes)
         diagnostics = GoldenQueryDiagnostics(
             matched_query_distances=matched_distances,
             unmatched_query_closest_gt_distances=unmatched_query_distances,
@@ -887,7 +898,7 @@ class ModularPrototypePredictor:
         seed_clustering = self.cluster_seed_queries(model, flat_queries, seed_selection)
         clustering_prototypes = self.initialize_clustered_prototypes(flat_queries, seed_clustering)
         clustering_prototypes = self.refine_prototypes(model, flat_queries, clustering_prototypes)
-        clustering_prediction = self.resolve_prediction(flat_queries, clustering_prototypes)
+        clustering_prediction = self.resolve_prediction(model, raw, batch_index, flat_queries, clustering_prototypes)
 
         gt_signature_prototypes = self.build_gt_signature_prototypes(
             model,
@@ -895,7 +906,7 @@ class ModularPrototypePredictor:
             gt_signatures,
             target_indices=target_indices,
         )
-        gt_signature_prediction = self.resolve_prediction(flat_queries, gt_signature_prototypes)
+        gt_signature_prediction = self.resolve_prediction(model, raw, batch_index, flat_queries, gt_signature_prototypes)
         golden_query_prediction, golden_query_diagnostics = self.predict_with_golden_queries_single(
             model,
             raw,
@@ -976,16 +987,18 @@ class StandardMask2FormerPredictor:
         )
 
     def _predict_single(self, model: Mask2FormerBase, raw: RawOutputs, batch_index: int) -> ResolvedPrediction:
-        del model
-
         flat_queries = self._flatten_outputs(raw, batch_index)
         cfg = self.cfg.overlap
 
-        mask_logits = project_mask_embeddings(
+        fused_mask_logits, _ = model.predict_fused_mask_logits(
             flat_queries.mask_embeddings.unsqueeze(0),
-            flat_queries.features.unsqueeze(0),
+            {
+                level_name: level_features[batch_index:batch_index + 1]
+                for level_name, level_features in raw.feature_maps.items()
+            },
             (flat_queries.image_height, flat_queries.image_width),
-        )[0]
+        )
+        mask_logits = fused_mask_logits[0]
         mask_probabilities = torch.sigmoid(mask_logits)
 
         if cfg.use_class_confidence:
