@@ -238,10 +238,12 @@ class Mask2FormerBase(nn.Module):
         self.feature_levels = ("p2", "p3", "p4", "p5")
         self.decoder_feature_levels = ("p3", "p4", "p5")
         self.level_embed = nn.Parameter(torch.randn(len(self.feature_levels), hidden_dim) * 0.02)
-        self.mask_fusion_weights = nn.ParameterDict({
-            level_name: nn.Parameter(torch.tensor(1.0))
-            for level_name in cfg.mask_loss_levels
-        })
+        self.mask_loss_feature_levels = self.get_mask_loss_feature_levels()
+        self.mask_fusion_head = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, len(self.mask_loss_feature_levels), kernel_size=1),
+        )
 
         spatial_hw = cfg.spatial_hw
         self.spatial_pos_embeds = nn.ParameterDict({
@@ -319,16 +321,39 @@ class Mask2FormerBase(nn.Module):
     def fuse_mask_logits(
         self,
         level_mask_logits: dict[str, torch.Tensor],
+        feature_maps: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        ordered_levels = self.get_mask_loss_feature_levels()
-        fusion_inputs = [
-            level_mask_logits[level_name] * self.mask_fusion_weights[level_name]
-            for level_name in ordered_levels
+        ordered_levels = tuple(
+            level_name
+            for level_name in self.mask_loss_feature_levels
             if level_name in level_mask_logits
-        ]
-        if not fusion_inputs:
+        )
+        if not ordered_levels:
             raise ValueError("Cannot fuse mask logits without any configured level predictions.")
-        return torch.stack(fusion_inputs, dim=0).sum(dim=0)
+
+        reference_level = self.feature_levels[0]
+        fusion_logits = self.mask_fusion_head(feature_maps[reference_level])
+        target_hw = next(iter(level_mask_logits.values())).shape[-2:]
+        if fusion_logits.shape[-2:] != target_hw:
+            fusion_logits = F.interpolate(
+                fusion_logits,
+                size=target_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        level_to_idx = {level_name: idx for idx, level_name in enumerate(self.mask_loss_feature_levels)}
+        selected_fusion_logits = torch.stack(
+            [fusion_logits[:, level_to_idx[level_name]] for level_name in ordered_levels],
+            dim=1,
+        )
+        fusion_weights = selected_fusion_logits.softmax(dim=1)
+
+        stacked_level_logits = torch.stack(
+            [level_mask_logits[level_name] for level_name in ordered_levels],
+            dim=1,
+        )
+        return (stacked_level_logits * fusion_weights[:, :, None]).sum(dim=1)
 
     def predict_fused_mask_logits(
         self,
@@ -337,9 +362,12 @@ class Mask2FormerBase(nn.Module):
         img_shape: tuple[int, int],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         level_mask_logits = self.project_masks_all_levels(mask_embeddings, feature_maps, img_shape)
-        return self.fuse_mask_logits(level_mask_logits), level_mask_logits
+        return self.fuse_mask_logits(level_mask_logits, feature_maps), level_mask_logits
 
     def get_mask_loss_feature_levels(self) -> tuple[str, ...]:
+        if hasattr(self, "mask_loss_feature_levels"):
+            return self.mask_loss_feature_levels
+
         configured_levels = self.cfg.mask_loss_levels
         unknown_levels = tuple(level_name for level_name in configured_levels if level_name not in self.feature_levels)
         if unknown_levels:
