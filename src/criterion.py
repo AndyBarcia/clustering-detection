@@ -49,9 +49,61 @@ def soft_target_cross_entropy_loss(
     return loss_map.mean()
 
 
+def positives_vs_rest_loss(logits: torch.Tensor, num_positives: int, reduction: str = "mean") -> torch.Tensor:
+    pos = logits[..., :num_positives]
+    neg = logits[..., num_positives:]
+    if neg.shape[-1] == 0:
+        return logits.sum() * 0.0
+    neg_lse = torch.logsumexp(neg, dim=-1, keepdim=True)
+    losses = F.softplus(neg_lse - pos)
+
+    if reduction == "mean":
+        return losses.mean()
+    if reduction == "sum":
+        return losses.sum()
+    return losses
+
+
+def reduce_query_to_gt_point_similarity(
+    q_sig_flat: torch.Tensor,
+    gt_point_sigs: torch.Tensor,
+    *,
+    similarity_metric: str,
+    clamp: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, num_queries, signature_dim = q_sig_flat.shape
+    _, num_gt, num_points, _ = gt_point_sigs.shape
+    flat_gt_point_sigs = gt_point_sigs.reshape(batch_size, num_gt * num_points, signature_dim)
+    point_similarity = pairwise_similarity(
+        q_sig_flat,
+        flat_gt_point_sigs,
+        metric=similarity_metric,
+        clamp=clamp,
+    ).reshape(batch_size, num_queries, num_gt, num_points)
+    return point_similarity.max(dim=-1).values, point_similarity
+
+
+def reduce_gt_to_gt_point_similarity(
+    gt_point_sigs: torch.Tensor,
+    *,
+    similarity_metric: str,
+    clamp: bool = False,
+) -> torch.Tensor:
+    batch_size, num_gt, num_points, signature_dim = gt_point_sigs.shape
+    flat_gt_point_sigs = gt_point_sigs.reshape(batch_size, num_gt * num_points, signature_dim)
+    pair_similarity = pairwise_similarity(
+        flat_gt_point_sigs,
+        flat_gt_point_sigs,
+        metric=similarity_metric,
+        clamp=clamp,
+    )
+    pair_similarity = pair_similarity.reshape(batch_size, num_gt, num_points, num_gt, num_points)
+    return pair_similarity.amax(dim=2).amax(dim=-1)
+
+
 def hungarian_seed_assignment(
     q_sig_flat: torch.Tensor, # [B,Q,S]
-    gt_sigs_norm: torch.Tensor, # [B,GT,S]
+    gt_sigs_norm: torch.Tensor, # [B,GT,K,S]
     gt_pad_mask: torch.Tensor, # [B,GT]
     q_seed_logits_flat: torch.Tensor | None = None, # [B,Q]
     *,
@@ -67,12 +119,13 @@ def hungarian_seed_assignment(
         if valid_gt_idx.numel() == 0 or num_queries == 0:
             continue
 
-        sim = pairwise_similarity(
-            q_sig_flat[b],
-            gt_sigs_norm[b, valid_gt_idx],
-            metric=similarity_metric,
+        sim, _ = reduce_query_to_gt_point_similarity(
+            q_sig_flat[b:b + 1],
+            gt_sigs_norm[b:b + 1, valid_gt_idx],
+            similarity_metric=similarity_metric,
+            clamp=True,
         )
-        cost = 1.0 - sim
+        cost = 1.0 - sim[0]
         if q_seed_logits_flat is not None and seed_cost_weight != 0.0:
             seed_cost = 1.0 - torch.sigmoid(q_seed_logits_flat[b])
             cost = cost + seed_cost_weight * seed_cost.unsqueeze(-1)
@@ -183,7 +236,7 @@ class ClusterPanopticCriterion(nn.Module):
 
     def _compute_loss_inter(
         self,
-        gt_sigs_norm: torch.Tensor, # [B,GT,S]
+        gt_sigs_norm: torch.Tensor, # [B,GT,K,S]
         gt_pad_mask: torch.Tensor, # [B,GT]
         features: torch.Tensor, # [B,C,Hf,Wf]
         identity_similarity_metric: str,
@@ -192,19 +245,46 @@ class ClusterPanopticCriterion(nn.Module):
         loss_inter = features.sum() * 0.0
 
         if num_gt <= 1:
+            intra_sim = pairwise_similarity(
+                gt_sigs_norm,
+                gt_sigs_norm,
+                metric=identity_similarity_metric,
+                clamp=True,
+            )
+            num_points = gt_sigs_norm.shape[2]
+            if num_points <= 1:
+                return loss_inter
+
+            point_eye = torch.eye(num_points, dtype=torch.bool, device=features.device).view(1, 1, num_points, num_points)
+            intra_mask = gt_pad_mask.unsqueeze(-1).unsqueeze(-1) & ~point_eye
+            if intra_mask.any():
+                loss_inter = (1.0 - intra_sim[intra_mask]).mean()
             return loss_inter
 
-        gt_sim = pairwise_similarity(
+        intra_sim = pairwise_similarity(
             gt_sigs_norm,
             gt_sigs_norm,
             metric=identity_similarity_metric,
+            clamp=True,
+        )
+        num_points = gt_sigs_norm.shape[2]
+        if num_points > 1:
+            point_eye = torch.eye(num_points, dtype=torch.bool, device=features.device).view(1, 1, num_points, num_points)
+            intra_mask = gt_pad_mask.unsqueeze(-1).unsqueeze(-1) & ~point_eye
+            if intra_mask.any():
+                loss_inter = loss_inter + (1.0 - intra_sim[intra_mask]).mean()
+
+        gt_sim = reduce_gt_to_gt_point_similarity(
+            gt_sigs_norm,
+            similarity_metric=identity_similarity_metric,
+            clamp=True,
         )
         eye = torch.eye(num_gt, dtype=torch.bool, device=features.device).unsqueeze(0)
         valid_pair_mask = gt_pad_mask.unsqueeze(2) & gt_pad_mask.unsqueeze(1)
         off_diag_mask = valid_pair_mask & ~eye
 
         if off_diag_mask.any():
-            loss_inter = F.relu(gt_sim[off_diag_mask] - self.cfg.inter_margin).pow(2).mean()
+            loss_inter = loss_inter + F.relu(gt_sim[off_diag_mask] - self.cfg.inter_margin).pow(2).mean()
 
         return loss_inter
 
@@ -212,16 +292,17 @@ class ClusterPanopticCriterion(nn.Module):
         self,
         q_sig_flat: torch.Tensor, # [B,Q,S]
         q_influence_flat: torch.Tensor, # [B,Q]
-        gt_sigs_norm: torch.Tensor, # [B,GT,S]
+        gt_sigs_norm: torch.Tensor, # [B,GT,K,S]
         gt_pad_mask: torch.Tensor, # [B,GT]
         q_mask_emb_flat: torch.Tensor, # [B,Q,Cm]
         q_cls_flat: torch.Tensor, # [B,Q,K]
         aggregation_similarity_metric: str,
     ):
-        sim = pairwise_similarity(
+        sim, _ = reduce_query_to_gt_point_similarity(
             q_sig_flat,
             gt_sigs_norm,
-            metric=aggregation_similarity_metric,
+            similarity_metric=aggregation_similarity_metric,
+            clamp=True,
         )
         weights_flat = assignment_weights_with_influence(
             similarity=sim,
@@ -310,7 +391,7 @@ class ClusterPanopticCriterion(nn.Module):
         self,
         q_sig_flat: torch.Tensor, # [B,Q,S]
         q_influence_flat: torch.Tensor, # [B,Q]
-        gt_sigs_norm: torch.Tensor, # [B,GT,S]
+        gt_sigs_norm: torch.Tensor, # [B,GT,K,S]
         gt_pad_mask: torch.Tensor, # [B,GT]
         q_mask_emb_flat: torch.Tensor, # [B,Q,Cm]
         q_cls_flat: torch.Tensor, # [B,Q,K]
@@ -346,7 +427,7 @@ class ClusterPanopticCriterion(nn.Module):
     def _compute_seed_losses(
         self,
         q_sig_flat: torch.Tensor, # [B,Q,S]
-        gt_sigs_norm: torch.Tensor, # [B,GT,S]
+        gt_sigs_norm: torch.Tensor, # [B,GT,K,S]
         gt_pad_mask: torch.Tensor, # [B,GT]
         q_seed_logits_flat: torch.Tensor, # [B,Q]
         features: torch.Tensor, # [B,C,Hf,Wf]
@@ -370,13 +451,29 @@ class ClusterPanopticCriterion(nn.Module):
         if matched_pos.numel() > 0:
             matched_gt = matched_gt_indices[matched_query_mask]
             matched_q_sig = q_sig_flat[matched_query_mask]
-            matched_gt_sig = gt_sigs_norm[matched_pos[:, 0], matched_gt].detach()
-            matched_similarity = pairwise_similarity(
+            flat_gt_points = gt_sigs_norm[matched_pos[:, 0]].detach()
+            similarity_to_points = pairwise_similarity(
                 matched_q_sig.unsqueeze(1),
-                matched_gt_sig.unsqueeze(1),
+                flat_gt_points.reshape(flat_gt_points.shape[0], -1, flat_gt_points.shape[-1]),
                 metric=identity_similarity_metric,
-            ).squeeze(-1).squeeze(-1)
-            loss_seed_sig = (1.0 - matched_similarity).mean()
+                clamp=False,
+            ).squeeze(1).reshape(flat_gt_points.shape[0], flat_gt_points.shape[1], flat_gt_points.shape[2])
+            positive_logits = similarity_to_points[
+                torch.arange(similarity_to_points.shape[0], device=similarity_to_points.device),
+                matched_gt,
+            ]
+            negative_mask = torch.ones(
+                (similarity_to_points.shape[0], similarity_to_points.shape[1]),
+                dtype=torch.bool,
+                device=similarity_to_points.device,
+            )
+            negative_mask[
+                torch.arange(similarity_to_points.shape[0], device=similarity_to_points.device),
+                matched_gt,
+            ] = False
+            negative_logits = similarity_to_points[negative_mask].reshape(similarity_to_points.shape[0], -1)
+            logits = torch.cat([positive_logits, negative_logits], dim=-1)
+            loss_seed_sig = positives_vs_rest_loss(logits, positive_logits.shape[-1], reduction="mean")
 
         return loss_seed, loss_seed_sig
 

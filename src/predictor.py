@@ -610,6 +610,30 @@ class ModularPrototypePredictor:
             ttt_steps_override=self.cfg.ttt_steps,
         )[0]
 
+    def _reduce_gt_point_signatures(self, gt_signatures: torch.Tensor) -> torch.Tensor:
+        if gt_signatures.numel() == 0:
+            return gt_signatures.new_empty((0, gt_signatures.shape[-1]))
+        return gt_signatures.mean(dim=1)
+
+    def _query_to_gt_point_distances(
+        self,
+        model: CustomMask2Former,
+        query_signatures: torch.Tensor,
+        gt_signatures: torch.Tensor,
+    ) -> torch.Tensor:
+        if gt_signatures.numel() == 0:
+            return query_signatures.new_empty((query_signatures.shape[0], 0))
+
+        num_gt, num_points, signature_dim = gt_signatures.shape
+        flat_gt_signatures = gt_signatures.reshape(num_gt * num_points, signature_dim)
+        point_distances = pairwise_distance(
+            query_signatures,
+            flat_gt_signatures,
+            metric=model.identity_similarity_metric,
+            clamp=True,
+        ).reshape(query_signatures.shape[0], num_gt, num_points)
+        return point_distances.min(dim=-1).values
+
     def build_gt_signature_prototypes(
         self,
         model: CustomMask2Former,
@@ -623,7 +647,7 @@ class ModularPrototypePredictor:
         return self.build_signature_prototypes(
             model,
             flat_queries,
-            gt_signatures,
+            self._reduce_gt_point_signatures(gt_signatures),
             target_indices=target_indices,
         )
 
@@ -819,12 +843,7 @@ class ModularPrototypePredictor:
             return empty_prediction, GoldenQueryDiagnostics()
 
         query_signatures = flat_queries.signature_embeddings[candidate_indices]
-        distances = pairwise_distance(
-            query_signatures,
-            gt_signatures,
-            metric=model.identity_similarity_metric,
-            clamp=True,
-        )
+        distances = self._query_to_gt_point_distances(model, query_signatures, gt_signatures)
 
         num_queries, num_gt = distances.shape
         size = max(num_queries, num_gt)

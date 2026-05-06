@@ -402,6 +402,7 @@ class CustomMask2Former(Mask2FormerBase):
         sig_dim = cfg.heads.sig_dim
 
         self.sig_dim = sig_dim
+        self.gt_points_per_instance = cfg.heads.gt_points_per_instance
         self.signature_normalize = cfg.heads.normalize_signatures
         self.aggregation_similarity_metric = cfg.heads.aggregation_similarity_metric
         self.identity_similarity_metric = cfg.heads.identity_similarity_metric
@@ -537,6 +538,7 @@ class CustomMask2Former(Mask2FormerBase):
         batch_size, num_masks, height, width = masks.shape
         device = masks.device
         dtype = masks.dtype
+        num_points = self.gt_points_per_instance
 
         ys = torch.arange(height, device=device, dtype=dtype).view(1, 1, height, 1)
         xs = torch.arange(width, device=device, dtype=dtype).view(1, 1, 1, width)
@@ -550,11 +552,16 @@ class CustomMask2Former(Mask2FormerBase):
         centroid_dist2 = (flat_coords_x - centroid_x).pow(2) + (flat_coords_y - centroid_y).pow(2)
         centroid_dist2 = centroid_dist2.masked_fill(~flat_masks, float("inf"))
 
-        chosen_indices = centroid_dist2.argmin(dim=-1)
-        point_x = torch.gather(flat_coords_x, 2, chosen_indices.unsqueeze(-1)).squeeze(-1)
-        point_y = torch.gather(flat_coords_y, 2, chosen_indices.unsqueeze(-1)).squeeze(-1)
+        sorted_indices = centroid_dist2.argsort(dim=-1)
+        valid_counts = flat_masks.sum(dim=-1).clamp_min(1)
+        ranks = torch.arange(num_points, device=device).view(1, 1, num_points)
+        ranks = torch.minimum(ranks, (valid_counts - 1).unsqueeze(-1))
+        chosen_indices = torch.gather(sorted_indices, 2, ranks)
+        point_x = torch.gather(flat_coords_x.unsqueeze(2).expand(-1, -1, num_points, -1), 3, chosen_indices.unsqueeze(-1)).squeeze(-1)
+        point_y = torch.gather(flat_coords_y.unsqueeze(2).expand(-1, -1, num_points, -1), 3, chosen_indices.unsqueeze(-1)).squeeze(-1)
         point_xy = torch.stack([point_x, point_y], dim=-1)
-        return point_xy, valid_mask
+        point_valid_mask = valid_mask.unsqueeze(-1).expand(-1, -1, num_points)
+        return point_xy, point_valid_mask
 
     def _sample_point_from_masks(
         self,
@@ -563,10 +570,11 @@ class CustomMask2Former(Mask2FormerBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         valid_mask = pad_mask & masks.flatten(2).any(dim=-1)
         if not valid_mask.any():
-            return masks.new_zeros((*masks.shape[:2], 2)), valid_mask
+            return masks.new_zeros((*masks.shape[:2], self.gt_points_per_instance, 2)), valid_mask.unsqueeze(-1).expand(-1, -1, self.gt_points_per_instance)
 
         batch_size, num_masks, height, width = masks.shape
         flat_masks = masks.flatten(2)
+        num_points = self.gt_points_per_instance
 
         if self.training:
             sampling_weights = flat_masks.clone()
@@ -577,15 +585,16 @@ class CustomMask2Former(Mask2FormerBase):
             )
             sampled_indices = torch.multinomial(
                 sampling_weights.reshape(batch_size * num_masks, height * width),
-                num_samples=1,
+                num_samples=num_points,
                 replacement=True,
-            ).view(batch_size, num_masks)
+            ).view(batch_size, num_masks, num_points)
 
             point_y = torch.div(sampled_indices, width, rounding_mode="floor").to(masks.dtype)
             point_x = (sampled_indices % width).to(masks.dtype)
             point_xy = torch.stack([point_x, point_y], dim=-1)
-            point_xy = point_xy * valid_mask.unsqueeze(-1).to(dtype=masks.dtype)
-            return point_xy, valid_mask
+            point_valid_mask = valid_mask.unsqueeze(-1).expand(-1, -1, num_points)
+            point_xy = point_xy * point_valid_mask.unsqueeze(-1).to(dtype=masks.dtype)
+            return point_xy, point_valid_mask
 
         return self._deterministic_point_from_masks(masks, valid_mask)
 
@@ -597,7 +606,8 @@ class CustomMask2Former(Mask2FormerBase):
         return torch.stack([normalized_x, normalized_y], dim=-1)
 
     def _sample_feature_at_points(self, feature_map: torch.Tensor, normalized_point_xy: torch.Tensor) -> torch.Tensor:
-        grid = normalized_point_xy.mul(2.0).sub(1.0).unsqueeze(2)
+        batch_size, _, _, _ = normalized_point_xy.shape
+        grid = normalized_point_xy.mul(2.0).sub(1.0).reshape(batch_size, -1, 1, 2)
         sampled = F.grid_sample(
             feature_map,
             grid,
@@ -605,7 +615,8 @@ class CustomMask2Former(Mask2FormerBase):
             padding_mode="border",
             align_corners=True,
         )
-        return sampled.squeeze(-1).transpose(1, 2)
+        sampled = sampled.squeeze(-1).transpose(1, 2)
+        return sampled.reshape(*normalized_point_xy.shape[:3], feature_map.shape[1])
 
     def encode_gts(self, memory, features, masks, labels, pad_mask, ttt_steps_override: Optional[int] = None):
         del memory, ttt_steps_override
@@ -618,13 +629,13 @@ class CustomMask2Former(Mask2FormerBase):
             reference_features = features
 
         cls_emb = self.gt_cls_proj(labels)
-        point_xy, valid_mask = self._sample_point_from_masks(masks.float(), pad_mask)
+        point_xy, point_valid_mask = self._sample_point_from_masks(masks.float(), pad_mask)
         normalized_point_xy = self._normalize_point_coords(point_xy, masks.shape[-1], masks.shape[-2])
-        gt_signature = cls_emb + self.gt_point_pos_proj(normalized_point_xy)
-        gt_signature = gt_signature * valid_mask.unsqueeze(-1).to(dtype=reference_features.dtype)
+        gt_signature = cls_emb.unsqueeze(2) + self.gt_point_pos_proj(normalized_point_xy)
+        gt_signature = gt_signature * point_valid_mask.unsqueeze(-1).to(dtype=reference_features.dtype)
         for feature_map in feature_maps:
             point_features = self._sample_feature_at_points(feature_map, normalized_point_xy)
-            point_features = point_features * valid_mask.unsqueeze(-1).to(dtype=feature_map.dtype)
+            point_features = point_features * point_valid_mask.unsqueeze(-1).to(dtype=feature_map.dtype)
             gt_signature = gt_signature + self.gt_point_feature_proj(point_features)
         return self.prepare_signature_embeddings(gt_signature)
 

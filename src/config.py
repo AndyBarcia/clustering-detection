@@ -35,6 +35,7 @@ class HeadConfig:
     num_classes: int = 3
     hidden_dim: int = 1024
     sig_dim: int = 64
+    gt_points_per_instance: int = 4
     normalize_signatures: bool = True
     aggregation_similarity_metric: str = "cosine"
     identity_similarity_metric: str = "cosine"
