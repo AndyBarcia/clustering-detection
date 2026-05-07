@@ -31,6 +31,13 @@ class DecoderConfig:
 
 
 @dataclass
+class SlotDecoderConfig:
+    num_layers: int = 3
+    num_slots: int = 20
+    use_attention_residuals: bool = False
+
+
+@dataclass
 class HeadConfig:
     num_classes: int = 3
     hidden_dim: int = 1024
@@ -46,6 +53,7 @@ class ModelConfig:
     backbone: BackboneConfig = field(default_factory=BackboneConfig)
     decoder_layer: DecoderLayerConfig = field(default_factory=DecoderLayerConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
+    slot_decoder: SlotDecoderConfig = field(default_factory=SlotDecoderConfig)
     heads: HeadConfig = field(default_factory=HeadConfig)
     mask_loss_levels: Tuple[str, ...] = ("p2", "p3", "p4", "p5")
 

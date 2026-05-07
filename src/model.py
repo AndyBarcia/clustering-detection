@@ -197,6 +197,7 @@ class Mask2FormerBase(nn.Module):
         self.num_classes = num_classes
         self.num_queries = num_queries
         self.num_layers = num_layers
+        self.num_slots = cfg.slot_decoder.num_slots
 
         self.backbone = TinyDetEncoder(
             in_ch=cfg.backbone.in_channels,
@@ -222,6 +223,22 @@ class Mask2FormerBase(nn.Module):
             decoder_layer,
             num_layers=num_layers,
             use_attention_residuals=cfg.decoder.use_attention_residuals,
+        )
+        self.slot_queries = nn.Embedding(cfg.slot_decoder.num_slots, hidden_dim)
+        slot_decoder_layer = TransformerDecoderLayer(
+            d_model=dlcfg.d_model,
+            nhead=dlcfg.nhead,
+            dim_feedforward=dlcfg.dim_feedforward,
+            dropout=dlcfg.dropout,
+            activation=dlcfg.activation,
+            ttt_steps=0,
+            ttt_lr=dlcfg.ttt_lr,
+            ttt_momentum=dlcfg.ttt_momentum,
+        )
+        self.slot_decoder = TTTTransformerDecoder(
+            slot_decoder_layer,
+            num_layers=cfg.slot_decoder.num_layers,
+            use_attention_residuals=cfg.slot_decoder.use_attention_residuals,
         )
 
         self.mask_head = nn.Sequential(
@@ -361,6 +378,26 @@ class Mask2FormerBase(nn.Module):
         cls_preds = self.cls_head(q)
         return mask_embs, cls_preds, None, None, None, None
 
+    def _run_slot_heads(self, slots):
+        del slots
+        return None, None, None
+
+    def _decode_slots(self, query_layers: torch.Tensor) -> torch.Tensor:
+        if query_layers.ndim != 4:
+            raise ValueError(
+                f"Expected decoded queries with shape [L, B, Q, C], got {tuple(query_layers.shape)}."
+            )
+
+        batch_size = query_layers.shape[1]
+        slot_embed = self.slot_queries.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        slot_outputs, _ = self.slot_decoder(
+            tgt=slot_embed,
+            memory=query_layers[-1],
+            memory_sequence=list(query_layers.unbind(0)),
+            seed_head=None,
+        )
+        return slot_outputs
+
     def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
 
@@ -372,21 +409,27 @@ class Mask2FormerBase(nn.Module):
             enriched_feats,
             ttt_steps_override=ttt_steps_override,
         )
+        slot_dec_all = self._decode_slots(q_dec_all) if self.supports_gt_prototypes else None
 
         mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds = self._run_heads(q_dec_all)
+        slot_sig_embs, slot_seed_logits, slot_seed_scores = self._run_slot_heads(slot_dec_all)
 
         return RawOutputs(
             features=features,
             feature_maps=enriched_feats,
             memory=memory,
             queries=q_dec_all,
+            slot_queries=slot_dec_all,
             intermediate_ttt_q=intermediate_ttt_q,
             mask_embs=mask_embs,
             cls_preds=cls_preds,
             img_shape=(H_img, W_img),
             sig_embs=sig_embs,
+            slot_sig_embs=slot_sig_embs,
             seed_logits=seed_logits,
             seed_scores=seed_scores,
+            slot_seed_logits=slot_seed_logits,
+            slot_seed_scores=slot_seed_scores,
             influence_preds=influence_preds,
         )
 
@@ -602,6 +645,12 @@ class CustomMask2Former(Mask2FormerBase):
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
         return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds
 
+    def _run_slot_heads(self, slots):
+        sig_embs = self.prepare_signature_embeddings(self.sig_head(slots))
+        seed_logits = self.seed_head(slots).squeeze(-1)
+        seed_scores = torch.sigmoid(seed_logits)
+        return sig_embs, seed_logits, seed_scores
+
 
 class StandardMask2Former(Mask2FormerBase):
     def __init__(self, cfg: ModelConfig):
@@ -609,7 +658,14 @@ class StandardMask2Former(Mask2FormerBase):
         self.transformer_decoder.use_attention_residuals = False
         self.transformer_decoder.attn_residual_queries = None
         self.transformer_decoder.attn_residual_key_scale = None
+        self.slot_decoder.use_attention_residuals = False
+        self.slot_decoder.attn_residual_queries = None
+        self.slot_decoder.attn_residual_key_scale = None
         for layer in self.transformer_decoder.layers:
+            layer.ttt_steps = 0
+            layer.ttt_lr = None
+            layer.ttt_momentum = None
+        for layer in self.slot_decoder.layers:
             layer.ttt_steps = 0
             layer.ttt_lr = None
             layer.ttt_momentum = None

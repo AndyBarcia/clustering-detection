@@ -12,13 +12,17 @@ class RawOutputs:
     feature_maps: dict[str, torch.Tensor]
     memory: torch.Tensor            # [B, HW, C]
     queries: torch.Tensor           # [L, B, Nq, C]
+    slot_queries: Optional[torch.Tensor]
     intermediate_ttt_q: torch.Tensor
     mask_embs: torch.Tensor         # [L, B, Nq, C]
     cls_preds: torch.Tensor         # [L, B, Nq, K]
     img_shape: Tuple[int, int]
     sig_embs: Optional[torch.Tensor] = None        # [L, B, Nq, S]
+    slot_sig_embs: Optional[torch.Tensor] = None   # [Ls, B, Ns, S]
     seed_logits: Optional[torch.Tensor] = None     # [L, B, Nq]
     seed_scores: Optional[torch.Tensor] = None     # [L, B, Nq]
+    slot_seed_logits: Optional[torch.Tensor] = None     # [Ls, B, Ns]
+    slot_seed_scores: Optional[torch.Tensor] = None     # [Ls, B, Ns]
     influence_preds: Optional[torch.Tensor] = None # [L, B, Nq]
 
 
@@ -94,6 +98,7 @@ class ResolvedPrediction:
     resolved_masks: list[torch.Tensor]    # list[[H, W]]
     resolved_labels: list[int]
     resolved_scores: list[float]
+    slot_signature_embeddings: Optional[torch.Tensor] = None  # [Ns, S]
 
     @property
     def all_signature_embeddings(self) -> torch.Tensor:

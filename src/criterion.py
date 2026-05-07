@@ -306,43 +306,6 @@ class ClusterPanopticCriterion(nn.Module):
         loss_mask_iou = torch.stack(list(level_loss_mask_iou.values())).mean()
         return loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou
 
-    def _compute_mask_cls_losses(
-        self,
-        q_sig_flat: torch.Tensor, # [B,Q,S]
-        q_influence_flat: torch.Tensor, # [B,Q]
-        gt_sigs_norm: torch.Tensor, # [B,GT,S]
-        gt_pad_mask: torch.Tensor, # [B,GT]
-        q_mask_emb_flat: torch.Tensor, # [B,Q,Cm]
-        q_cls_flat: torch.Tensor, # [B,Q,K]
-        gt_labels_pad: torch.Tensor, # [B,GT]
-        gt_masks_pad: torch.Tensor, # [B,GT,H,W]
-        feature_maps_val: list[tuple[str, torch.Tensor]],
-        img_shape: tuple[int, int],
-        aggregation_similarity_metric: str,
-    ):
-        proto_mask_emb, proto_cls = self._compute_assignment_aggregation(
-            q_sig_flat=q_sig_flat,
-            q_influence_flat=q_influence_flat,
-            gt_sigs_norm=gt_sigs_norm,
-            gt_pad_mask=gt_pad_mask,
-            q_mask_emb_flat=q_mask_emb_flat,
-            q_cls_flat=q_cls_flat,
-            aggregation_similarity_metric=aggregation_similarity_metric,
-        )
-        loss_cls = self._compute_aggregated_cls_loss(
-            proto_cls, 
-            gt_labels_pad, 
-            gt_pad_mask
-        )
-        loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou = self._compute_aggregated_mask_losses(
-            proto_mask_emb=proto_mask_emb,
-            feature_maps_val=feature_maps_val,
-            gt_masks_pad=gt_masks_pad,
-            gt_pad_mask=gt_pad_mask,
-            img_shape=img_shape,
-        )
-        return loss_cls, loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou
-
     def _compute_seed_losses(
         self,
         q_sig_flat: torch.Tensor, # [B,Q,S]
@@ -380,21 +343,64 @@ class ClusterPanopticCriterion(nn.Module):
 
         return loss_seed, loss_seed_sig
 
+    def _compute_mask_cls_losses(
+        self,
+        q_sig_flat: torch.Tensor, # [B,Q,S]
+        q_influence_flat: torch.Tensor, # [B,Q]
+        gt_sigs_norm: torch.Tensor, # [B,GT,S]
+        gt_pad_mask: torch.Tensor, # [B,GT]
+        q_mask_emb_flat: torch.Tensor, # [B,Q,Cm]
+        q_cls_flat: torch.Tensor, # [B,Q,K]
+        gt_labels_pad: torch.Tensor, # [B,GT]
+        gt_masks_pad: torch.Tensor, # [B,GT,H,W]
+        feature_maps_val: list[tuple[str, torch.Tensor]],
+        img_shape: tuple[int, int],
+        aggregation_similarity_metric: str,
+    ):
+        proto_mask_emb, proto_cls = self._compute_assignment_aggregation(
+            q_sig_flat=q_sig_flat,
+            q_influence_flat=q_influence_flat,
+            gt_sigs_norm=gt_sigs_norm,
+            gt_pad_mask=gt_pad_mask,
+            q_mask_emb_flat=q_mask_emb_flat,
+            q_cls_flat=q_cls_flat,
+            aggregation_similarity_metric=aggregation_similarity_metric,
+        )
+        loss_cls = self._compute_aggregated_cls_loss(
+            proto_cls,
+            gt_labels_pad,
+            gt_pad_mask,
+        )
+        loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou = self._compute_aggregated_mask_losses(
+            proto_mask_emb=proto_mask_emb,
+            feature_maps_val=feature_maps_val,
+            gt_masks_pad=gt_masks_pad,
+            gt_pad_mask=gt_pad_mask,
+            img_shape=img_shape,
+        )
+        return loss_cls, loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou
+
     def compute_loss(self, model: CustomMask2Former, raw: RawOutputs, targets):
         features = raw.features
-        memory = raw.memory
         feature_maps = self._ordered_feature_maps(model, raw)
         mask_embs = raw.mask_embs
         cls_preds = raw.cls_preds
         sig_embs = raw.sig_embs
-        seed_logits = raw.seed_logits
         influence_preds = raw.influence_preds
+        slot_sig_embs = raw.slot_sig_embs
+        slot_seed_logits = raw.slot_seed_logits
         H_img, W_img = raw.img_shape
 
-        if sig_embs is None or seed_logits is None or influence_preds is None:
-            raise ValueError("Clustered criterion requires signature, seed, and influence predictions.")
+        if (
+            mask_embs is None
+            or cls_preds is None
+            or sig_embs is None
+            or influence_preds is None
+            or slot_sig_embs is None
+            or slot_seed_logits is None
+        ):
+            raise ValueError("Clustered criterion requires query mask/class outputs and slot seed/signature outputs.")
 
-        # features: [B,C,Hf,Wf], memory: [B,N_mem,C]
         B = features.shape[0]
 
         valid_b, masks_list, labels_list = [], [], []
@@ -433,32 +439,28 @@ class ClusterPanopticCriterion(nn.Module):
             gt_pad_mask[i, :M] = True
 
         features_val = features[valid_b]
-        memory_val = memory[valid_b]
         feature_maps_val = [(level_name, level_features[valid_b]) for level_name, level_features in feature_maps]
-
         q_sig = sig_embs[:, valid_b]
         q_mask_emb = mask_embs[:, valid_b]
         q_cls = cls_preds[:, valid_b]
-        q_seed_logits = seed_logits[:, valid_b]
         q_influence = influence_preds[:, valid_b]
+        slot_sig = slot_sig_embs[:, valid_b]
+        slot_seed = slot_seed_logits[:, valid_b]
 
-        # Decoder outputs are [L,Bv,Q,...]; we flatten layers and queries into a single query axis.
-        L, _, N_q, S = q_sig.shape
+        query_layers, _, query_count, sig_dim = q_sig.shape
+        q_sig_flat = q_sig.transpose(0, 1).reshape(B_val, query_layers * query_count, sig_dim)
+        q_mask_emb_flat = q_mask_emb.transpose(0, 1).reshape(B_val, query_layers * query_count, -1)
+        q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, query_layers * query_count, -1)
+        q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, query_layers * query_count)
 
-        # q_sig_flat: [Bv,L*Q,S], q_mask_emb_flat: [Bv,L*Q,C], q_cls_flat: [Bv,L*Q,K]
-        q_sig_flat = q_sig.transpose(0, 1).reshape(B_val, L * N_q, S)
-        q_mask_emb_flat = q_mask_emb.transpose(0, 1).reshape(B_val, L * N_q, -1)
-        q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, L * N_q, -1)
-        # q_seed_logits_flat/q_influence_flat: [Bv,L*Q]
-        q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
-        q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
+        slot_layers = slot_sig.shape[0]
 
         # gt_sigs_norm: [Bv,GT,S]
         feature_maps_dict = {
             level_name: level_features
             for level_name, level_features in feature_maps_val
         }
-        gt_sigs_norm = model.encode_gts(memory_val, feature_maps_dict, gt_masks_pad, gt_labels_pad, gt_pad_mask)
+        gt_sigs_norm = model.encode_gts(None, feature_maps_dict, gt_masks_pad, gt_labels_pad, gt_pad_mask)
         
         loss_inter = self._compute_loss_inter(
             gt_sigs_norm, 
@@ -466,7 +468,7 @@ class ClusterPanopticCriterion(nn.Module):
             features,
             identity_similarity_metric=model.identity_similarity_metric,
         )
-        
+
         loss_cls, loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou = self._compute_mask_cls_losses(
             q_sig_flat=q_sig_flat,
             q_influence_flat=q_influence_flat,
@@ -480,15 +482,20 @@ class ClusterPanopticCriterion(nn.Module):
             img_shape=(H_img, W_img),
             aggregation_similarity_metric=model.aggregation_similarity_metric,
         )
-        
-        loss_seed, loss_seed_sig = self._compute_seed_losses(
-            q_sig_flat=q_sig_flat,
-            gt_sigs_norm=gt_sigs_norm,
-            gt_pad_mask=gt_pad_mask,
-            q_seed_logits_flat=q_seed_logits_flat,
-            features=features,
-            identity_similarity_metric=model.identity_similarity_metric,
-        )
+
+        slot_layer_seed_losses = [
+            self._compute_seed_losses(
+                q_sig_flat=slot_sig[layer_idx],
+                gt_sigs_norm=gt_sigs_norm,
+                gt_pad_mask=gt_pad_mask,
+                q_seed_logits_flat=slot_seed[layer_idx],
+                features=features,
+                identity_similarity_metric=model.identity_similarity_metric,
+            )
+            for layer_idx in range(slot_layers)
+        ]
+        loss_seed = torch.stack([losses[0] for losses in slot_layer_seed_losses]).mean()
+        loss_seed_sig = torch.stack([losses[1] for losses in slot_layer_seed_losses]).mean()
 
         total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
 

@@ -201,6 +201,19 @@ class ModularPrototypePredictor:
             predicted_labels=predicted_labels,
         )
 
+    def flatten_slot_signatures(self, raw: RawOutputs, batch_index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if raw.slot_sig_embs is None or raw.slot_seed_scores is None:
+            raise ValueError("Slot signature outputs are unavailable for slot-based inference.")
+
+        slot_signature_embeddings = raw.slot_sig_embs[-1, batch_index]
+        slot_seed_scores = raw.slot_seed_scores[-1, batch_index]
+        return slot_signature_embeddings, slot_seed_scores
+
+    def maybe_slot_signatures(self, raw: RawOutputs, batch_index: int) -> Optional[torch.Tensor]:
+        if raw.slot_sig_embs is None:
+            return None
+        return raw.slot_sig_embs[-1, batch_index]
+
     def select_seed_queries(self, flat_queries: FlatQueryOutputs) -> SeedSelection:
         cfg = self.cfg.seed
         effective_scores = flat_queries.seed_scores.clone()
@@ -627,7 +640,45 @@ class ModularPrototypePredictor:
             target_indices=target_indices,
         )
 
-    def resolve_prediction(self, flat_queries: FlatQueryOutputs, prototypes: PrototypeState) -> ResolvedPrediction:
+    def build_slot_signature_prototypes(
+        self,
+        model: CustomMask2Former,
+        flat_queries: FlatQueryOutputs,
+        slot_signatures: torch.Tensor,
+        slot_seed_scores: torch.Tensor,
+    ) -> PrototypeState:
+        if slot_signatures.shape[0] == 0:
+            return self._empty_prototype_state(flat_queries)
+
+        keep_mask = slot_seed_scores >= self.cfg.seed.quality_threshold
+        keep_indices = torch.where(keep_mask)[0]
+        if keep_indices.numel() < self.cfg.seed.min_num_seeds:
+            k = min(self.cfg.seed.min_num_seeds, slot_seed_scores.numel())
+            keep_indices = torch.topk(slot_seed_scores, k=k).indices
+        if self.cfg.seed.topk is not None and keep_indices.numel() > self.cfg.seed.topk:
+            top_local = torch.topk(slot_seed_scores[keep_indices], k=self.cfg.seed.topk).indices
+            keep_indices = keep_indices[top_local]
+
+        if keep_indices.numel() == 0:
+            return self._empty_prototype_state(flat_queries)
+
+        prototypes = self.build_signature_prototypes(
+            model,
+            flat_queries,
+            slot_signatures[keep_indices],
+        )
+        prototypes.prototype_seed_indices = keep_indices
+        prototypes.assignment_strength = slot_seed_scores[keep_indices]
+        prototypes.source_cluster_labels = keep_indices
+        return prototypes
+
+    def resolve_prediction(
+        self,
+        flat_queries: FlatQueryOutputs,
+        prototypes: PrototypeState,
+        *,
+        slot_signature_embeddings: Optional[torch.Tensor] = None,
+    ) -> ResolvedPrediction:
         cfg = self.cfg.overlap
         features = flat_queries.features
         image_height, image_width = flat_queries.image_height, flat_queries.image_width
@@ -649,6 +700,7 @@ class ModularPrototypePredictor:
                 resolved_masks=[],
                 resolved_labels=[],
                 resolved_scores=[],
+                slot_signature_embeddings=slot_signature_embeddings,
             )
 
         mask_logits = project_mask_embeddings(
@@ -690,6 +742,7 @@ class ModularPrototypePredictor:
                 resolved_masks=[],
                 resolved_labels=[],
                 resolved_scores=[],
+                slot_signature_embeddings=slot_signature_embeddings,
             )
 
         kept_prototype_indices = torch.where(keep_mask)[0]
@@ -770,15 +823,38 @@ class ModularPrototypePredictor:
             resolved_masks=resolved_masks,
             resolved_labels=resolved_labels,
             resolved_scores=resolved_scores,
+            slot_signature_embeddings=slot_signature_embeddings,
         )
 
     def predict_clustered_single(self, model: CustomMask2Former, raw: RawOutputs, batch_index: int) -> ResolvedPrediction:
+        if raw.slot_sig_embs is not None and raw.slot_seed_scores is not None:
+            return self.predict_slot_single(model, raw, batch_index)
+
         flat_queries = self.flatten_outputs(raw, batch_index)
         seed_selection = self.select_seed_queries(flat_queries)
         seed_clustering = self.cluster_seed_queries(model, flat_queries, seed_selection)
         prototypes = self.initialize_clustered_prototypes(flat_queries, seed_clustering)
         prototypes = self.refine_prototypes(model, flat_queries, prototypes)
-        return self.resolve_prediction(flat_queries, prototypes)
+        return self.resolve_prediction(
+            flat_queries,
+            prototypes,
+            slot_signature_embeddings=self.maybe_slot_signatures(raw, batch_index),
+        )
+
+    def predict_slot_single(self, model: CustomMask2Former, raw: RawOutputs, batch_index: int) -> ResolvedPrediction:
+        flat_queries = self.flatten_outputs(raw, batch_index)
+        slot_signatures, slot_seed_scores = self.flatten_slot_signatures(raw, batch_index)
+        prototypes = self.build_slot_signature_prototypes(
+            model,
+            flat_queries,
+            slot_signatures,
+            slot_seed_scores,
+        )
+        return self.resolve_prediction(
+            flat_queries,
+            prototypes,
+            slot_signature_embeddings=slot_signatures,
+        )
 
     def predict_with_gt_signatures_single(self, model: CustomMask2Former, raw: RawOutputs, targets, batch_index: int) -> ResolvedPrediction:
         flat_queries = self.flatten_outputs(raw, batch_index)
@@ -815,7 +891,11 @@ class ModularPrototypePredictor:
 
         candidate_indices = torch.arange(flat_queries.num_queries, device=flat_queries.signature_embeddings.device)
         if gt_signatures.shape[0] == 0 or candidate_indices.numel() == 0:
-            empty_prediction = self.resolve_prediction(flat_queries, self._empty_prototype_state(flat_queries))
+            empty_prediction = self.resolve_prediction(
+                flat_queries,
+                self._empty_prototype_state(flat_queries),
+                slot_signature_embeddings=self.maybe_slot_signatures(raw, batch_index),
+            )
             return empty_prediction, GoldenQueryDiagnostics()
 
         query_signatures = flat_queries.signature_embeddings[candidate_indices]
@@ -865,7 +945,11 @@ class ModularPrototypePredictor:
             prototype_seed_indices=matched_query_indices,
             target_indices=matched_gt_indices,
         )
-        prediction = self.resolve_prediction(flat_queries, prototypes)
+        prediction = self.resolve_prediction(
+            flat_queries,
+            prototypes,
+            slot_signature_embeddings=self.maybe_slot_signatures(raw, batch_index),
+        )
         diagnostics = GoldenQueryDiagnostics(
             matched_query_distances=matched_distances,
             unmatched_query_closest_gt_distances=unmatched_query_distances,
@@ -883,7 +967,11 @@ class ModularPrototypePredictor:
         seed_clustering = self.cluster_seed_queries(model, flat_queries, seed_selection)
         clustering_prototypes = self.initialize_clustered_prototypes(flat_queries, seed_clustering)
         clustering_prototypes = self.refine_prototypes(model, flat_queries, clustering_prototypes)
-        clustering_prediction = self.resolve_prediction(flat_queries, clustering_prototypes)
+        clustering_prediction = self.resolve_prediction(
+            flat_queries,
+            clustering_prototypes,
+            slot_signature_embeddings=self.maybe_slot_signatures(raw, batch_index),
+        )
 
         gt_signature_prototypes = self.build_gt_signature_prototypes(
             model,
@@ -891,7 +979,11 @@ class ModularPrototypePredictor:
             gt_signatures,
             target_indices=target_indices,
         )
-        gt_signature_prediction = self.resolve_prediction(flat_queries, gt_signature_prototypes)
+        gt_signature_prediction = self.resolve_prediction(
+            flat_queries,
+            gt_signature_prototypes,
+            slot_signature_embeddings=self.maybe_slot_signatures(raw, batch_index),
+        )
         golden_query_prediction, golden_query_diagnostics = self.predict_with_golden_queries_single(
             model,
             raw,

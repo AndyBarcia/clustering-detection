@@ -942,6 +942,7 @@ def _draw_signature_umap(
     q_sig = None if flat is None else flat.signature_embeddings
     q_seed = None if flat is None else flat.seed_scores
     q_influence = None if flat is None else flat.influence_scores
+    slot_sig = prediction.slot_signature_embeddings
     gt_sig = prediction.all_signature_embeddings
 
     if q_sig is None or gt_sig is None:
@@ -951,6 +952,7 @@ def _draw_signature_umap(
         return
 
     q_sig_np = q_sig.detach().cpu().numpy()
+    slot_sig_np = None if slot_sig is None else slot_sig.detach().cpu().numpy()
     gt_sig_np = gt_sig.detach().cpu().numpy()
 
     gt_masks_all = [mask.detach().cpu().numpy() for mask in target["masks"]]
@@ -979,10 +981,20 @@ def _draw_signature_umap(
     gt_masks = [gt_masks_all[idx] for idx in gt_target_indices]
     gt_labels = [gt_labels_all[idx] for idx in gt_target_indices]
 
-    all_sig = np.concatenate([q_sig_np, gt_sig_np], axis=0) if gt_sig_np.shape[0] > 0 else q_sig_np
+    signature_sets = [q_sig_np]
+    if slot_sig_np is not None and slot_sig_np.shape[0] > 0:
+        signature_sets.append(slot_sig_np)
+    if gt_sig_np.shape[0] > 0:
+        signature_sets.append(gt_sig_np)
+    all_sig = np.concatenate(signature_sets, axis=0)
     embedding = _project_signatures_2d(all_sig, metric=identity_similarity_metric)
     q_pts = embedding[: q_sig_np.shape[0]]
-    gt_pts = embedding[q_sig_np.shape[0] :]
+    cursor = q_sig_np.shape[0]
+    slot_pts = None
+    if slot_sig_np is not None and slot_sig_np.shape[0] > 0:
+        slot_pts = embedding[cursor : cursor + slot_sig_np.shape[0]]
+        cursor += slot_sig_np.shape[0]
+    gt_pts = embedding[cursor:]
 
     gt_colors = [_instance_color(image_np, mask) for mask in gt_masks]
     gt_marker_size = 150.0
@@ -1044,6 +1056,7 @@ def _draw_signature_umap(
 
     query_colors = np.full((q_pts.shape[0], 3), 0.7, dtype=np.float32)
     query_alpha = np.full((q_pts.shape[0],), 0.72, dtype=np.float32)
+    slot_color = np.array([0.0, 0.45, 0.95], dtype=np.float32)
 
     if row_state is not None:
         row_state.umap_query_points = q_pts
@@ -1075,6 +1088,20 @@ def _draw_signature_umap(
                     base_color=np.array(query_colors[idx], dtype=np.float32),
                     base_alpha=float(query_alpha[idx]),
                 )
+            )
+
+    if slot_pts is not None:
+        for pt in slot_pts:
+            ax.scatter(
+                pt[0],
+                pt[1],
+                s=95.0,
+                c=[slot_color],
+                alpha=0.86,
+                marker="D",
+                edgecolors="white",
+                linewidths=0.8,
+                zorder=3,
             )
 
     for idx, pt in enumerate(gt_pts):
