@@ -20,6 +20,10 @@ class RawOutputs:
     seed_logits: Optional[torch.Tensor] = None     # [L, B, Nq]
     seed_scores: Optional[torch.Tensor] = None     # [L, B, Nq]
     influence_preds: Optional[torch.Tensor] = None # [L, B, Nq]
+    object_queries: Optional[torch.Tensor] = None      # [Lo, B, No, C]
+    object_sig_embs: Optional[torch.Tensor] = None     # [Lo, B, No, S]
+    object_seed_logits: Optional[torch.Tensor] = None  # [Lo, B, No]
+    object_seed_scores: Optional[torch.Tensor] = None  # [Lo, B, No]
 
 
 @dataclass
@@ -94,6 +98,7 @@ class ResolvedPrediction:
     resolved_masks: list[torch.Tensor]    # list[[H, W]]
     resolved_labels: list[int]
     resolved_scores: list[float]
+    object_queries: Optional[FlatQueryOutputs] = None
 
     @property
     def all_signature_embeddings(self) -> torch.Tensor:

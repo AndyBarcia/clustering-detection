@@ -938,10 +938,12 @@ def _draw_signature_umap(
     title: str,
     row_state: Optional[_RowInteractionState] = None,
 ):
-    flat: Optional[FlatQueryOutputs] = prediction.flat_queries
-    q_sig = None if flat is None else flat.signature_embeddings
-    q_seed = None if flat is None else flat.seed_scores
-    q_influence = None if flat is None else flat.influence_scores
+    flat: FlatQueryOutputs = prediction.object_queries
+    if flat is None:
+        raise ValueError("Signature UMAP requires object queries; no fallback query population is allowed.")
+    q_sig = flat.signature_embeddings
+    q_seed = flat.seed_scores
+    q_influence = flat.influence_scores
     gt_sig = prediction.all_signature_embeddings
 
     if q_sig is None or gt_sig is None:
@@ -1046,13 +1048,9 @@ def _draw_signature_umap(
     query_alpha = np.full((q_pts.shape[0],), 0.72, dtype=np.float32)
 
     if row_state is not None:
-        row_state.umap_query_points = q_pts
-        row_state.umap_query_pick_radius = 0.03 * max(
-            float(np.ptp(q_pts[:, 0])) if q_pts.shape[0] > 0 else 1.0,
-            float(np.ptp(q_pts[:, 1])) if q_pts.shape[0] > 0 else 1.0,
-            1.0,
-        )
-        row_state.umap_query_axis = ax
+        row_state.umap_query_points = None
+        row_state.umap_query_pick_radius = 0.0
+        row_state.umap_query_axis = None
         row_state.umap_query_artists = []
 
     for idx in range(q_pts.shape[0]):
@@ -1416,11 +1414,11 @@ def render_prediction_grid(
     interactive: bool = False,
 ):
     num_samples = len(images)
-    gt_signature_prediction_column_idx = next(
-        (idx for idx, (title, _) in enumerate(prediction_columns) if "GT Prototype" in title),
+    clustered_prediction_column_idx = next(
+        (idx for idx, (title, _) in enumerate(prediction_columns) if "Clustered" in title),
         None,
     )
-    add_signature_column = gt_signature_prediction_column_idx is not None
+    add_signature_column = clustered_prediction_column_idx is not None
     num_cols = 2 + len(prediction_columns) + int(add_signature_column)
     fig, axes = plt.subplots(num_samples, num_cols, figsize=(5 * num_cols, 5 * max(num_samples, 1)), squeeze=False)
 
@@ -1448,7 +1446,7 @@ def render_prediction_grid(
         )
 
         next_col_idx = 2
-        gt_signature_prediction = None
+        signature_prediction = None
         for column_idx, (column_title, predictions) in enumerate(prediction_columns):
             prediction = predictions[row_idx]
             pred_masks = [mask.detach().cpu().numpy() for mask in prediction.resolved_masks]
@@ -1471,19 +1469,19 @@ def render_prediction_grid(
                 gt_masks=gt_masks,
                 kind="prediction",
             )
-            if column_idx == gt_signature_prediction_column_idx:
-                gt_signature_prediction = prediction
+            if column_idx == clustered_prediction_column_idx:
+                signature_prediction = prediction
             next_col_idx += 1
 
-        if add_signature_column and gt_signature_prediction is not None:
+        if add_signature_column and signature_prediction is not None:
             _draw_signature_umap(
                 axes[row_idx, next_col_idx],
                 image_np,
                 target,
-                gt_signature_prediction,
+                signature_prediction,
                 identity_similarity_metric=identity_similarity_metric,
                 class_names=class_names,
-                title="GT Signature UMAP",
+                title="Object / Prototype Signatures",
             )
 
     if figure_title:
@@ -1615,10 +1613,10 @@ def show_detailed_prediction_view(
         mode="pixel_distribution",
     )
 
-    umap_prediction = bundle.predictions.gt_signatures or primary_prediction
+    umap_prediction = primary_prediction
     umap_title = (
-        "Query / GT Signatures"
-        if bundle.predictions.gt_signatures is not None
+        "Object / Prototype Signatures"
+        if primary_prediction.object_queries is not None
         else "Query / Prototype Signatures"
     )
 

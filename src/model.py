@@ -181,6 +181,30 @@ class TTTTransformerDecoder(nn.Module):
         return all_outputs, intermediate_ttt_q
 
 
+class ObjectTransformerDecoder(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=256, dropout=0.1, activation="gelu", num_layers=3):
+        super().__init__()
+        layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation=activation,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(num_layers)])
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, tgt: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        output = tgt
+        history = []
+        for layer in self.layers:
+            output = layer(output, memory)
+            history.append(self.norm(output))
+        return torch.stack(history, dim=0)
+
+
 class Mask2FormerBase(nn.Module):
     supports_gt_prototypes = False
 
@@ -222,6 +246,15 @@ class Mask2FormerBase(nn.Module):
             decoder_layer,
             num_layers=num_layers,
             use_attention_residuals=cfg.decoder.use_attention_residuals,
+        )
+        self.object_queries = nn.Embedding(num_queries, hidden_dim)
+        self.object_decoder = ObjectTransformerDecoder(
+            d_model=dlcfg.d_model,
+            nhead=dlcfg.nhead,
+            dim_feedforward=dlcfg.dim_feedforward,
+            dropout=dlcfg.dropout,
+            activation=dlcfg.activation,
+            num_layers=num_layers,
         )
 
         self.mask_head = nn.Sequential(
@@ -361,6 +394,16 @@ class Mask2FormerBase(nn.Module):
         cls_preds = self.cls_head(q)
         return mask_embs, cls_preds, None, None, None, None
 
+    def _decode_objects(self, q_dec_all: torch.Tensor) -> torch.Tensor:
+        # Object queries attend to all image-query states from all decoder layers.
+        L, B, Q, C = q_dec_all.shape
+        memory = q_dec_all.permute(1, 0, 2, 3).reshape(B, L * Q, C)
+        object_query_embed = self.object_queries.weight.unsqueeze(0).repeat(B, 1, 1)
+        return self.object_decoder(object_query_embed, memory)
+
+    def _run_object_heads(self, object_q):
+        return None, None, None
+
     def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
 
@@ -374,6 +417,8 @@ class Mask2FormerBase(nn.Module):
         )
 
         mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds = self._run_heads(q_dec_all)
+        object_queries = self._decode_objects(q_dec_all)
+        object_sig_embs, object_seed_logits, object_seed_scores = self._run_object_heads(object_queries)
 
         return RawOutputs(
             features=features,
@@ -388,6 +433,10 @@ class Mask2FormerBase(nn.Module):
             seed_logits=seed_logits,
             seed_scores=seed_scores,
             influence_preds=influence_preds,
+            object_queries=object_queries,
+            object_sig_embs=object_sig_embs,
+            object_seed_logits=object_seed_logits,
+            object_seed_scores=object_seed_scores,
         )
 
 
@@ -411,7 +460,7 @@ class CustomMask2Former(Mask2FormerBase):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, sig_dim),
         )
-        self.seed_head = nn.Sequential(
+        self.object_seed_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
@@ -435,7 +484,7 @@ class CustomMask2Former(Mask2FormerBase):
         )
 
     def _decoder_seed_head(self):
-        return self.seed_head
+        return None
 
     def _decoder_memory_mask(self, query_state: torch.Tensor, features: torch.Tensor, memory_hw=None):
         if self._current_decoder_feature_maps is None:
@@ -597,10 +646,14 @@ class CustomMask2Former(Mask2FormerBase):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
         sig_embs = self.prepare_signature_embeddings(self.sig_head(q))
-        seed_logits = self.seed_head(q).squeeze(-1)
-        seed_scores = torch.sigmoid(seed_logits)
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
-        return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds
+        return mask_embs, cls_preds, sig_embs, None, None, influence_preds
+
+    def _run_object_heads(self, object_q):
+        object_sig_embs = self.prepare_signature_embeddings(self.sig_head(object_q))
+        object_seed_logits = self.object_seed_head(object_q).squeeze(-1)
+        object_seed_scores = torch.sigmoid(object_seed_logits)
+        return object_sig_embs, object_seed_logits, object_seed_scores
 
 
 class StandardMask2Former(Mask2FormerBase):

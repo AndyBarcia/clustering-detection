@@ -387,12 +387,13 @@ class ClusterPanopticCriterion(nn.Module):
         mask_embs = raw.mask_embs
         cls_preds = raw.cls_preds
         sig_embs = raw.sig_embs
-        seed_logits = raw.seed_logits
+        seed_logits = raw.object_seed_logits
+        object_sig_embs = raw.object_sig_embs
         influence_preds = raw.influence_preds
         H_img, W_img = raw.img_shape
 
-        if sig_embs is None or seed_logits is None or influence_preds is None:
-            raise ValueError("Clustered criterion requires signature, seed, and influence predictions.")
+        if sig_embs is None or object_sig_embs is None or seed_logits is None or influence_preds is None:
+            raise ValueError("Clustered criterion requires query signatures/influence and object seed/signature predictions.")
 
         # features: [B,C,Hf,Wf], memory: [B,N_mem,C]
         B = features.shape[0]
@@ -439,8 +440,9 @@ class ClusterPanopticCriterion(nn.Module):
         q_sig = sig_embs[:, valid_b]
         q_mask_emb = mask_embs[:, valid_b]
         q_cls = cls_preds[:, valid_b]
-        q_seed_logits = seed_logits[:, valid_b]
         q_influence = influence_preds[:, valid_b]
+        object_q_sig = object_sig_embs[:, valid_b]
+        object_seed_logits = seed_logits[:, valid_b]
 
         # Decoder outputs are [L,Bv,Q,...]; we flatten layers and queries into a single query axis.
         L, _, N_q, S = q_sig.shape
@@ -449,8 +451,7 @@ class ClusterPanopticCriterion(nn.Module):
         q_sig_flat = q_sig.transpose(0, 1).reshape(B_val, L * N_q, S)
         q_mask_emb_flat = q_mask_emb.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, L * N_q, -1)
-        # q_seed_logits_flat/q_influence_flat: [Bv,L*Q]
-        q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
+        # q_influence_flat: [Bv,L*Q]
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
 
         # gt_sigs_norm: [Bv,GT,S]
@@ -481,14 +482,19 @@ class ClusterPanopticCriterion(nn.Module):
             aggregation_similarity_metric=model.aggregation_similarity_metric,
         )
         
-        loss_seed, loss_seed_sig = self._compute_seed_losses(
-            q_sig_flat=q_sig_flat,
-            gt_sigs_norm=gt_sigs_norm,
-            gt_pad_mask=gt_pad_mask,
-            q_seed_logits_flat=q_seed_logits_flat,
-            features=features,
-            identity_similarity_metric=model.identity_similarity_metric,
-        )
+        object_layer_losses = [
+            self._compute_seed_losses(
+                q_sig_flat=object_q_sig[layer_idx],
+                gt_sigs_norm=gt_sigs_norm,
+                gt_pad_mask=gt_pad_mask,
+                q_seed_logits_flat=object_seed_logits[layer_idx],
+                features=features,
+                identity_similarity_metric=model.identity_similarity_metric,
+            )
+            for layer_idx in range(object_q_sig.shape[0])
+        ]
+        loss_seed = torch.stack([loss[0] for loss in object_layer_losses]).mean()
+        loss_seed_sig = torch.stack([loss[1] for loss in object_layer_losses]).mean()
 
         total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
 

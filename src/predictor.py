@@ -165,7 +165,7 @@ class ModularPrototypePredictor:
         query_mask_embeddings = raw.mask_embs[:, batch_index]
         query_class_logits = raw.cls_preds[:, batch_index]
         query_signature_embeddings = raw.sig_embs[:, batch_index]
-        query_seed_scores = raw.seed_scores[:, batch_index]
+        query_seed_scores = raw.seed_scores[:, batch_index] if raw.seed_scores is not None else None
         query_influence_scores = raw.influence_preds[:, batch_index]
 
         num_layers, queries_per_layer, signature_dim = query_signature_embeddings.shape
@@ -174,7 +174,6 @@ class ModularPrototypePredictor:
         query_mask_embeddings = query_mask_embeddings.reshape(num_layers * queries_per_layer, -1)
         query_class_logits = query_class_logits.reshape(num_layers * queries_per_layer, num_classes)
         query_signature_embeddings = query_signature_embeddings.reshape(num_layers * queries_per_layer, signature_dim)
-        query_seed_scores = query_seed_scores.reshape(num_layers * queries_per_layer)
         query_influence_scores = query_influence_scores.reshape(num_layers * queries_per_layer)
 
         query_class_probabilities = F.softmax(query_class_logits, dim=-1)
@@ -182,6 +181,10 @@ class ModularPrototypePredictor:
         background_confidence = query_class_probabilities[:, 0]
         foreground_confidence = 1.0 - query_class_probabilities[:, 0]
         partition_confidence = torch.where(predicted_labels == 0, background_confidence, foreground_confidence)
+        if query_seed_scores is None:
+            query_seed_scores = partition_confidence
+        else:
+            query_seed_scores = query_seed_scores.reshape(num_layers * queries_per_layer)
 
         return FlatQueryOutputs(
             features=features,
@@ -199,6 +202,47 @@ class ModularPrototypePredictor:
             foreground_confidence=foreground_confidence,
             partition_confidence=partition_confidence,
             predicted_labels=predicted_labels,
+        )
+
+    def flatten_object_outputs(self, raw: RawOutputs, batch_index: int, reference_queries: FlatQueryOutputs) -> FlatQueryOutputs:
+        if raw.object_sig_embs is None or raw.object_seed_scores is None:
+            raise ValueError("Clustered inference requires object decoder signatures and seed scores.")
+
+        object_signature_embeddings = raw.object_sig_embs[:, batch_index]
+        object_seed_scores = raw.object_seed_scores[:, batch_index]
+        num_layers, objects_per_layer, signature_dim = object_signature_embeddings.shape
+        object_signature_embeddings = object_signature_embeddings.reshape(num_layers * objects_per_layer, signature_dim)
+        object_seed_scores = object_seed_scores.reshape(num_layers * objects_per_layer)
+
+        num_objects = object_signature_embeddings.shape[0]
+        num_classes = reference_queries.class_logits.shape[-1]
+        dtype = object_signature_embeddings.dtype
+        class_logits = torch.zeros((num_objects, num_classes), device=object_signature_embeddings.device, dtype=dtype)
+        mask_embeddings = torch.zeros(
+            (num_objects, reference_queries.mask_embeddings.shape[-1]),
+            device=object_signature_embeddings.device,
+            dtype=dtype,
+        )
+        background_confidence = torch.zeros((num_objects,), device=object_signature_embeddings.device, dtype=dtype)
+        foreground_confidence = torch.ones((num_objects,), device=object_signature_embeddings.device, dtype=dtype)
+        class_probabilities = F.softmax(class_logits, dim=-1)
+
+        return FlatQueryOutputs(
+            features=reference_queries.features,
+            image_height=reference_queries.image_height,
+            image_width=reference_queries.image_width,
+            num_decoder_layers=num_layers,
+            queries_per_layer=objects_per_layer,
+            mask_embeddings=mask_embeddings,
+            class_logits=class_logits,
+            class_probabilities=class_probabilities,
+            signature_embeddings=object_signature_embeddings,
+            seed_scores=object_seed_scores,
+            influence_scores=torch.zeros_like(object_seed_scores),
+            background_confidence=background_confidence,
+            foreground_confidence=foreground_confidence,
+            partition_confidence=object_seed_scores,
+            predicted_labels=torch.ones((num_objects,), dtype=torch.long, device=object_signature_embeddings.device),
         )
 
     def select_seed_queries(self, flat_queries: FlatQueryOutputs) -> SeedSelection:
@@ -445,6 +489,53 @@ class ModularPrototypePredictor:
             assignment_strength=torch.empty((0,), device=device),
         )
 
+    def initialize_object_prototypes(
+        self,
+        flat_queries: FlatQueryOutputs,
+        object_queries: FlatQueryOutputs,
+        clustering: SeedClustering,
+    ) -> PrototypeState:
+        device = flat_queries.signature_embeddings.device
+        valid = clustering.cluster_labels >= 0
+
+        if valid.sum() == 0:
+            return self._empty_prototype_state(
+                flat_queries,
+                source_query_indices=clustering.selection.indices,
+                source_cluster_labels=clustering.cluster_labels,
+            )
+
+        prototype_signatures = []
+        prototype_seed_indices = []
+
+        for member_object_indices in clustering.cluster_members:
+            representative_local = torch.argmax(object_queries.seed_scores[member_object_indices])
+            representative_object_index = member_object_indices[representative_local]
+            prototype_seed_indices.append(representative_object_index)
+            prototype_signatures.append(object_queries.signature_embeddings[representative_object_index])
+
+        num_prototypes = len(prototype_signatures)
+        return PrototypeState(
+            signature_embeddings=torch.stack(prototype_signatures, dim=0),
+            class_logits=torch.zeros(
+                (num_prototypes, flat_queries.class_logits.shape[-1]),
+                device=device,
+                dtype=flat_queries.class_logits.dtype,
+            ),
+            mask_embeddings=torch.zeros(
+                (num_prototypes, flat_queries.mask_embeddings.shape[-1]),
+                device=device,
+                dtype=flat_queries.mask_embeddings.dtype,
+            ),
+            cluster_members=clustering.cluster_members,
+            prototype_seed_indices=torch.stack(prototype_seed_indices, dim=0),
+            target_indices=None,
+            source_query_indices=clustering.selection.indices,
+            source_cluster_labels=clustering.cluster_labels,
+            assignment_weights=torch.empty((flat_queries.num_queries, 0), device=device),
+            assignment_strength=torch.empty((0,), device=device),
+        )
+
     def refine_prototypes(self, model: CustomMask2Former, flat_queries: FlatQueryOutputs, prototypes: PrototypeState) -> PrototypeState:
         cfg = self.cfg.assign
         device = flat_queries.signature_embeddings.device
@@ -627,7 +718,12 @@ class ModularPrototypePredictor:
             target_indices=target_indices,
         )
 
-    def resolve_prediction(self, flat_queries: FlatQueryOutputs, prototypes: PrototypeState) -> ResolvedPrediction:
+    def resolve_prediction(
+        self,
+        flat_queries: FlatQueryOutputs,
+        prototypes: PrototypeState,
+        object_queries: Optional[FlatQueryOutputs] = None,
+    ) -> ResolvedPrediction:
         cfg = self.cfg.overlap
         features = flat_queries.features
         image_height, image_width = flat_queries.image_height, flat_queries.image_width
@@ -649,6 +745,7 @@ class ModularPrototypePredictor:
                 resolved_masks=[],
                 resolved_labels=[],
                 resolved_scores=[],
+                object_queries=object_queries,
             )
 
         mask_logits = project_mask_embeddings(
@@ -690,6 +787,7 @@ class ModularPrototypePredictor:
                 resolved_masks=[],
                 resolved_labels=[],
                 resolved_scores=[],
+                object_queries=object_queries,
             )
 
         kept_prototype_indices = torch.where(keep_mask)[0]
@@ -770,15 +868,17 @@ class ModularPrototypePredictor:
             resolved_masks=resolved_masks,
             resolved_labels=resolved_labels,
             resolved_scores=resolved_scores,
+            object_queries=object_queries,
         )
 
     def predict_clustered_single(self, model: CustomMask2Former, raw: RawOutputs, batch_index: int) -> ResolvedPrediction:
         flat_queries = self.flatten_outputs(raw, batch_index)
-        seed_selection = self.select_seed_queries(flat_queries)
-        seed_clustering = self.cluster_seed_queries(model, flat_queries, seed_selection)
-        prototypes = self.initialize_clustered_prototypes(flat_queries, seed_clustering)
+        object_queries = self.flatten_object_outputs(raw, batch_index, flat_queries)
+        seed_selection = self.select_seed_queries(object_queries)
+        seed_clustering = self.cluster_seed_queries(model, object_queries, seed_selection)
+        prototypes = self.initialize_object_prototypes(flat_queries, object_queries, seed_clustering)
         prototypes = self.refine_prototypes(model, flat_queries, prototypes)
-        return self.resolve_prediction(flat_queries, prototypes)
+        return self.resolve_prediction(flat_queries, prototypes, object_queries=object_queries)
 
     def predict_with_gt_signatures_single(self, model: CustomMask2Former, raw: RawOutputs, targets, batch_index: int) -> ResolvedPrediction:
         flat_queries = self.flatten_outputs(raw, batch_index)
@@ -800,10 +900,13 @@ class ModularPrototypePredictor:
         targets,
         batch_index: int,
         flat_queries: Optional[FlatQueryOutputs] = None,
+        object_queries: Optional[FlatQueryOutputs] = None,
         gt_signatures: Optional[torch.Tensor] = None,
     ) -> tuple[ResolvedPrediction, GoldenQueryDiagnostics]:
         if flat_queries is None:
             flat_queries = self.flatten_outputs(raw, batch_index)
+        if object_queries is None:
+            object_queries = self.flatten_object_outputs(raw, batch_index, flat_queries)
         if gt_signatures is None:
             gt_signatures = self.encode_gt_signatures(
                 model,
@@ -813,12 +916,23 @@ class ModularPrototypePredictor:
                 flat_queries.signature_embeddings.device,
             )
 
-        candidate_indices = torch.arange(flat_queries.num_queries, device=flat_queries.signature_embeddings.device)
+        objects_per_layer = object_queries.queries_per_layer
+        num_object_layers = object_queries.num_decoder_layers
+        final_layer_start = max(0, num_object_layers - 1) * objects_per_layer
+        candidate_indices = torch.arange(
+            final_layer_start,
+            final_layer_start + objects_per_layer,
+            device=object_queries.signature_embeddings.device,
+        )
         if gt_signatures.shape[0] == 0 or candidate_indices.numel() == 0:
-            empty_prediction = self.resolve_prediction(flat_queries, self._empty_prototype_state(flat_queries))
+            empty_prediction = self.resolve_prediction(
+                flat_queries,
+                self._empty_prototype_state(flat_queries),
+                object_queries=object_queries,
+            )
             return empty_prediction, GoldenQueryDiagnostics()
 
-        query_signatures = flat_queries.signature_embeddings[candidate_indices]
+        query_signatures = object_queries.signature_embeddings[candidate_indices]
         distances = pairwise_distance(
             query_signatures,
             gt_signatures,
@@ -857,7 +971,7 @@ class ModularPrototypePredictor:
         if (~matched_mask).any():
             unmatched_query_distances = distances[~matched_mask].min(dim=1).values.detach().cpu().tolist()
 
-        matched_query_signatures = flat_queries.signature_embeddings[matched_query_indices]
+        matched_query_signatures = object_queries.signature_embeddings[matched_query_indices]
         prototypes = self.build_signature_prototypes(
             model,
             flat_queries,
@@ -865,7 +979,7 @@ class ModularPrototypePredictor:
             prototype_seed_indices=matched_query_indices,
             target_indices=matched_gt_indices,
         )
-        prediction = self.resolve_prediction(flat_queries, prototypes)
+        prediction = self.resolve_prediction(flat_queries, prototypes, object_queries=object_queries)
         diagnostics = GoldenQueryDiagnostics(
             matched_query_distances=matched_distances,
             unmatched_query_closest_gt_distances=unmatched_query_distances,
@@ -879,11 +993,16 @@ class ModularPrototypePredictor:
         gt_signatures = self.encode_gt_signatures(model, raw, targets, batch_index, device)
         target_indices = torch.arange(labels.shape[0], device=device, dtype=torch.long)
 
-        seed_selection = self.select_seed_queries(flat_queries)
-        seed_clustering = self.cluster_seed_queries(model, flat_queries, seed_selection)
-        clustering_prototypes = self.initialize_clustered_prototypes(flat_queries, seed_clustering)
+        object_queries = self.flatten_object_outputs(raw, batch_index, flat_queries)
+        seed_selection = self.select_seed_queries(object_queries)
+        seed_clustering = self.cluster_seed_queries(model, object_queries, seed_selection)
+        clustering_prototypes = self.initialize_object_prototypes(flat_queries, object_queries, seed_clustering)
         clustering_prototypes = self.refine_prototypes(model, flat_queries, clustering_prototypes)
-        clustering_prediction = self.resolve_prediction(flat_queries, clustering_prototypes)
+        clustering_prediction = self.resolve_prediction(
+            flat_queries,
+            clustering_prototypes,
+            object_queries=object_queries,
+        )
 
         gt_signature_prototypes = self.build_gt_signature_prototypes(
             model,
@@ -898,6 +1017,7 @@ class ModularPrototypePredictor:
             targets,
             batch_index,
             flat_queries=flat_queries,
+            object_queries=object_queries,
             gt_signatures=gt_signatures,
         )
         return EvaluationPredictionSet(
