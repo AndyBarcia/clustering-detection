@@ -388,11 +388,19 @@ class ClusterPanopticCriterion(nn.Module):
         cls_preds = raw.cls_preds
         sig_embs = raw.sig_embs
         seed_logits = raw.seed_logits
+        prior_sig_embs = raw.prior_sig_embs
+        prior_seed_logits = raw.prior_seed_logits
         influence_preds = raw.influence_preds
         H_img, W_img = raw.img_shape
 
-        if sig_embs is None or seed_logits is None or influence_preds is None:
-            raise ValueError("Clustered criterion requires signature, seed, and influence predictions.")
+        if (
+            sig_embs is None
+            or seed_logits is None
+            or prior_sig_embs is None
+            or prior_seed_logits is None
+            or influence_preds is None
+        ):
+            raise ValueError("Clustered criterion requires prior/posterior signature, seed, and influence predictions.")
 
         # features: [B,C,Hf,Wf], memory: [B,N_mem,C]
         B = features.shape[0]
@@ -409,12 +417,18 @@ class ClusterPanopticCriterion(nn.Module):
             zero = features.sum() * 0.0
             return zero, {
                 "loss_total": zero,
-                "loss_seed_sig": zero,
-                "loss_seed": zero,
-                "loss_cls": zero,
-                "loss_mask_ce": zero,
-                "loss_mask_iou": zero,
-                "loss_mask_total": zero,
+                "loss_seed_sig_prior": zero,
+                "loss_seed_prior": zero,
+                "loss_seed_sig_posterior": zero,
+                "loss_seed_posterior": zero,
+                "loss_cls_prior": zero,
+                "loss_mask_ce_prior": zero,
+                "loss_mask_iou_prior": zero,
+                "loss_cls_posterior": zero,
+                "loss_mask_ce_posterior": zero,
+                "loss_mask_iou_posterior": zero,
+                "loss_mask_total_prior": zero,
+                "loss_mask_total_posterior": zero,
                 "loss_inter": zero,
             }
 
@@ -437,9 +451,11 @@ class ClusterPanopticCriterion(nn.Module):
         feature_maps_val = [(level_name, level_features[valid_b]) for level_name, level_features in feature_maps]
 
         q_sig = sig_embs[:, valid_b]
+        q_prior_sig = prior_sig_embs[:, valid_b]
         q_mask_emb = mask_embs[:, valid_b]
         q_cls = cls_preds[:, valid_b]
         q_seed_logits = seed_logits[:, valid_b]
+        q_prior_seed_logits = prior_seed_logits[:, valid_b]
         q_influence = influence_preds[:, valid_b]
 
         # Decoder outputs are [L,Bv,Q,...]; we flatten layers and queries into a single query axis.
@@ -447,10 +463,12 @@ class ClusterPanopticCriterion(nn.Module):
 
         # q_sig_flat: [Bv,L*Q,S], q_mask_emb_flat: [Bv,L*Q,C], q_cls_flat: [Bv,L*Q,K]
         q_sig_flat = q_sig.transpose(0, 1).reshape(B_val, L * N_q, S)
+        q_prior_sig_flat = q_prior_sig.transpose(0, 1).reshape(B_val, L * N_q, S)
         q_mask_emb_flat = q_mask_emb.transpose(0, 1).reshape(B_val, L * N_q, -1)
         q_cls_flat = q_cls.transpose(0, 1).reshape(B_val, L * N_q, -1)
         # q_seed_logits_flat/q_influence_flat: [Bv,L*Q]
         q_seed_logits_flat = q_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
+        q_prior_seed_logits_flat = q_prior_seed_logits.transpose(0, 1).reshape(B_val, L * N_q)
         q_influence_flat = q_influence.transpose(0, 1).reshape(B_val, L * N_q)
 
         # gt_sigs_norm: [Bv,GT,S]
@@ -467,7 +485,13 @@ class ClusterPanopticCriterion(nn.Module):
             identity_similarity_metric=model.identity_similarity_metric,
         )
         
-        loss_cls, loss_mask_ce, loss_mask_iou, level_loss_mask_ce, level_loss_mask_iou = self._compute_mask_cls_losses(
+        (
+            loss_posterior_cls,
+            loss_posterior_mask_ce,
+            loss_posterior_mask_iou,
+            posterior_level_loss_mask_ce,
+            posterior_level_loss_mask_iou,
+        ) = self._compute_mask_cls_losses(
             q_sig_flat=q_sig_flat,
             q_influence_flat=q_influence_flat,
             gt_sigs_norm=gt_sigs_norm,
@@ -480,8 +504,27 @@ class ClusterPanopticCriterion(nn.Module):
             img_shape=(H_img, W_img),
             aggregation_similarity_metric=model.aggregation_similarity_metric,
         )
+        (
+            loss_prior_cls,
+            loss_prior_mask_ce,
+            loss_prior_mask_iou,
+            prior_level_loss_mask_ce,
+            prior_level_loss_mask_iou,
+        ) = self._compute_mask_cls_losses(
+            q_sig_flat=q_prior_sig_flat,
+            q_influence_flat=q_influence_flat,
+            gt_sigs_norm=gt_sigs_norm,
+            gt_pad_mask=gt_pad_mask,
+            q_mask_emb_flat=q_mask_emb_flat,
+            q_cls_flat=q_cls_flat,
+            gt_labels_pad=gt_labels_pad,
+            gt_masks_pad=gt_masks_pad,
+            feature_maps_val=feature_maps_val,
+            img_shape=(H_img, W_img),
+            aggregation_similarity_metric=model.aggregation_similarity_metric,
+        )
         
-        loss_seed, loss_seed_sig = self._compute_seed_losses(
+        loss_posterior_seed, loss_posterior_seed_sig = self._compute_seed_losses(
             q_sig_flat=q_sig_flat,
             gt_sigs_norm=gt_sigs_norm,
             gt_pad_mask=gt_pad_mask,
@@ -489,31 +532,57 @@ class ClusterPanopticCriterion(nn.Module):
             features=features,
             identity_similarity_metric=model.identity_similarity_metric,
         )
-
-        total_loss_mask = self.cfg.w_mask_ce * loss_mask_ce + self.cfg.w_mask_iou * loss_mask_iou
+        loss_prior_seed, loss_prior_seed_sig = self._compute_seed_losses(
+            q_sig_flat=q_prior_sig_flat,
+            gt_sigs_norm=gt_sigs_norm,
+            gt_pad_mask=gt_pad_mask,
+            q_seed_logits_flat=q_prior_seed_logits_flat,
+            features=features,
+            identity_similarity_metric=model.identity_similarity_metric,
+        )
+        total_loss_mask_prior = self.cfg.w_mask_ce * loss_prior_mask_ce + self.cfg.w_mask_iou * loss_prior_mask_iou
+        total_loss_mask_posterior = self.cfg.w_mask_ce * loss_posterior_mask_ce + self.cfg.w_mask_iou * loss_posterior_mask_iou
 
         final_loss = (
-            loss_seed_sig
-            + loss_cls
-            + total_loss_mask
-            + self.cfg.w_seed * loss_seed
+            0.5 * (
+                loss_prior_seed_sig
+                + loss_prior_cls
+                + total_loss_mask_prior
+                + self.cfg.w_seed * loss_prior_seed
+            )
+            + 0.5 * (
+                loss_posterior_seed_sig
+                + loss_posterior_cls
+                + total_loss_mask_posterior
+                + self.cfg.w_seed * loss_posterior_seed
+            )
             + self.cfg.w_inter * loss_inter
         )
 
         components = {
             "loss_total": final_loss,
-            "loss_seed_sig": loss_seed_sig,
-            "loss_seed": loss_seed,
-            "loss_cls": loss_cls,
-            "loss_mask_ce": loss_mask_ce,
-            "loss_mask_iou": loss_mask_iou,
-            "loss_mask_total": total_loss_mask,
+            "loss_seed_sig_prior": loss_prior_seed_sig,
+            "loss_seed_prior": loss_prior_seed,
+            "loss_seed_sig_posterior": loss_posterior_seed_sig,
+            "loss_seed_posterior": loss_posterior_seed,
+            "loss_cls_prior": loss_prior_cls,
+            "loss_mask_ce_prior": loss_prior_mask_ce,
+            "loss_mask_iou_prior": loss_prior_mask_iou,
+            "loss_cls_posterior": loss_posterior_cls,
+            "loss_mask_ce_posterior": loss_posterior_mask_ce,
+            "loss_mask_iou_posterior": loss_posterior_mask_iou,
+            "loss_mask_total_prior": total_loss_mask_prior,
+            "loss_mask_total_posterior": total_loss_mask_posterior,
             "loss_inter": loss_inter,
         }
-        for level_name, loss_value in level_loss_mask_ce.items():
-            components[f"loss_mask_ce_{level_name}"] = loss_value
-        for level_name, loss_value in level_loss_mask_iou.items():
-            components[f"loss_mask_iou_{level_name}"] = loss_value
+        for level_name, loss_value in prior_level_loss_mask_ce.items():
+            components[f"loss_mask_ce_{level_name}_prior"] = loss_value
+        for level_name, loss_value in posterior_level_loss_mask_ce.items():
+            components[f"loss_mask_ce_{level_name}_posterior"] = loss_value
+        for level_name, loss_value in prior_level_loss_mask_iou.items():
+            components[f"loss_mask_iou_{level_name}_prior"] = loss_value
+        for level_name, loss_value in posterior_level_loss_mask_iou.items():
+            components[f"loss_mask_iou_{level_name}_posterior"] = loss_value
 
         return final_loss, components
 

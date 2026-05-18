@@ -176,15 +176,27 @@ def build_dataloader(args, device):
 def format_epoch_metrics(epoch_metrics):
     ordered_keys = [
         "loss_total",
-        "loss_seed_sig",
-        "loss_seed",
-        "loss_cls",
-        "loss_mask_ce",
-        "loss_mask_iou",
+        "loss_cls_posterior",
+        "loss_cls_prior",
+        "loss_inter",
+        "loss_mask_ce_posterior",
+        "loss_mask_ce_prior",
+        "loss_mask_iou_posterior",
+        "loss_mask_iou_prior",
+        "loss_mask_total_posterior",
+        "loss_mask_total_prior",
         "loss_mask_bce",
         "loss_mask_dice",
         "loss_mask_total",
-        "loss_inter",
+        "loss_seed_posterior",
+        "loss_seed_prior",
+        "loss_seed_sig_posterior",
+        "loss_seed_sig_prior",
+        "loss_cls",
+        "loss_mask_ce",
+        "loss_mask_iou",
+        "loss_seed",
+        "loss_seed_sig",
     ]
     formatted = [f"{key}={epoch_metrics[key]:.4f}" for key in ordered_keys if key in epoch_metrics]
     extra_mask_keys = sorted(

@@ -19,6 +19,9 @@ class RawOutputs:
     sig_embs: Optional[torch.Tensor] = None        # [L, B, Nq, S]
     seed_logits: Optional[torch.Tensor] = None     # [L, B, Nq]
     seed_scores: Optional[torch.Tensor] = None     # [L, B, Nq]
+    prior_sig_embs: Optional[torch.Tensor] = None  # [L, B, Nq, S]
+    prior_seed_logits: Optional[torch.Tensor] = None  # [L, B, Nq]
+    prior_seed_scores: Optional[torch.Tensor] = None  # [L, B, Nq]
     influence_preds: Optional[torch.Tensor] = None # [L, B, Nq]
 
 

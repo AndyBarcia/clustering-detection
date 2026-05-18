@@ -441,15 +441,18 @@ def _build_summary_payload(
     gt_signature_summary: Dict[str, float] | None,
     golden_query_summary: Dict[str, float] | None,
     signature_probe_summary: Dict[str, Any] | None = None,
+    prior_posterior_delta_summary: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     return {
         "clustering": clustering_summary,
         "gt_signatures": gt_signature_summary,
         "golden_queries": golden_query_summary,
         "signature_probes": signature_probe_summary,
+        "prior_posterior_deltas": prior_posterior_delta_summary,
         "available_evaluations": [
             name
             for name, metrics in (
+                ("prior_posterior_deltas", prior_posterior_delta_summary),
                 ("signature_probes", signature_probe_summary),
                 ("gt_signatures", gt_signature_summary),
                 ("golden_queries", golden_query_summary),
@@ -457,6 +460,70 @@ def _build_summary_payload(
             )
             if metrics is not None
         ],
+    }
+
+
+def _compute_prior_posterior_delta_records(raw, object_counts: Sequence[int]) -> List[Dict[str, Any]]:
+    required = (raw.prior_sig_embs, raw.sig_embs, raw.prior_seed_scores, raw.seed_scores)
+    if any(value is None for value in required):
+        return []
+
+    prior_sig = raw.prior_sig_embs.detach()
+    posterior_sig = raw.sig_embs.detach()
+    prior_seed = raw.prior_seed_scores.detach()
+    posterior_seed = raw.seed_scores.detach()
+
+    signature_cosine_distance = 1.0 - F.cosine_similarity(prior_sig, posterior_sig, dim=-1)
+    signature_l2_delta = (posterior_sig - prior_sig).norm(dim=-1)
+    seed_abs_delta = (posterior_seed - prior_seed).abs()
+
+    records: List[Dict[str, Any]] = []
+    for batch_index, object_count in enumerate(object_counts):
+        seed_delta_image = seed_abs_delta[:, batch_index].reshape(-1)
+        signature_cosine_image = signature_cosine_distance[:, batch_index].reshape(-1)
+        signature_l2_image = signature_l2_delta[:, batch_index].reshape(-1)
+        records.append(
+            {
+                "object_count": int(object_count),
+                "num_queries": int(seed_delta_image.numel()),
+                "seed_abs_delta": float(seed_delta_image.mean().item()),
+                "seed_abs_delta_query_std": float(seed_delta_image.std(unbiased=False).item()),
+                "signature_cosine_distance": float(signature_cosine_image.mean().item()),
+                "signature_cosine_distance_query_std": float(signature_cosine_image.std(unbiased=False).item()),
+                "signature_l2_delta": float(signature_l2_image.mean().item()),
+                "signature_l2_delta_query_std": float(signature_l2_image.std(unbiased=False).item()),
+            }
+        )
+    return records
+
+
+def _summarize_prior_posterior_delta_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any] | None:
+    if not records:
+        return None
+
+    summary: Dict[str, Any] = {
+        "num_images": len(records),
+        "num_queries": int(sum(record["num_queries"] for record in records)),
+    }
+    for key in (
+        "seed_abs_delta",
+        "seed_abs_delta_query_std",
+        "signature_cosine_distance",
+        "signature_cosine_distance_query_std",
+        "signature_l2_delta",
+        "signature_l2_delta_query_std",
+    ):
+        _append_value_summary(summary, key, [float(record[key]) for record in records])
+    return summary
+
+
+def _summarize_grouped_delta_records(records: Sequence[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    grouped = defaultdict(list)
+    for record in records:
+        grouped[int(record["object_count"])].append(record)
+    return {
+        object_count: _summarize_prior_posterior_delta_records(group_records)
+        for object_count, group_records in sorted(grouped.items())
     }
 
 
@@ -582,6 +649,7 @@ def evaluate_system(
     golden_query_evaluations: List[ImageEvaluation] | None = [] if system.supports_gt_prototypes else None
     object_counts: List[int] = []
     signature_probe_records: list[dict[str, Any]] = []
+    prior_posterior_delta_records: list[dict[str, Any]] = []
 
     try:
         for batch, targets in dataset:
@@ -589,6 +657,10 @@ def evaluate_system(
             raw = system.model(batch, ttt_steps_override=system.cfg.inference.ttt_steps)
             prediction_sets = _ensure_prediction_list(
                 system.predictor.predict_evaluation_views_from_raw(system.model, raw, targets)
+            )
+            batch_object_counts = [int((target["labels"] != 0).sum().item()) for target in targets]
+            prior_posterior_delta_records.extend(
+                _compute_prior_posterior_delta_records(raw, batch_object_counts)
             )
 
             for batch_index, (prediction_set, target) in enumerate(zip(prediction_sets, targets)):
@@ -607,7 +679,7 @@ def evaluate_system(
                     signature_metric=getattr(system.model, "identity_similarity_metric", "dot"),
                 )
                 clustering_evaluations.append(clustering_eval)
-                object_counts.append(int((target["labels"] != 0).sum().item()))
+                object_counts.append(batch_object_counts[batch_index])
                 if gt_signature_evaluations is not None and gt_eval is not None:
                     gt_signature_evaluations.append(gt_eval)
                 if golden_query_evaluations is not None and golden_eval is not None:
@@ -623,6 +695,7 @@ def evaluate_system(
         None if gt_signature_evaluations is None else summarize_evaluations(gt_signature_evaluations),
         None if golden_query_evaluations is None else summarize_evaluations(golden_query_evaluations),
         _evaluate_signature_probe_summary(signature_probe_records, device=torch.device(device)),
+        _summarize_prior_posterior_delta_records(prior_posterior_delta_records),
     )
     by_count = _summarize_grouped_evaluations(
         clustering_evaluations,
@@ -630,6 +703,9 @@ def evaluate_system(
         golden_query_evaluations,
         object_counts,
     )
+    delta_by_count = _summarize_grouped_delta_records(prior_posterior_delta_records)
+    for object_count, delta_summary in delta_by_count.items():
+        by_count.setdefault(object_count, {})["prior_posterior_deltas"] = delta_summary
     return overall, by_count
 
 
@@ -1165,5 +1241,51 @@ def format_metrics_table(
             ]
         )
         sections.append("Signature probes by object count\n" + _format_table(headers, rows))
+
+    delta_metrics = overall.get("prior_posterior_deltas")
+    if delta_metrics is not None:
+        headers = [
+            "obj.",
+            "img.",
+            "queries",
+            "seed_abs",
+            "seed_qstd",
+            "sig_cos",
+            "sig_cos_qstd",
+            "sig_l2",
+            "sig_l2_qstd",
+        ]
+        rows: List[List[str]] = []
+        for object_count, metrics in sorted(by_count.items()):
+            eval_metrics = metrics.get("prior_posterior_deltas")
+            if eval_metrics is None:
+                continue
+            rows.append(
+                [
+                    str(object_count),
+                    str(eval_metrics["num_images"]),
+                    str(eval_metrics["num_queries"]),
+                    _format_metric(eval_metrics, "seed_abs_delta_mean"),
+                    _format_metric(eval_metrics, "seed_abs_delta_query_std_mean"),
+                    _format_metric(eval_metrics, "signature_cosine_distance_mean"),
+                    _format_metric(eval_metrics, "signature_cosine_distance_query_std_mean"),
+                    _format_metric(eval_metrics, "signature_l2_delta_mean"),
+                    _format_metric(eval_metrics, "signature_l2_delta_query_std_mean"),
+                ]
+            )
+        rows.append(
+            [
+                "all",
+                str(delta_metrics["num_images"]),
+                str(delta_metrics["num_queries"]),
+                _format_metric(delta_metrics, "seed_abs_delta_mean"),
+                _format_metric(delta_metrics, "seed_abs_delta_query_std_mean"),
+                _format_metric(delta_metrics, "signature_cosine_distance_mean"),
+                _format_metric(delta_metrics, "signature_cosine_distance_query_std_mean"),
+                _format_metric(delta_metrics, "signature_l2_delta_mean"),
+                _format_metric(delta_metrics, "signature_l2_delta_query_std_mean"),
+            ]
+        )
+        sections.append("Prior/posterior deltas by object count\n" + _format_table(headers, rows))
 
     return "\n\n".join(sections)

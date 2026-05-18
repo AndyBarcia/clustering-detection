@@ -359,7 +359,7 @@ class Mask2FormerBase(nn.Module):
     def _run_heads(self, q):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
-        return mask_embs, cls_preds, None, None, None, None
+        return mask_embs, cls_preds, None, None, None, None, None, None, None
 
     def forward(self, images: torch.Tensor, ttt_steps_override: Optional[int] = None) -> RawOutputs:
         H_img, W_img = images.shape[-2:]
@@ -373,7 +373,17 @@ class Mask2FormerBase(nn.Module):
             ttt_steps_override=ttt_steps_override,
         )
 
-        mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds = self._run_heads(q_dec_all)
+        (
+            mask_embs,
+            cls_preds,
+            sig_embs,
+            seed_logits,
+            seed_scores,
+            prior_sig_embs,
+            prior_seed_logits,
+            prior_seed_scores,
+            influence_preds,
+        ) = self._run_heads(q_dec_all)
 
         return RawOutputs(
             features=features,
@@ -387,6 +397,9 @@ class Mask2FormerBase(nn.Module):
             sig_embs=sig_embs,
             seed_logits=seed_logits,
             seed_scores=seed_scores,
+            prior_sig_embs=prior_sig_embs,
+            prior_seed_logits=prior_seed_logits,
+            prior_seed_scores=prior_seed_scores,
             influence_preds=influence_preds,
         )
 
@@ -399,12 +412,17 @@ class CustomMask2Former(Mask2FormerBase):
 
         hidden_dim = cfg.backbone.hidden_dim
         num_classes = cfg.heads.num_classes
+        num_queries = cfg.decoder.num_queries
+        num_layers = cfg.decoder.num_layers
         sig_dim = cfg.heads.sig_dim
 
         self.sig_dim = sig_dim
         self.signature_normalize = cfg.heads.normalize_signatures
         self.aggregation_similarity_metric = cfg.heads.aggregation_similarity_metric
         self.identity_similarity_metric = cfg.heads.identity_similarity_metric
+
+        self.prior_sig = nn.Parameter(torch.randn(num_layers, num_queries, sig_dim) * (sig_dim ** -0.5))
+        self.prior_seed_logits = nn.Parameter(torch.zeros(num_layers, num_queries))
 
         self.sig_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -421,6 +439,7 @@ class CustomMask2Former(Mask2FormerBase):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
         )
+        self._init_small_posterior_deltas()
 
         self.gt_cls_proj = nn.Embedding(num_classes, sig_dim)
         self.gt_bbox_proj = nn.Sequential(
@@ -433,6 +452,12 @@ class CustomMask2Former(Mask2FormerBase):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, sig_dim),
         )
+
+    def _init_small_posterior_deltas(self):
+        for head in (self.sig_head, self.seed_head):
+            final = head[-1]
+            nn.init.normal_(final.weight, std=1e-3)
+            nn.init.zeros_(final.bias)
 
     def _decoder_seed_head(self):
         return self.seed_head
@@ -596,11 +621,27 @@ class CustomMask2Former(Mask2FormerBase):
     def _run_heads(self, q):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
-        sig_embs = self.prepare_signature_embeddings(self.sig_head(q))
-        seed_logits = self.seed_head(q).squeeze(-1)
+        prior_sig = self.prior_sig[:, None].expand(-1, q.shape[1], -1, -1)
+        prior_seed_logits = self.prior_seed_logits[:, None].expand(-1, q.shape[1], -1)
+        sig_delta = self.sig_head(q)
+        seed_delta = self.seed_head(q).squeeze(-1)
+        prior_sig_embs = self.prepare_signature_embeddings(prior_sig)
+        sig_embs = self.prepare_signature_embeddings(prior_sig + sig_delta)
+        seed_logits = prior_seed_logits + seed_delta
         seed_scores = torch.sigmoid(seed_logits)
+        prior_seed_scores = torch.sigmoid(prior_seed_logits)
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
-        return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds
+        return (
+            mask_embs,
+            cls_preds,
+            sig_embs,
+            seed_logits,
+            seed_scores,
+            prior_sig_embs,
+            prior_seed_logits,
+            prior_seed_scores,
+            influence_preds,
+        )
 
 
 class StandardMask2Former(Mask2FormerBase):
