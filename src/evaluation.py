@@ -28,6 +28,7 @@ class ImageEvaluation:
     prediction_records: List[Tuple[float, int]]
     matched_query_distances: List[float] = field(default_factory=list)
     unmatched_query_closest_gt_distances: List[float] = field(default_factory=list)
+    seed_scores: List[float] = field(default_factory=list)
     signature_count_pred: int | None = None
     signature_count_gt: int | None = None
     signature_chamfer_distance: float | None = None
@@ -338,14 +339,18 @@ def _compute_average_precision(prediction_records: Iterable[Tuple[float, int]], 
 def _append_value_summary(summary: Dict[str, float], prefix: str, values: Sequence[float]):
     if not values:
         return
+    values_np = np.asarray(values, dtype=np.float64)
     summary[f"{prefix}_count"] = int(len(values))
-    summary[f"{prefix}_mean"] = float(sum(values) / len(values))
+    summary[f"{prefix}_mean"] = float(values_np.mean())
     if len(values) > 1:
-        summary[f"{prefix}_std"] = float(np.std(np.asarray(values, dtype=np.float64), ddof=0))
+        summary[f"{prefix}_std"] = float(np.std(values_np, ddof=0))
     else:
         summary[f"{prefix}_std"] = 0.0
-    summary[f"{prefix}_min"] = float(min(values))
-    summary[f"{prefix}_max"] = float(max(values))
+    summary[f"{prefix}_min"] = float(values_np.min())
+    summary[f"{prefix}_q1"] = float(np.quantile(values_np, 0.25))
+    summary[f"{prefix}_median"] = float(np.quantile(values_np, 0.50))
+    summary[f"{prefix}_q3"] = float(np.quantile(values_np, 0.75))
+    summary[f"{prefix}_max"] = float(values_np.max())
 
 
 def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[str, float]:
@@ -358,6 +363,7 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
     prediction_records: List[Tuple[float, int]] = []
     matched_query_distances: List[float] = []
     unmatched_query_distances: List[float] = []
+    seed_scores: List[float] = []
     count_pred: List[int] = []
     count_gt: List[int] = []
     chamfer_values: List[float] = []
@@ -370,6 +376,7 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
         prediction_records.extend(item.prediction_records)
         matched_query_distances.extend(item.matched_query_distances)
         unmatched_query_distances.extend(item.unmatched_query_closest_gt_distances)
+        seed_scores.extend(item.seed_scores)
         count_pred.append(int(item.num_pred))
         count_gt.append(int(item.num_gt))
         per_image_mean_iou.append(item.matched_iou_sum / item.num_gt if item.num_gt > 0 else 0.0)
@@ -398,6 +405,7 @@ def summarize_evaluations(image_evaluations: Sequence[ImageEvaluation]) -> Dict[
 
     _append_value_summary(summary, "matched_query_cosine_distance", matched_query_distances)
     _append_value_summary(summary, "unmatched_query_closest_gt_cosine_distance", unmatched_query_distances)
+    _append_value_summary(summary, "seed_score", seed_scores)
 
     count_errors = [pred - gt for pred, gt in zip(count_pred, count_gt)]
     abs_count_errors = [abs(error) for error in count_errors]
@@ -478,6 +486,11 @@ def _evaluate_prediction_set(
         target,
         ap_iou_threshold=ap_iou_threshold,
     )
+    flat_queries = prediction_set.clustering.flat_queries
+    if flat_queries is not None and flat_queries.seed_scores.numel() > 0:
+        clustering_evaluation.seed_scores.extend(
+            float(value) for value in flat_queries.seed_scores.detach().cpu().tolist()
+        )
     if gt_signatures is not None:
         pred_signatures = _foreground_resolved_signature_embeddings(prediction_set.clustering)
         chamfer, hausdorff = _compute_signature_set_distance_metrics(
@@ -1122,6 +1135,52 @@ def format_metrics_table(
 
         _append_overall_row(rows, overall_metrics, value_columns=value_columns)
         sections.append(title + "\n" + _format_table(headers, rows))
+
+    seed_overall_metrics = overall.get("clustering")
+    if seed_overall_metrics is not None and "seed_score_count" in seed_overall_metrics:
+        headers = [
+            "obj.",
+            "n",
+            "mean",
+            "std",
+            "min",
+            "q1",
+            "median",
+            "q3",
+            "max",
+        ]
+        rows: List[List[str]] = []
+        for object_count, metrics in by_count.items():
+            eval_metrics = metrics.get("clustering")
+            if eval_metrics is None or "seed_score_count" not in eval_metrics:
+                continue
+            rows.append(
+                [
+                    str(object_count),
+                    str(eval_metrics["seed_score_count"]),
+                    _format_float(eval_metrics.get("seed_score_mean"), digits=4),
+                    _format_float(eval_metrics.get("seed_score_std"), digits=4),
+                    _format_float(eval_metrics.get("seed_score_min"), digits=4),
+                    _format_float(eval_metrics.get("seed_score_q1"), digits=4),
+                    _format_float(eval_metrics.get("seed_score_median"), digits=4),
+                    _format_float(eval_metrics.get("seed_score_q3"), digits=4),
+                    _format_float(eval_metrics.get("seed_score_max"), digits=4),
+                ]
+            )
+        rows.append(
+            [
+                "all",
+                str(seed_overall_metrics["seed_score_count"]),
+                _format_float(seed_overall_metrics.get("seed_score_mean"), digits=4),
+                _format_float(seed_overall_metrics.get("seed_score_std"), digits=4),
+                _format_float(seed_overall_metrics.get("seed_score_min"), digits=4),
+                _format_float(seed_overall_metrics.get("seed_score_q1"), digits=4),
+                _format_float(seed_overall_metrics.get("seed_score_median"), digits=4),
+                _format_float(seed_overall_metrics.get("seed_score_q3"), digits=4),
+                _format_float(seed_overall_metrics.get("seed_score_max"), digits=4),
+            ]
+        )
+        sections.append("Seed scores by object count\n" + _format_table(headers, rows))
 
     probe_metrics = overall.get("signature_probes")
     if probe_metrics is not None:

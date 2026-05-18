@@ -136,6 +136,7 @@ def hungarian_mask2former_assignment(
     gt_labels: torch.Tensor, # [GT]
     gt_masks: torch.Tensor, # [GT,H,W]
     cfg: LossConfig,
+    seed_logits: torch.Tensor | None = None, # [Q]
 ):
     num_queries = cls_logits.shape[0]
     num_gt = gt_labels.shape[0]
@@ -155,6 +156,9 @@ def hungarian_mask2former_assignment(
         + cfg.matcher_cost_mask_bce * mask_cost
         + cfg.matcher_cost_mask_dice * dice_cost
     )
+    if seed_logits is not None and cfg.matcher_cost_seed != 0.0:
+        seed_cost = 1.0 - torch.sigmoid(seed_logits)
+        total_cost = total_cost + cfg.matcher_cost_seed * seed_cost.unsqueeze(-1)
     row_ind, col_ind = linear_sum_assignment(total_cost.detach().cpu().numpy())
     return (
         torch.as_tensor(row_ind, device=device, dtype=torch.long),
@@ -531,6 +535,7 @@ class StandardMask2FormerCriterion(nn.Module):
         feature_maps: list[tuple[str, torch.Tensor]],
         q_mask_emb: torch.Tensor,
         q_cls: torch.Tensor,
+        q_seed_logits: torch.Tensor | None,
         targets,
         img_shape: tuple[int, int],
     ):
@@ -566,6 +571,7 @@ class StandardMask2FormerCriterion(nn.Module):
                     gt_labels=gt_labels,
                     gt_masks=gt_masks,
                     cfg=self.cfg,
+                    seed_logits=None if q_seed_logits is None else q_seed_logits[b],
                 )
                 target_classes[matched_query_idx] = gt_labels[matched_gt_idx]
 
@@ -613,8 +619,12 @@ class StandardMask2FormerCriterion(nn.Module):
         reference_features = raw.features
         # raw.mask_embs/raw.cls_preds are lists over decoder layers.
         layer_losses = [
-            self._compute_single_layer_loss(feature_maps, q_mask_emb, q_cls, targets, raw.img_shape)
-            for q_mask_emb, q_cls in zip(raw.mask_embs, raw.cls_preds)
+            self._compute_single_layer_loss(feature_maps, q_mask_emb, q_cls, q_seed_logits, targets, raw.img_shape)
+            for q_mask_emb, q_cls, q_seed_logits in zip(
+                raw.mask_embs,
+                raw.cls_preds,
+                raw.seed_logits if raw.seed_logits is not None else [None] * raw.mask_embs.shape[0],
+            )
         ]
 
         loss_cls = torch.stack([loss[0] for loss in layer_losses]).mean()

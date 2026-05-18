@@ -71,6 +71,10 @@ def load_system_checkpoint(path: str, map_location="cpu", inference_override: Op
     ckpt = torch.load(path, map_location=map_location)
     model_state_dict = dict(ckpt["model_state_dict"])
     model_state_dict.pop("layer_importance", None)
+    seed_head_keys = [key for key in model_state_dict if key.startswith("seed_head.")]
+    if seed_head_keys and "seed_logits_grid" not in model_state_dict:
+        for key in seed_head_keys:
+            model_state_dict.pop(key, None)
 
     model_cfg = dataclass_from_dict(ModelConfig, ckpt["model_config"])
     loss_cfg = dataclass_from_dict(LossConfig, ckpt["loss_config"])
@@ -87,14 +91,26 @@ def load_system_checkpoint(path: str, map_location="cpu", inference_override: Op
     )
 
     system = PanopticSystem(cfg)
+    migrated_fixed_seed_grid = bool(seed_head_keys) and "seed_logits_grid" not in ckpt["model_state_dict"]
+    seed_grid = model_state_dict.get("seed_logits_grid")
+    if seed_grid is not None and seed_grid.shape != system.model.seed_logits_grid.shape:
+        if seed_grid.dim() == 1 and seed_grid.shape[0] == system.model.seed_logits_grid.shape[1]:
+            model_state_dict["seed_logits_grid"] = seed_grid.unsqueeze(0).expand_as(system.model.seed_logits_grid).clone()
+        else:
+            model_state_dict.pop("seed_logits_grid", None)
+            migrated_fixed_seed_grid = True
     missing_attn_residuals = (
         strict and
         not any(key.startswith("transformer_decoder.attn_residual_queries") for key in model_state_dict)
     )
-    incompatible = system.model.load_state_dict(model_state_dict, strict=False if missing_attn_residuals else strict)
+    allow_partial_load = missing_attn_residuals or migrated_fixed_seed_grid
+    incompatible = system.model.load_state_dict(model_state_dict, strict=False if allow_partial_load else strict)
 
-    if missing_attn_residuals:
-        missing = [k for k in incompatible.missing_keys if not k.startswith("transformer_decoder.attn_residual_")]
+    if allow_partial_load:
+        missing = [
+            k for k in incompatible.missing_keys
+            if not k.startswith("transformer_decoder.attn_residual_") and k != "seed_logits_grid"
+        ]
         if missing or incompatible.unexpected_keys:
             raise RuntimeError(
                 f"Checkpoint load failed. Missing keys: {missing}. Unexpected keys: {incompatible.unexpected_keys}"

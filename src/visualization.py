@@ -1247,6 +1247,51 @@ def _prediction_columns(
     return prediction_columns
 
 
+def _draw_seed_distribution(ax, prediction: ResolvedPrediction, *, title: str = "Seed Distribution"):
+    ax.clear()
+    flat_queries = prediction.flat_queries
+    if flat_queries is None or flat_queries.seed_scores.numel() == 0:
+        ax.set_title(title)
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No seed scores", ha="center", va="center", fontsize=11, transform=ax.transAxes)
+        return
+
+    seed_scores = flat_queries.seed_scores.detach().float().cpu().numpy()
+    mean = float(np.mean(seed_scores))
+    median = float(np.median(seed_scores))
+    std = float(np.std(seed_scores))
+    min_score = float(seed_scores.min())
+    max_score = float(seed_scores.max())
+    if max_score > min_score:
+        padding = max((max_score - min_score) * 0.12, 1e-4)
+        hist_min = max(0.0, min_score - padding)
+        hist_max = min(1.0, max_score + padding)
+    else:
+        padding = max(std * 4.0, 1e-3)
+        hist_min = max(0.0, mean - padding)
+        hist_max = min(1.0, mean + padding)
+
+    ax.hist(seed_scores, bins=60, range=(hist_min, hist_max), color="#4C78A8", alpha=0.85, edgecolor="white", linewidth=0.45)
+    ax.axvline(mean, color="#F58518", linewidth=1.8, label=f"mean {mean:.3f}")
+    ax.axvline(median, color="#54A24B", linewidth=1.8, linestyle="--", label=f"median {median:.3f}")
+    ax.set_title(title)
+    ax.set_xlim(hist_min, hist_max)
+    ax.set_xlabel("seed score")
+    ax.set_ylabel("queries")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="upper right", fontsize=8, frameon=False)
+    ax.text(
+        0.02,
+        0.96,
+        f"n={seed_scores.size}\nstd={std:.5f}\nmin={min_score:.5f}\nmax={max_score:.5f}",
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=8,
+        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none", "pad": 2},
+    )
+
+
 @torch.no_grad()
 def run_predictions(
     system: PanopticSystem,
@@ -1414,6 +1459,7 @@ def render_prediction_grid(
     class_names: Optional[Sequence[str]] = None,
     figure_title: Optional[str] = None,
     interactive: bool = False,
+    include_seed_distribution: bool = True,
 ):
     num_samples = len(images)
     gt_signature_prediction_column_idx = next(
@@ -1421,7 +1467,8 @@ def render_prediction_grid(
         None,
     )
     add_signature_column = gt_signature_prediction_column_idx is not None
-    num_cols = 2 + len(prediction_columns) + int(add_signature_column)
+    add_seed_column = include_seed_distribution and len(prediction_columns) > 0
+    num_cols = 2 + len(prediction_columns) + int(add_signature_column) + int(add_seed_column)
     fig, axes = plt.subplots(num_samples, num_cols, figsize=(5 * num_cols, 5 * max(num_samples, 1)), squeeze=False)
 
     if figure_title:
@@ -1484,6 +1531,13 @@ def render_prediction_grid(
                 identity_similarity_metric=identity_similarity_metric,
                 class_names=class_names,
                 title="GT Signature UMAP",
+            )
+            next_col_idx += 1
+
+        if add_seed_column:
+            _draw_seed_distribution(
+                axes[row_idx, next_col_idx],
+                prediction_columns[0][1][row_idx],
             )
 
     if figure_title:

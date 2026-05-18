@@ -411,11 +411,7 @@ class CustomMask2Former(Mask2FormerBase):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, sig_dim),
         )
-        self.seed_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
+        self.seed_logits_grid = nn.Parameter(torch.zeros(cfg.decoder.num_layers, cfg.decoder.num_queries))
         self.influence_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -435,7 +431,7 @@ class CustomMask2Former(Mask2FormerBase):
         )
 
     def _decoder_seed_head(self):
-        return self.seed_head
+        return None
 
     def _decoder_memory_mask(self, query_state: torch.Tensor, features: torch.Tensor, memory_hw=None):
         if self._current_decoder_feature_maps is None:
@@ -597,7 +593,7 @@ class CustomMask2Former(Mask2FormerBase):
         mask_embs = self.mask_head(q)
         cls_preds = self.cls_head(q)
         sig_embs = self.prepare_signature_embeddings(self.sig_head(q))
-        seed_logits = self.seed_head(q).squeeze(-1)
+        seed_logits = self.seed_logits_grid[:, None, :].expand(-1, q.shape[1], -1)
         seed_scores = torch.sigmoid(seed_logits)
         influence_preds = torch.sigmoid(self.influence_head(q).squeeze(-1))
         return mask_embs, cls_preds, sig_embs, seed_logits, seed_scores, influence_preds
